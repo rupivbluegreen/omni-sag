@@ -54,6 +54,19 @@ services:
       - minio-data:/data
     restart: unless-stopped
 
+  freeradius:
+    image: freeradius/freeradius-server:latest
+    container_name: omni-sag-freeradius
+    # RADIUS (MS-CHAPv2) second-factor authority for the Slice 2 demo. It
+    # simulates NPS+Entra MFA outcomes: alice is approved, bob is denied.
+    ports:
+      - "1812:1812/udp"
+      - "1813:1813/udp"
+    volumes:
+      - ./freeradius/clients.conf:/etc/raddb/clients.conf:ro
+      - ./freeradius/authorize:/etc/raddb/mods-config/files/authorize:ro
+    restart: unless-stopped
+
 volumes:
   samba-data:
   samba-config:

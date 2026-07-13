@@ -1,0 +1,8 @@
+# Dev-lab second-factor authority (simulates NPS+Entra MFA outcomes).
+#   alice -> MFA "approved": MS-CHAPv2 validates against this password.
+#   bob   -> MFA "denied":   explicitly rejected regardless of password.
+# alice's password must match the AD password she types at the gateway.
+alice   Cleartext-Password := "Passw0rd!"
+
+bob     Auth-Type := Reject
+        Reply-Message = "MFA denied for bob"

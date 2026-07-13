@@ -17,7 +17,8 @@ import (
 type Type string
 
 const (
-	TypeAuth           Type = "auth"            // authentication attempt
+	TypeAuth           Type = "auth"            // primary authentication attempt
+	TypeMFA            Type = "mfa"             // second-factor (MFA) outcome
 	TypeTunnelDecision Type = "tunnel_decision" // dialer authorization decision
 	TypeSessionStart   Type = "session_start"
 	TypeSessionEnd     Type = "session_end"

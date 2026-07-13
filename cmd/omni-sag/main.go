@@ -9,6 +9,7 @@ import (
 	"net"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/rupivbluegreen/omni-sag/internal/authn"
 	"github.com/rupivbluegreen/omni-sag/internal/config"
@@ -56,7 +57,21 @@ func run(cfgPath string) error {
 	})
 
 	d := dialer.New(cfg.CompilePolicy(), sink)
-	srv := session.New(hostKey, auth, d, sink)
+
+	var opts []session.Option
+	if cfg.MFA.Enabled {
+		rc := cfg.MFA.RADIUS
+		opts = append(opts, session.WithMFA(authn.NewRADIUS(authn.RADIUSConfig{
+			Server:                    rc.Server,
+			Secret:                    []byte(rc.Secret),
+			NASIdentifier:             rc.NASIdentifier,
+			Timeout:                   time.Duration(rc.TimeoutSeconds) * time.Second,
+			Retries:                   rc.Retries,
+			AllowInteractiveChallenge: rc.AllowInteractiveChallenge,
+		})))
+		log.Printf("omni-sag: MFA enabled (RADIUS %s)", rc.Server)
+	}
+	srv := session.New(hostKey, auth, d, sink, opts...)
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {

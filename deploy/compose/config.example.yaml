@@ -1,4 +1,4 @@
-# Slice 1 sample config for the docker-compose dev lab (samba-AD + MinIO).
+# Sample config for the docker-compose dev lab (samba-AD + MinIO + FreeRADIUS).
 # Run: omni-sag -config deploy/compose/config.example.yaml
 listen: ":2222"
 host_key: "hostkey.pem"
@@ -10,6 +10,21 @@ ldap:
   bind_password: "LabAdminPass123!"
   user_filter: "(sAMAccountName=%s)"
   insecure_tls: true # dev only: samba-AD self-signed cert
+
+# MFA (Slice 2): second factor after LDAPS primary. Disabled by default so the
+# Slice 1 demo still runs. Enable to gate logins behind RADIUS MS-CHAPv2.
+mfa:
+  enabled: false
+  radius:
+    server: "127.0.0.1:1812"
+    secret: "testing123"
+    nas_identifier: "omni-sag"
+    timeout_seconds: 5
+    retries: 2
+    # Push-style MFA (NPS+Entra) uses Access-Accept/Reject and needs no prompt.
+    # Interactive OTP (Access-Challenge) is off by default and, over the SSH
+    # password path, fails closed because it cannot prompt.
+    allow_interactive_challenge: false
 
 # Evidence: use the file sink for infra-free dev, or the s3 block for MinIO.
 evidence:

@@ -16,8 +16,26 @@ type File struct {
 	Listen   string         `yaml:"listen"`   // SSH listen address, e.g. ":2222"
 	HostKey  string         `yaml:"host_key"` // path to the SSH host key (created if absent)
 	LDAP     LDAPConfig     `yaml:"ldap"`
+	MFA      MFAConfig      `yaml:"mfa"`
 	Evidence EvidenceConfig `yaml:"evidence"`
 	Policy   PolicyConfig   `yaml:"policy"`
+}
+
+// MFAConfig configures the optional second factor. When Enabled, a successful
+// LDAPS primary auth is additionally gated by the configured provider.
+type MFAConfig struct {
+	Enabled bool          `yaml:"enabled"`
+	RADIUS  *RADIUSConfig `yaml:"radius"`
+}
+
+// RADIUSConfig configures the RADIUS (MS-CHAPv2) second factor.
+type RADIUSConfig struct {
+	Server                    string `yaml:"server"`         // host:port
+	Secret                    string `yaml:"secret"`         // shared secret
+	NASIdentifier             string `yaml:"nas_identifier"` // this gateway's NAS-Identifier
+	TimeoutSeconds            int    `yaml:"timeout_seconds"`
+	Retries                   int    `yaml:"retries"`
+	AllowInteractiveChallenge bool   `yaml:"allow_interactive_challenge"`
 }
 
 // EvidenceConfig selects the evidence sink. Exactly one of File or S3 must be
@@ -93,6 +111,14 @@ func (f *File) validate() error {
 	}
 	if f.Evidence.File != "" && f.Evidence.S3 != nil {
 		return fmt.Errorf("config: set only one of evidence.file or evidence.s3")
+	}
+	if f.MFA.Enabled {
+		if f.MFA.RADIUS == nil {
+			return fmt.Errorf("config: mfa.enabled requires an mfa.radius block")
+		}
+		if f.MFA.RADIUS.Server == "" || f.MFA.RADIUS.Secret == "" {
+			return fmt.Errorf("config: mfa.radius requires server and secret")
+		}
 	}
 	for _, r := range f.Policy.Roles {
 		if r.Name == "" {

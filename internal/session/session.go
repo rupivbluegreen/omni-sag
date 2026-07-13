@@ -28,11 +28,24 @@ type Server struct {
 	sshCfg *ssh.ServerConfig
 	dialer *dialer.Dialer
 	sink   evidence.Sink
+	mfa    authn.MFAProvider // optional second factor; nil disables MFA
+}
+
+// Option configures a Server.
+type Option func(*Server)
+
+// WithMFA gates every successful primary authentication behind a second
+// factor. If Verify fails, the login is refused (fail closed).
+func WithMFA(p authn.MFAProvider) Option {
+	return func(s *Server) { s.mfa = p }
 }
 
 // New builds an SSH server that authenticates with auth and forwards through d.
-func New(hostKey ssh.Signer, auth authn.Authenticator, d *dialer.Dialer, sink evidence.Sink) *Server {
+func New(hostKey ssh.Signer, auth authn.Authenticator, d *dialer.Dialer, sink evidence.Sink, opts ...Option) *Server {
 	s := &Server{dialer: d, sink: sink}
+	for _, opt := range opts {
+		opt(s)
+	}
 	cfg := &ssh.ServerConfig{
 		PasswordCallback: s.passwordCallback(auth),
 	}
@@ -61,6 +74,32 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 			User: id.User, SourceIP: srcIP,
 			Allow: evidence.BoolPtr(true), Reason: "authenticated",
 		})
+
+		// Second factor: primary success is not enough when MFA is enabled.
+		// The password bytes are reused to build the MS-CHAPv2 response and are
+		// not retained. The SSH password path cannot prompt interactively, so a
+		// provider that issues an interactive challenge fails closed.
+		if s.mfa != nil {
+			mfaErr := s.mfa.Verify(context.Background(), authn.MFARequest{
+				Username: id.User,
+				Password: password,
+				SourceIP: srcIP,
+			})
+			allowed := mfaErr == nil
+			reason := "mfa approved"
+			if !allowed {
+				reason = "mfa denied"
+			}
+			_ = s.sink.Emit(evidence.Event{
+				Time: time.Now().UTC(), Type: evidence.TypeMFA,
+				User: id.User, SourceIP: srcIP,
+				Allow: evidence.BoolPtr(allowed), Reason: reason,
+			})
+			if !allowed {
+				return nil, errors.New("authentication failed")
+			}
+		}
+
 		return &ssh.Permissions{Extensions: map[string]string{
 			"user":   id.User,
 			"groups": strings.Join(id.Groups, groupSep),
