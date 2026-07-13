@@ -1,0 +1,8 @@
+openapi: 3.1.0
+info:
+  title: Omni-SAG API
+  version: 0.0.0
+  description: >
+    Control-plane API contract (sessions, policies, health).
+    Populated in Slice 7 — server stubs and SDKs are generated from this file.
+paths: {}

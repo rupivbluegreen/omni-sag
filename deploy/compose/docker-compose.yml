@@ -1,0 +1,52 @@
+services:
+  samba-ad:
+    image: nowsci/samba-domain
+    container_name: omni-sag-samba-ad
+    hostname: dc1
+    dns_search: lab.local
+    environment:
+      DOMAIN: "LAB.LOCAL"
+      DOMAINPASS: "LabAdminPass123!"
+      DNS_FORWARDER: "8.8.8.8"
+      INSECURE_LDAP: "true"
+      NOCOMPLEXITY: "true"
+    ports:
+      - "389:389"
+      - "636:636"
+      - "3268:3268"
+      - "3269:3269"
+      - "53:53/udp"
+      - "88:88/tcp"
+      - "88:88/udp"
+      - "464:464/tcp"
+      - "464:464/udp"
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+    volumes:
+      - samba-data:/var/lib/samba
+      - samba-config:/etc/samba/external
+
+  minio:
+    image: minio/minio:latest
+    container_name: omni-sag-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: omnisag
+      MINIO_ROOT_PASSWORD: omnisag-dev-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - minio-data:/data
+    restart: unless-stopped
+
+volumes:
+  samba-data:
+  samba-config:
+  minio-data:

@@ -1,0 +1,26 @@
+.PHONY: build test lint check-imports ci lab-up lab-down lab-logs
+
+build:
+	go build ./...
+
+test:
+	go test ./...
+
+lint:
+	@fmtout=$$(gofmt -l .); \
+	if [ -n "$$fmtout" ]; then echo "gofmt needed:"; echo "$$fmtout"; exit 1; fi
+	go vet ./...
+
+check-imports:
+	bash scripts/check-imports.sh
+
+ci: build lint check-imports test
+
+lab-up:
+	docker compose -f deploy/compose/docker-compose.yml up -d
+
+lab-down:
+	docker compose -f deploy/compose/docker-compose.yml down
+
+lab-logs:
+	docker compose -f deploy/compose/docker-compose.yml logs -f
