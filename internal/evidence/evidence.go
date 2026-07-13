@@ -1,4 +1,54 @@
 // Package evidence provides the event bus, emitter epochs, Merkle chain,
 // and S3 writer. Every package may import evidence: emitting is universal
 // and non-optional.
+//
+// Slice 1 is deliberately crude: a typed Event and a Sink interface with a
+// file (JSONL) and an S3/MinIO implementation. Slice 3 promotes this into the
+// ordered bus, per-emitter epoch+sequence, Merkle chain, and signed
+// checkpoints. The Event shape is kept forward-compatible so that promotion
+// does not require reshaping already-written records.
 package evidence
+
+import (
+	"time"
+)
+
+// Type enumerates the kinds of events emitted in Slice 1.
+type Type string
+
+const (
+	TypeAuth           Type = "auth"            // authentication attempt
+	TypeTunnelDecision Type = "tunnel_decision" // dialer authorization decision
+	TypeSessionStart   Type = "session_start"
+	TypeSessionEnd     Type = "session_end"
+)
+
+// Event is a single evidence record. Fields are additive: new event kinds add
+// fields rather than repurposing existing ones, so the JSONL stream stays
+// readable across slices.
+type Event struct {
+	ID       string    `json:"id"`
+	Time     time.Time `json:"time"`
+	Type     Type      `json:"type"`
+	User     string    `json:"user,omitempty"`
+	SourceIP string    `json:"source_ip,omitempty"`
+
+	// Target and decision fields (tunnel_decision / session events).
+	Target      string `json:"target,omitempty"` // host:port
+	Allow       *bool  `json:"allow,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+	MatchedRole string `json:"matched_role,omitempty"`
+
+	// Freeform detail for anything not yet promoted to a field.
+	Detail string `json:"detail,omitempty"`
+}
+
+// Sink is a destination for evidence events. Implementations must be safe for
+// concurrent use by multiple goroutines: many sessions emit at once.
+type Sink interface {
+	Emit(e Event) error
+	Close() error
+}
+
+// BoolPtr is a helper for the Allow field.
+func BoolPtr(b bool) *bool { return &b }

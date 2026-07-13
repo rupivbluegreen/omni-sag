@@ -1,0 +1,30 @@
+# Slice 1 sample config for the docker-compose dev lab (samba-AD + MinIO).
+# Run: omni-sag -config deploy/compose/config.example.yaml
+listen: ":2222"
+host_key: "hostkey.pem"
+
+ldap:
+  url: "ldaps://127.0.0.1:636"
+  base_dn: "DC=lab,DC=local"
+  bind_dn: "CN=Administrator,CN=Users,DC=lab,DC=local"
+  bind_password: "LabAdminPass123!"
+  user_filter: "(sAMAccountName=%s)"
+  insecure_tls: true # dev only: samba-AD self-signed cert
+
+# Evidence: use the file sink for infra-free dev, or the s3 block for MinIO.
+evidence:
+  file: "evidence.jsonl"
+  # s3:
+  #   endpoint: "127.0.0.1:9000"
+  #   access_key: "omnisag"
+  #   secret_key: "omnisag-dev-secret"
+  #   bucket: "omni-sag-evidence"
+  #   use_ssl: false
+
+policy:
+  roles:
+    - name: dba
+      groups: ["dba"] # AD group granting this role
+      allow:
+        - host: "db1.lab.local"
+          ports: [5432]

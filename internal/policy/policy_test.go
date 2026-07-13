@@ -1,0 +1,73 @@
+package policy
+
+import "testing"
+
+// demoPolicy mirrors the Slice 1 demo: a "dba" role granting the DB host, keyed
+// off the "dba" AD group.
+func demoPolicy() Policy {
+	return Policy{Roles: []Role{
+		{
+			Name:   "dba",
+			Groups: []string{"dba"},
+			Allow:  []Rule{{Host: "db1.lab.local", Ports: []int{5432}}},
+		},
+	}}
+}
+
+func TestDecide_DBAAllowed(t *testing.T) {
+	pr := Principal{User: "alice", Groups: []string{"dba", "domain users"}}
+	d := demoPolicy().Decide(pr, Target{Host: "db1.lab.local", Port: 5432})
+	if !d.Allow {
+		t.Fatalf("dba should be allowed, got deny: %s", d.Reason)
+	}
+	if d.MatchedRole != "dba" {
+		t.Fatalf("MatchedRole = %q, want dba", d.MatchedRole)
+	}
+}
+
+func TestDecide_NonDBADenied(t *testing.T) {
+	pr := Principal{User: "bob", Groups: []string{"domain users"}}
+	d := demoPolicy().Decide(pr, Target{Host: "db1.lab.local", Port: 5432})
+	if d.Allow {
+		t.Fatal("non-dba must be denied")
+	}
+}
+
+func TestDecide_DefaultDeny_NoRoles(t *testing.T) {
+	pr := Principal{User: "nobody", Groups: nil}
+	d := demoPolicy().Decide(pr, Target{Host: "db1.lab.local", Port: 5432})
+	if d.Allow {
+		t.Fatal("principal with no groups must be denied")
+	}
+}
+
+func TestDecide_RoleButWrongTarget(t *testing.T) {
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	// right host, wrong port
+	if d := demoPolicy().Decide(pr, Target{Host: "db1.lab.local", Port: 22}); d.Allow {
+		t.Fatal("wrong port must be denied")
+	}
+	// wrong host, right port
+	if d := demoPolicy().Decide(pr, Target{Host: "evil.lab.local", Port: 5432}); d.Allow {
+		t.Fatal("wrong host must be denied")
+	}
+}
+
+func TestDecide_GroupMatchCaseInsensitive(t *testing.T) {
+	pr := Principal{User: "alice", Groups: []string{"DBA"}}
+	if d := demoPolicy().Decide(pr, Target{Host: "db1.lab.local", Port: 5432}); !d.Allow {
+		t.Fatalf("group match must be case-insensitive, got: %s", d.Reason)
+	}
+}
+
+func TestRule_WildcardHostAnyPort(t *testing.T) {
+	p := Policy{Roles: []Role{{
+		Name:   "admin",
+		Groups: []string{"admins"},
+		Allow:  []Rule{{Host: "*"}}, // any host, any port
+	}}}
+	pr := Principal{User: "root", Groups: []string{"admins"}}
+	if d := p.Decide(pr, Target{Host: "anything.lab.local", Port: 9999}); !d.Allow {
+		t.Fatalf("wildcard host/any-port must allow, got: %s", d.Reason)
+	}
+}
