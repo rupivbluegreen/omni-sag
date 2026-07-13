@@ -10,6 +10,7 @@ package session
 import (
 	"context"
 	"errors"
+	"log"
 	"net"
 	"strings"
 	"time"
@@ -21,14 +22,33 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-const groupSep = "\x00" // separator for groups packed into ssh.Permissions
+const (
+	groupSep = "\x00" // separator for groups packed into ssh.Permissions
+
+	// defaultHandshakeTimeout bounds how long an unauthenticated client may take
+	// to complete (or stall) the SSH handshake — including the auth callback.
+	// Without it a slowloris client parks a goroutine and FD indefinitely.
+	defaultHandshakeTimeout = 30 * time.Second
+
+	// maxInflightHandshakes caps concurrent in-flight handshakes so a flood of
+	// stalled connections cannot exhaust goroutines/FDs. Established sessions do
+	// not count against it (the slot is released once the handshake completes).
+	maxInflightHandshakes = 128
+
+	// authTimeout bounds the authenticator (LDAP + MFA) so a stalled DC or
+	// RADIUS server cannot block the handshake goroutine forever. Kept below
+	// defaultHandshakeTimeout so auth fails with a clean error first.
+	authTimeout = 20 * time.Second
+)
 
 // Server is the SSH front door.
 type Server struct {
-	sshCfg *ssh.ServerConfig
-	dialer *dialer.Dialer
-	sink   evidence.Sink
-	mfa    authn.MFAProvider // optional second factor; nil disables MFA
+	sshCfg           *ssh.ServerConfig
+	dialer           *dialer.Dialer
+	sink             evidence.Sink
+	mfa              authn.MFAProvider // optional second factor; nil disables MFA
+	handshakeTimeout time.Duration
+	sem              chan struct{} // bounds concurrent in-flight handshakes
 }
 
 // Option configures a Server.
@@ -42,7 +62,12 @@ func WithMFA(p authn.MFAProvider) Option {
 
 // New builds an SSH server that authenticates with auth and forwards through d.
 func New(hostKey ssh.Signer, auth authn.Authenticator, d *dialer.Dialer, sink evidence.Sink, opts ...Option) *Server {
-	s := &Server{dialer: d, sink: sink}
+	s := &Server{
+		dialer:           d,
+		sink:             sink,
+		handshakeTimeout: defaultHandshakeTimeout,
+		sem:              make(chan struct{}, maxInflightHandshakes),
+	}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -54,22 +79,35 @@ func New(hostKey ssh.Signer, auth authn.Authenticator, d *dialer.Dialer, sink ev
 	return s
 }
 
+// emit sends an evidence event, logging (never swallowing) any sink error so a
+// degraded evidence pipeline is observable. Emitting is non-optional.
+func (s *Server) emit(e evidence.Event) {
+	if err := s.sink.Emit(e); err != nil {
+		log.Printf("omni-sag: evidence emit failed (type=%s user=%s): %v", e.Type, e.User, err)
+	}
+}
+
 // passwordCallback verifies the password via the authenticator, emits an auth
 // evidence event either way, and packs the resolved identity into the
 // connection's permissions for later authorization.
 func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error) {
 	return func(meta ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-		id, err := auth.Authenticate(context.Background(), meta.User(), string(password))
+		// Bound the authenticator so a stalled DC/RADIUS cannot park this
+		// handshake goroutine indefinitely.
+		ctx, cancel := context.WithTimeout(context.Background(), authTimeout)
+		defer cancel()
+
+		id, err := auth.Authenticate(ctx, meta.User(), string(password))
 		srcIP := hostOf(meta.RemoteAddr())
 		if err != nil {
-			_ = s.sink.Emit(evidence.Event{
+			s.emit(evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeAuth,
 				User: meta.User(), SourceIP: srcIP,
 				Allow: evidence.BoolPtr(false), Reason: "authentication failed",
 			})
 			return nil, errors.New("authentication failed")
 		}
-		_ = s.sink.Emit(evidence.Event{
+		s.emit(evidence.Event{
 			Time: time.Now().UTC(), Type: evidence.TypeAuth,
 			User: id.User, SourceIP: srcIP,
 			Allow: evidence.BoolPtr(true), Reason: "authenticated",
@@ -80,7 +118,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		// not retained. The SSH password path cannot prompt interactively, so a
 		// provider that issues an interactive challenge fails closed.
 		if s.mfa != nil {
-			mfaErr := s.mfa.Verify(context.Background(), authn.MFARequest{
+			mfaErr := s.mfa.Verify(ctx, authn.MFARequest{
 				Username: id.User,
 				Password: password,
 				SourceIP: srcIP,
@@ -90,7 +128,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 			if !allowed {
 				reason = "mfa denied"
 			}
-			_ = s.sink.Emit(evidence.Event{
+			s.emit(evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeMFA,
 				User: id.User, SourceIP: srcIP,
 				Allow: evidence.BoolPtr(allowed), Reason: reason,
@@ -121,12 +159,27 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			}
 			return err
 		}
+		// Acquire a handshake slot before spawning, so a flood of stalled
+		// connections cannot grow goroutines/FDs without bound. Block here (not
+		// in the goroutine) so back-pressure reaches Accept.
+		select {
+		case s.sem <- struct{}{}:
+		case <-ctx.Done():
+			_ = conn.Close()
+			return nil
+		}
 		go s.handleConn(ctx, conn)
 	}
 }
 
 func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
+	// Bound the handshake with a deadline, then release the slot and clear the
+	// deadline once it completes. A stalled handshake trips the deadline instead
+	// of parking forever.
+	_ = raw.SetDeadline(time.Now().Add(s.handshakeTimeout))
 	sconn, chans, reqs, err := ssh.NewServerConn(raw, s.sshCfg)
+	_ = raw.SetDeadline(time.Time{})
+	<-s.sem // release the handshake slot (success or failure)
 	if err != nil {
 		_ = raw.Close()
 		return

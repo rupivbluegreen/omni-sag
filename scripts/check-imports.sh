@@ -5,7 +5,8 @@ module="github.com/rupivbluegreen/omni-sag"
 fail=0
 
 echo "== net.Dial restricted to internal/dialer =="
-matches=$(grep -rnE '\bnet\.Dial(er)?\b' --include='*.go' . \
+matches=$(grep -rnE '\bnet\.Dial(er)?\b' --include='*.go' \
+  --exclude-dir='.git' --exclude-dir='.claude' --exclude-dir='vendor' . \
   | grep -v '_test\.go:' \
   | grep -v '^\./internal/dialer/' || true)
 if [ -n "$matches" ]; then

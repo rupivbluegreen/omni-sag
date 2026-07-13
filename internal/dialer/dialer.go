@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"time"
 
@@ -52,7 +53,9 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 
 	// Emit the decision as evidence before acting on it. An evidence failure
 	// must not silently drop the record: surface it, but the decision stands.
-	_ = d.sink.Emit(evidence.Event{
+	// Slice 3 will decide whether an un-recordable allow should fail closed;
+	// for now the failure is logged so a degraded sink is observable.
+	if err := d.sink.Emit(evidence.Event{
 		Time:        time.Now().UTC(),
 		Type:        evidence.TypeTunnelDecision,
 		User:        pr.User,
@@ -61,7 +64,10 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 		Allow:       evidence.BoolPtr(decision.Allow),
 		Reason:      decision.Reason,
 		MatchedRole: decision.MatchedRole,
-	})
+	}); err != nil {
+		log.Printf("omni-sag: evidence emit failed (tunnel_decision user=%s target=%s allow=%v): %v",
+			pr.User, target, decision.Allow, err)
+	}
 
 	if !decision.Allow {
 		return nil, fmt.Errorf("%w: %s", ErrDenied, decision.Reason)

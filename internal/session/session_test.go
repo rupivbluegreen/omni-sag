@@ -162,6 +162,46 @@ func TestWalkingSkeleton_BadPasswordRejected(t *testing.T) {
 	}
 }
 
+func TestHandshakeTimeout_ClosesStalledConn(t *testing.T) {
+	// A client that connects but never sends the SSH banner must be dropped by
+	// the handshake deadline, not parked forever.
+	hostKey, err := NewEphemeralHostKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := evidence.NewMemSink()
+	d := dialer.New(policy.Policy{}, sink)
+	srv := New(hostKey, fakeAuth{}, d, sink)
+	srv.handshakeTimeout = 300 * time.Millisecond // shrink for the test
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go srv.Serve(ctx, ln)
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Send no client banner. The server writes its own version line, then must
+	// close the connection once the handshake deadline trips. Draining to EOF
+	// returns when the server drops us; if it never did, our 3s read deadline
+	// makes this take ~3s and the assertion fails.
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	start := time.Now()
+	_, _ = io.Copy(io.Discard, conn) // returns when the server closes the conn
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Fatalf("server took too long (%v) to drop a stalled handshake; deadline not enforced", elapsed)
+	}
+}
+
 // assertDecision waits briefly for the async tunnel_decision event and checks
 // its allow flag for the given user.
 func assertDecision(t *testing.T, sink *evidence.MemSink, user string, wantAllow bool) {

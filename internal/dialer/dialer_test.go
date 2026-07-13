@@ -56,6 +56,33 @@ func TestDialTarget_AllowedDials(t *testing.T) {
 	}
 }
 
+// failSink returns an error on every Emit, simulating a degraded evidence sink.
+type failSink struct{}
+
+func (failSink) Emit(evidence.Event) error { return errors.New("sink down") }
+func (failSink) Close() error              { return nil }
+
+func TestDialTarget_AllowProceedsWhenEvidenceEmitFails(t *testing.T) {
+	// An evidence sink outage must not break the allow path (the failure is
+	// logged, not swallowed silently, and the decision stands).
+	dialed := false
+	swapDial(t, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialed = true
+		client, _ := net.Pipe()
+		return client, nil
+	})
+	d := New(demoPolicy(), failSink{})
+	pr := policy.Principal{User: "alice", Groups: []string{"dba"}}
+	conn, err := d.DialTarget(context.Background(), pr, "10.0.0.5", policy.Target{Host: "db1.lab.local", Port: 5432})
+	if err != nil {
+		t.Fatalf("allow must still dial despite evidence failure, got %v", err)
+	}
+	conn.Close()
+	if !dialed {
+		t.Fatal("target should have been dialed")
+	}
+}
+
 func TestDialTarget_DeniedDoesNotDial(t *testing.T) {
 	dialCalled := false
 	swapDial(t, func(ctx context.Context, network, addr string) (net.Conn, error) {
