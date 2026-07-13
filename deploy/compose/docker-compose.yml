@@ -15,13 +15,21 @@ services:
       - "636:636"
       - "3268:3268"
       - "3269:3269"
-      - "53:53/udp"
+      # Host DNS (53) is intentionally not published: systemd-resolved owns it,
+      # and the gateway resolves targets itself. Samba runs DNS inside the
+      # container namespace regardless.
       - "88:88/tcp"
       - "88:88/udp"
       - "464:464/tcp"
       - "464:464/udp"
     cap_add:
       - NET_ADMIN
+      # SYS_ADMIN lets samba set the security.NTACL xattr on sysvol during
+      # domain provisioning; without it provisioning fails ACCESS_DENIED.
+      # Dev-lab only — unrelated to the gateway's restricted-v2 posture.
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
     restart: unless-stopped
     volumes:
       - samba-data:/var/lib/samba

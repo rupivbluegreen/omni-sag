@@ -1,4 +1,4 @@
-.PHONY: build test lint check-imports ci lab-up lab-down lab-logs
+.PHONY: build test lint check-imports ci lab-up lab-down lab-logs lab-seed
 
 build:
 	go build ./...
@@ -18,6 +18,9 @@ ci: build lint check-imports test
 
 lab-up:
 	docker compose -f deploy/compose/docker-compose.yml up -d
+
+lab-seed:
+	bash scripts/lab-seed.sh
 
 lab-down:
 	docker compose -f deploy/compose/docker-compose.yml down
