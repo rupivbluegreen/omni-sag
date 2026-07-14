@@ -1,7 +1,7 @@
 # Security Policy 🔒
 
-Omni-SAG is a security gateway, so we take this seriously — but it's also a hobby project run by
-humans, so please be kind and patient.
+Omni-SAG is a security gateway, so we take this seriously — and it's run by humans, so please be
+kind and patient.
 
 ## Reporting a vulnerability
 
@@ -19,7 +19,7 @@ Please include:
 - The commit/version you tested against.
 
 We'll acknowledge as soon as we reasonably can, work with you on a fix, and credit you (if you'd
-like) when it ships. No bug bounty — this is a hobby project — but very sincere thanks. 🙏
+like) when it ships. No bug bounty (yet!) — but very sincere thanks. 🙏
 
 ## What counts as a security issue
 

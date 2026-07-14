@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" role="img" aria-label="Omni-SAG — the SSH bastion that keeps the receipts">
+  <defs>
+    <linearGradient id="amber" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffcb52"/><stop offset="1" stop-color="#ff9e00"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="82%" cy="8%" r="65%">
+      <stop offset="0" stop-color="#ffb000" stop-opacity="0.16"/>
+      <stop offset="0.6" stop-color="#ffb000" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow2" cx="6%" cy="88%" r="55%">
+      <stop offset="0" stop-color="#57d98a" stop-opacity="0.10"/>
+      <stop offset="0.6" stop-color="#57d98a" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="grain"><feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" stitchTiles="stitch"/>
+      <feColorMatrix type="saturate" values="0"/></filter>
+    <pattern id="scan" width="4" height="4" patternUnits="userSpaceOnUse">
+      <rect width="4" height="4" fill="none"/><rect y="2" width="4" height="1" fill="#000" opacity="0.22"/>
+    </pattern>
+    <style>
+      .mono{font-family:'JetBrains Mono','DejaVu Sans Mono',ui-monospace,monospace}
+      .sans{font-family:'IBM Plex Sans','DejaVu Sans',sans-serif}
+    </style>
+  </defs>
+
+  <rect width="1280" height="640" fill="#0d0b08"/>
+  <rect width="1280" height="640" fill="url(#glow)"/>
+  <rect width="1280" height="640" fill="url(#glow2)"/>
+  <rect width="1280" height="640" fill="url(#scan)"/>
+  <rect width="1280" height="640" filter="url(#grain)" opacity="0.04"/>
+  <rect x="8" y="8" width="1264" height="624" rx="22" fill="none" stroke="#ffb000" stroke-opacity="0.18"/>
+
+  <!-- kicker -->
+  <text x="84" y="112" class="mono" font-size="24" fill="#57d98a" letter-spacing="2">● OPEN SOURCE · FAIL-CLOSED ON PURPOSE</text>
+
+  <!-- shield + wordmark -->
+  <g transform="translate(84 150) scale(1.75)">
+    <path d="M32 3 L57 12 V31 C57 47 46 57.5 32 61.5 C18 57.5 7 47 7 31 V12 Z" fill="url(#amber)"/>
+    <path d="M21 23 L31 32 L21 41" fill="none" stroke="#0d0b08" stroke-width="4.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="34" y="37.4" width="12.5" height="4.4" rx="2.2" fill="#0d0b08"/>
+  </g>
+  <text x="220" y="238" class="mono" font-size="104" font-weight="800" letter-spacing="-3" fill="#ece5d6">omni<tspan fill="#ffb000">-</tspan>sag</text>
+  <rect x="876" y="168" width="26" height="76" rx="3" fill="#ffb000"/>
+
+  <!-- tagline -->
+  <text x="84" y="320" class="sans" font-size="46" font-weight="600" fill="#ece5d6">the SSH bastion that <tspan fill="#ffb000">keeps the receipts.</tspan></text>
+
+  <!-- terminal card -->
+  <g transform="translate(84 360)">
+    <rect width="1112" height="180" rx="16" fill="#16130e" stroke="#ffb000" stroke-opacity="0.28"/>
+    <circle cx="28" cy="28" r="7" fill="#ff5f57"/><circle cx="52" cy="28" r="7" fill="#febc2e"/><circle cx="76" cy="28" r="7" fill="#28c840"/>
+    <text x="34" y="78" class="mono" font-size="26" fill="#ece5d6"><tspan fill="#ffb000">$ </tspan>ssh -L … <tspan fill="#8fbcff">alice</tspan>@gw   <tspan fill="#57d98a">✔ ALLOWED</tspan> · role=dba · tunnel open</text>
+    <text x="34" y="116" class="mono" font-size="26" fill="#ece5d6"><tspan fill="#ffb000">$ </tspan>ssh -L … <tspan fill="#8fbcff">bob</tspan>@gw     <tspan fill="#ff6b6b">✘ administratively prohibited</tspan></text>
+    <text x="34" y="154" class="mono" font-size="26" fill="#ece5d6"><tspan fill="#ffb000">$ </tspan>omni-verify -bundle ./evidence   <tspan fill="#57d98a">PASS — intact &amp; authentic</tspan></text>
+  </g>
+
+  <!-- footer -->
+  <text x="84" y="600" class="mono" font-size="26" fill="#ffb000">github.com/rupivbluegreen/omni-sag<tspan fill="#9a8f79">   ·   Go · MIT · AD+MFA · Merkle evidence</tspan></text>
+</svg>

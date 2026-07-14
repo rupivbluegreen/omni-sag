@@ -1,8 +1,7 @@
 # Contributing to Omni-SAG 🛡️
 
-Hey — thanks for even reading this. Omni-SAG is a hobby project that got a little
-out of hand (in a good way), and it's a lot more fun with company. Issues, ideas,
-docs fixes, and PRs are all genuinely welcome.
+Hey — thanks for even reading this. Omni-SAG is built in the open, and it's a lot
+more fun with company. Issues, ideas, docs fixes, and PRs are all genuinely welcome.
 
 ## TL;DR
 

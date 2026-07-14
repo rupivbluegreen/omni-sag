@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🛡️ Omni-SAG
+<img src="docs/assets/logo.svg" alt="Omni-SAG" width="440" />
 
 ### the SSH bastion that keeps the receipts
 
@@ -27,8 +27,8 @@ Active Directory (with MFA), decides what they're allowed to reach, and writes d
 a way nobody can quietly edit later. The default answer is always **no** — access is something you
 earn, per connection.
 
-It's a **hobby project**, built for the community and for anyone who thinks privileged access should
-come with receipts. No enterprise sales call required. 🙂
+It's **open source**, built in the open for anyone who thinks privileged access should come with
+receipts. No enterprise sales call required. 🙂
 
 ```console
 $ ssh -L 5432:db1.lab.local:5432 alice@gateway     # alice ∈ dba

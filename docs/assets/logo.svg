@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 96" role="img" aria-label="Omni-SAG">
+  <defs>
+    <linearGradient id="amber" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffcb52"/>
+      <stop offset="1" stop-color="#ff9e00"/>
+    </linearGradient>
+  </defs>
+  <!-- self-contained dark plate so the logo reads on any background -->
+  <rect width="384" height="96" rx="18" fill="#0d0b08"/>
+  <rect x="1" y="1" width="382" height="94" rx="17" fill="none" stroke="#ffb000" stroke-opacity="0.22"/>
+  <!-- shield mark -->
+  <g transform="translate(22 16)">
+    <path d="M32 3 L57 12 V31 C57 47 46 57.5 32 61.5 C18 57.5 7 47 7 31 V12 Z" fill="url(#amber)"/>
+    <path d="M21 23 L31 32 L21 41" fill="none" stroke="#0d0b08" stroke-width="4.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="34" y="37.4" width="12.5" height="4.4" rx="2.2" fill="#0d0b08"/>
+  </g>
+  <!-- wordmark -->
+  <text x="104" y="60" font-family="'JetBrains Mono','DejaVu Sans Mono',ui-monospace,monospace"
+        font-weight="800" font-size="34" letter-spacing="-0.5" fill="#ece5d6">omni<tspan fill="#ffb000">-</tspan>sag</text>
+  <!-- terminal block cursor -->
+  <rect x="272" y="34" width="13" height="30" rx="1.5" fill="#ffb000"/>
+</svg>

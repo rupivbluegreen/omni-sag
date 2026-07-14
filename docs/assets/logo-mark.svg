@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Omni-SAG mark">
+  <defs>
+    <linearGradient id="amber" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffcb52"/>
+      <stop offset="1" stop-color="#ff9e00"/>
+    </linearGradient>
+  </defs>
+  <!-- security shield -->
+  <path d="M32 3 L57 12 V31 C57 47 46 57.5 32 61.5 C18 57.5 7 47 7 31 V12 Z" fill="url(#amber)"/>
+  <!-- terminal prompt: >_ -->
+  <path d="M21 23 L31 32 L21 41" fill="none" stroke="#0d0b08" stroke-width="4.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="34" y="37.4" width="12.5" height="4.4" rx="2.2" fill="#0d0b08"/>
+</svg>
