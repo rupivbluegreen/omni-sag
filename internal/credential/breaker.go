@@ -42,17 +42,22 @@ func NewBreaker(cfg BreakerConfig) *Breaker {
 }
 
 // Allow reports whether a call may proceed. When open it returns false until the
-// cooldown elapses, then permits a single trial (half-open).
+// cooldown elapses, then permits EXACTLY ONE trial (half-open) — further calls
+// are refused until that trial resolves via Success/Fail, so a down or slow CCP
+// cannot be hit by a storm of concurrent requests.
 func (b *Breaker) Allow() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.openUntil.IsZero() {
 		return true // closed
 	}
-	if b.now().Before(b.openUntil) {
-		return false // open
+	if b.halfOpen {
+		return false // a trial is already in flight; admit only one
 	}
-	b.halfOpen = true // cooldown elapsed → one trial
+	if b.now().Before(b.openUntil) {
+		return false // still open
+	}
+	b.halfOpen = true // cooldown elapsed and no trial in flight → admit one
 	return true
 }
 

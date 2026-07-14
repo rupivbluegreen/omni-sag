@@ -57,9 +57,16 @@ if grep -rnE 'func \([a-zA-Z0-9_ ]*\*?Secret\) String\(\)' internal/credential/ 
   echo "internal/credential: Secret must not implement String() (ADR-0001)"
   fail=1
 fi
-if grep -rnE '\b(Password|Passphrase|Passwd|SecretValue|PlainSecret)\b[[:space:]]+string' \
+if grep -rnE '\b(Password|Passphrase|Passwd|SecretValue|PlainSecret|Secret|Token|Credential|PlainText|Plaintext)\b[[:space:]]+string' \
     --include='*.go' internal/credential/ 2>/dev/null | grep -v '_test\.go:'; then
   echo "internal/credential: secret value carried in a string field (use credential.Secret / []byte)"
+  fail=1
+fi
+# Converting secret bytes to a Go string defeats zeroization; flag string(x.Bytes())
+# in every package that handles secrets (credential + its two allowed importers).
+if grep -rnE 'string\([a-zA-Z0-9_.]*\.Bytes\(\)\)' --include='*.go' \
+    internal/credential/ internal/session/ internal/dialer/ 2>/dev/null | grep -v '_test\.go:'; then
+  echo "secret bytes converted to string (string(...Bytes())) — defeats zeroization (ADR-0001)"
   fail=1
 fi
 

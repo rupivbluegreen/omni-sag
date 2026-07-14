@@ -25,14 +25,20 @@ const (
 	ModeDeny        Mode = "deny"        // no credential path; refuse
 )
 
-// Normalize maps empty/unknown to ModePassthrough — the safe, backward-compatible
-// default (the gateway injects nothing; the caller's own connection is used).
+// Normalize maps an EMPTY (unset) mode to ModePassthrough — the safe,
+// backward-compatible default (the gateway injects nothing; the caller's own
+// connection is used). An UNKNOWN/typo'd mode is left unchanged so Resolve's
+// default fails closed rather than silently downgrading to passthrough. Config
+// validation rejects unknown modes at load; this guards non-config policy
+// sources (e.g. CRDs) too.
 func (m Mode) Normalize() Mode {
 	switch m {
 	case ModeInject, ModePrompt, ModePassthrough, ModeDeny:
 		return m
-	default:
+	case "":
 		return ModePassthrough
+	default:
+		return m // unknown -> Resolve's default returns ErrFailClosed
 	}
 }
 

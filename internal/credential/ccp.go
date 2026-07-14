@@ -117,6 +117,10 @@ func (c *CCPClient) Fetch(ctx context.Context, q Query) (*Secret, error) {
 	if !ok {
 		return nil, fmt.Errorf("ccp: response missing Content")
 	}
+	// json.RawMessage copies its input, so `raw` is a second heap buffer holding
+	// the (quoted) secret independent of `body`; wipe it too or the plaintext
+	// lingers in the heap until GC.
+	defer zero(raw)
 	secretBytes, err := jsonUnquote(raw)
 	if err != nil {
 		return nil, fmt.Errorf("ccp: content decode: %w", err)

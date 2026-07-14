@@ -55,17 +55,15 @@ func (s *Secret) Destroy() {
 
 // Format renders the secret redacted for every verb so a stray %v/%s/%q never
 // leaks it. This is intentionally NOT a String() method (ADR-0001 / CI lint).
-func (s *Secret) Format(f fmt.State, _ rune) {
+// Value receiver so that formatting a Secret VALUE (e.g. %+v on a dereferenced
+// *Secret) redacts too, not just a *Secret.
+func (s Secret) Format(f fmt.State, _ rune) {
 	_, _ = io.WriteString(f, s.redacted())
 }
 
 // GoString redacts under %#v.
-func (s *Secret) GoString() string { return "credential.Secret(REDACTED)" }
+func (s Secret) GoString() string { return "credential.Secret(REDACTED)" }
 
-func (s *Secret) redacted() string {
-	n := 0
-	if s != nil {
-		n = len(s.b)
-	}
-	return "credential.Secret(len=" + strconv.Itoa(n) + ", REDACTED)"
+func (s Secret) redacted() string {
+	return "credential.Secret(len=" + strconv.Itoa(len(s.b)) + ", REDACTED)"
 }

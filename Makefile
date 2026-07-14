@@ -7,7 +7,7 @@ test:
 	go test ./...
 
 lint:
-	@fmtout=$$(gofmt -l .); \
+	@fmtout=$$(gofmt -l . | grep -v -e '^\.claude/' -e '^vendor/' || true); \
 	if [ -n "$$fmtout" ]; then echo "gofmt needed:"; echo "$$fmtout"; exit 1; fi
 	go vet ./...
 
