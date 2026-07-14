@@ -56,6 +56,10 @@ type Rule struct {
 	Host   string
 	Ports  []int
 	Record RecordMode
+	// Credential is the credential posture for matching targets:
+	// "inject" | "prompt" | "passthrough" | "deny" (empty ⇒ passthrough). Kept
+	// as a plain string so policy stays free of the internal/credential import.
+	Credential string
 }
 
 // Role binds AD group membership to a set of allow rules.
@@ -73,10 +77,11 @@ type Policy struct {
 
 // Decision is the outcome of evaluating a Principal against a Target.
 type Decision struct {
-	Allow       bool
-	Reason      string
-	MatchedRole string     // role that granted access, empty on deny
-	RecordMode  RecordMode // recording posture of the matched target (RecordNone on deny)
+	Allow          bool
+	Reason         string
+	MatchedRole    string     // role that granted access, empty on deny
+	RecordMode     RecordMode // recording posture of the matched target (RecordNone on deny)
+	CredentialMode string     // credential posture of the matched target (empty on deny)
 }
 
 // ForwardingAllowed reports whether port-forwarding (-L) is permitted for this
@@ -130,10 +135,11 @@ func (p Policy) Decide(pr Principal, t Target) Decision {
 		for _, rule := range r.Allow {
 			if rule.matches(t) {
 				return Decision{
-					Allow:       true,
-					Reason:      "allowed by role " + r.Name,
-					MatchedRole: r.Name,
-					RecordMode:  rule.Record.Normalize(),
+					Allow:          true,
+					Reason:         "allowed by role " + r.Name,
+					MatchedRole:    r.Name,
+					RecordMode:     rule.Record.Normalize(),
+					CredentialMode: rule.Credential,
 				}
 			}
 		}

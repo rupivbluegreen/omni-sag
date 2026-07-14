@@ -96,6 +96,22 @@ inspection:
     mode: COMPLIANCE
     retention_days: 3650
 
+# Credential injection (Slice 6): the gateway can source a target credential
+# from CyberArk CCP over mutual TLS. Required only if a rule uses credential
+# "inject". If inject is configured and CyberArk is unavailable, the session
+# FAILS CLOSED — it is never downgraded to prompt/passthrough (PRD FR-18).
+# cyberark:
+#   base_url: "https://ccp.lab.local/AIMWebService"
+#   client_cert: "cyberark-client.crt"  # mTLS gateway identity (PEM)
+#   client_key:  "cyberark-client.key"
+#   ca_cert:     "cyberark-ca.crt"       # verifies the CCP server (no skip-verify)
+#   app_id: "omni-sag"
+#   safe: "targets"
+#   object_template: "{host}"            # {host} is replaced by the target host
+#   timeout_seconds: 10
+#   breaker_failures: 3
+#   breaker_cooldown_seconds: 30
+
 policy:
   roles:
     - name: dba
@@ -107,3 +123,6 @@ policy:
           #   full          -> -L forwarding is REFUSED (session must be recorded)
           #   metadata-only -> -L allowed, evidence marks the session unrecorded
           record: none
+          # credential (Slice 6): passthrough (default) | prompt | inject | deny
+          #   inject -> fetch from CyberArk; fails closed if CCP is unavailable
+          credential: passthrough

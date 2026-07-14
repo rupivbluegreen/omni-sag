@@ -160,6 +160,62 @@ policy:
 	}
 }
 
+func TestValidate_CredentialMode(t *testing.T) {
+	rule := func(cred string) string {
+		return `
+listen: ":2222"
+evidence:
+  file: "e.jsonl"
+policy:
+  roles:
+    - name: dba
+      groups: ["dba"]
+      allow:
+        - host: "db1"
+          ports: [5432]
+          credential: "` + cred + `"
+`
+	}
+	// passthrough/prompt/deny (and empty) need no CyberArk block.
+	for _, ok := range []string{"", "passthrough", "prompt", "deny"} {
+		if _, err := Load(writeTemp(t, rule(ok))); err != nil {
+			t.Fatalf("credential %q should be valid: %v", ok, err)
+		}
+	}
+	// an invalid mode is rejected.
+	if _, err := Load(writeTemp(t, rule("borrow"))); err == nil {
+		t.Fatal("invalid credential mode must be rejected")
+	}
+	// inject without a cyberark block is rejected.
+	if _, err := Load(writeTemp(t, rule("inject"))); err == nil {
+		t.Fatal("inject without a cyberark block must be rejected")
+	}
+	// inject with a cyberark block loads.
+	withCA := `
+listen: ":2222"
+evidence:
+  file: "e.jsonl"
+cyberark:
+  base_url: "https://ccp.lab/AIMWebService"
+  client_cert: "client.crt"
+  client_key: "client.key"
+  app_id: "omni-sag"
+  safe: "targets"
+  object_template: "{host}"
+policy:
+  roles:
+    - name: dba
+      groups: ["dba"]
+      allow:
+        - host: "db1"
+          ports: [5432]
+          credential: "inject"
+`
+	if _, err := Load(writeTemp(t, withCA)); err != nil {
+		t.Fatalf("inject with cyberark should load: %v", err)
+	}
+}
+
 func TestValidate_RecordingBackends(t *testing.T) {
 	both := `
 listen: ":2222"

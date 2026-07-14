@@ -25,6 +25,7 @@ const (
 	TypeRecording      Type = "recording"       // a session recording was produced (asciicast)
 	TypeTransfer       Type = "transfer"        // an SFTP file transfer manifest
 	TypeInspection     Type = "inspection"      // a content-inspection (ICAP) verdict
+	TypeCredential     Type = "credential"      // a credential-mode resolution outcome
 )
 
 // Event is a single evidence record. Fields are additive: new event kinds add
@@ -54,6 +55,10 @@ type Event struct {
 	// Content-inspection fields (inspection events).
 	Verdict    string `json:"verdict,omitempty"`     // clean | blocked | modified | error
 	ICAPStatus int    `json:"icap_status,omitempty"` // raw ICAP status code
+
+	// Credential fields (credential events). The secret is NEVER recorded.
+	CredentialMode string `json:"credential_mode,omitempty"` // inject | prompt | passthrough | deny
+	Outcome        string `json:"outcome,omitempty"`         // injected | prompt | passthrough | denied
 
 	// Freeform detail for anything not yet promoted to a field.
 	Detail string `json:"detail,omitempty"`

@@ -15,8 +15,10 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"time"
 
+	"github.com/rupivbluegreen/omni-sag/internal/credential"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 )
@@ -29,6 +31,11 @@ var ErrDenied = errors.New("dialer: target administratively prohibited")
 // forwarding (-L) is refused because the target requires full session
 // recording (PRD FR-10). No socket is opened.
 var ErrForwardingRefused = errors.New("dialer: forwarding refused on full-recording target")
+
+// ErrCredentialRefused is returned when the target's credential mode denies the
+// session or (for inject) the credential cannot be resolved and the session
+// fails closed. No socket is opened; there is no downgrade (PRD FR-18).
+var ErrCredentialRefused = errors.New("dialer: credential refused")
 
 // netDial is the ONLY net.Dial call site for targets in the codebase. It is a
 // package variable solely so tests can substitute a fake transport; production
@@ -43,11 +50,70 @@ type Dialer struct {
 	policy  policy.Policy
 	sink    evidence.Sink
 	timeout time.Duration
+	cred    *credential.Provider // optional; nil ⇒ all targets are passthrough
 }
 
-// New returns a Dialer bound to a policy and an evidence sink.
-func New(p policy.Policy, sink evidence.Sink) *Dialer {
-	return &Dialer{policy: p, sink: sink, timeout: 10 * time.Second}
+// Option configures a Dialer.
+type Option func(*Dialer)
+
+// WithCredentialProvider resolves the target's credential mode (inject | prompt
+// | passthrough | deny) as part of establishing the connection.
+func WithCredentialProvider(p *credential.Provider) Option {
+	return func(d *Dialer) { d.cred = p }
+}
+
+// New returns a Dialer bound to a policy and an evidence sink. A credential
+// provider is always installed (a fetcher-less default when none is supplied) so
+// deny/prompt/passthrough modes are enforced; only inject needs CyberArk.
+func New(p policy.Policy, sink evidence.Sink, opts ...Option) *Dialer {
+	d := &Dialer{policy: p, sink: sink, timeout: 10 * time.Second}
+	for _, opt := range opts {
+		opt(d)
+	}
+	if d.cred == nil {
+		d.cred = credential.NewProvider(credential.Config{})
+	}
+	return d
+}
+
+// CyberArkParams configures credential injection from CyberArk. Plain types so
+// the composition root (cmd) need not import internal/credential.
+type CyberArkParams struct {
+	BaseURL, ClientCert, ClientKey, CACert string
+	AppID, Safe, ObjectTemplate            string
+	TimeoutSeconds                         int
+	BreakerFailures                        int
+	BreakerCooldownSeconds                 int
+}
+
+// WithCyberArk builds a credential provider that resolves inject-mode secrets
+// from CyberArk CCP over mTLS, and returns it as an Option. Errors on bad
+// certs.
+func WithCyberArk(p CyberArkParams) (Option, error) {
+	ccp, err := credential.NewCCPClient(credential.CCPConfig{
+		BaseURL:        p.BaseURL,
+		ClientCertPath: p.ClientCert,
+		ClientKeyPath:  p.ClientKey,
+		CACertPath:     p.CACert,
+		Timeout:        time.Duration(p.TimeoutSeconds) * time.Second,
+	})
+	if err != nil {
+		return nil, err
+	}
+	appID, safe, tmpl := p.AppID, p.Safe, p.ObjectTemplate
+	query := func(req credential.Request) credential.Query {
+		host := req.Target
+		if h, _, err := net.SplitHostPort(req.Target); err == nil {
+			host = h
+		}
+		return credential.Query{AppID: appID, Safe: safe, Object: strings.ReplaceAll(tmpl, "{host}", host)}
+	}
+	breaker := credential.NewBreaker(credential.BreakerConfig{
+		Threshold: p.BreakerFailures,
+		Cooldown:  time.Duration(p.BreakerCooldownSeconds) * time.Second,
+	})
+	prov := credential.NewProvider(credential.Config{Fetcher: ccp, Query: query, Breaker: breaker})
+	return WithCredentialProvider(prov), nil
 }
 
 // DialTarget authorizes pr against target, emits the decision as evidence, and
@@ -95,6 +161,12 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 		return nil, fmt.Errorf("%w: %s", ErrForwardingRefused, target)
 	}
 
+	// Resolve the target's credential mode before opening a socket, so a deny or
+	// an inject fail-closed never leaves a dangling connection. No downgrade.
+	if err := d.resolveCredential(ctx, pr, sourceIP, target, decision); err != nil {
+		return nil, err
+	}
+
 	dialCtx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
 	conn, err := netDial(dialCtx, "tcp", target.String())
@@ -102,4 +174,60 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 		return nil, fmt.Errorf("dialer: dial %s: %w", target, err)
 	}
 	return conn, nil
+}
+
+// resolveCredential applies the target's credential mode and emits a credential
+// evidence event (never the secret). It returns an error — wrapping
+// ErrCredentialRefused — when the mode denies the session or an inject fails
+// closed; the caller must then refuse and NOT open a socket. The injected
+// secret is used just-in-time and zeroized (the real target-auth leg is stubbed
+// at the current gateway-terminated boundary — see ADR-0002).
+func (d *Dialer) resolveCredential(ctx context.Context, pr policy.Principal, sourceIP string, target policy.Target, decision policy.Decision) error {
+	if d.cred == nil {
+		return nil
+	}
+	mode := credential.Mode(decision.CredentialMode).Normalize()
+	if mode == credential.ModePassthrough {
+		// The default: the gateway injects nothing and the caller's own
+		// connection is used. Nothing to resolve or record.
+		return nil
+	}
+	res, cerr := d.cred.Resolve(ctx, credential.Request{
+		User:   pr.User,
+		Target: target.String(),
+		Mode:   mode,
+	})
+
+	outcome := string(res.Outcome)
+	reason := res.Reason
+	if cerr != nil {
+		reason = cerr.Error() // safe: credential errors never contain the secret
+		if errors.Is(cerr, credential.ErrDenied) {
+			outcome = string(credential.OutcomeDenied)
+		} else {
+			outcome = "fail_closed"
+		}
+	}
+	if err := d.sink.Emit(evidence.Event{
+		Time:           time.Now().UTC(),
+		Type:           evidence.TypeCredential,
+		User:           pr.User,
+		SourceIP:       sourceIP,
+		Target:         target.String(),
+		Allow:          evidence.BoolPtr(cerr == nil),
+		CredentialMode: string(mode.Normalize()),
+		Outcome:        outcome,
+		Reason:         reason,
+	}); err != nil {
+		log.Printf("omni-sag: evidence emit failed (credential user=%s target=%s): %v", pr.User, target, err)
+	}
+
+	if cerr != nil {
+		return fmt.Errorf("%w: %v", ErrCredentialRefused, cerr)
+	}
+	if res.Secret != nil {
+		// Just-in-time use then zeroize; never cached, never logged.
+		res.Secret.Destroy()
+	}
+	return nil
 }
