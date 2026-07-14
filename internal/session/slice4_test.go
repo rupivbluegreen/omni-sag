@@ -28,7 +28,7 @@ func startServerWith(t *testing.T, p policy.Policy, auth authn.Authenticator, si
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := dialer.New(p, sink)
+	d := dialer.New(p, sink, dialer.WithLoopbackTargetsAllowed())
 	srv := New(hostKey, auth, d, sink, opts...)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

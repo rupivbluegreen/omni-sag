@@ -59,7 +59,9 @@ func startServer(t *testing.T, p policy.Policy, auth authn.Authenticator, sink e
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := dialer.New(p, sink)
+	// Test harness targets are loopback echo servers; permit loopback so the
+	// forward path is exercised. The SSRF guard still blocks metadata/etc.
+	d := dialer.New(p, sink, dialer.WithLoopbackTargetsAllowed())
 	srv := New(hostKey, auth, d, sink)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

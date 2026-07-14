@@ -23,7 +23,12 @@ func demoPolicy() policy.Policy {
 func swapDial(t *testing.T, fn func(ctx context.Context, network, addr string) (net.Conn, error)) {
 	t.Helper()
 	orig := netDial
-	netDial = fn
+	// Adapt the 3-arg test fake to the seam's control-carrying signature; the
+	// fake replaces the whole socket so the guard control is intentionally
+	// bypassed (guard behavior is exercised via the real path in guard tests).
+	netDial = func(ctx context.Context, network, addr string, _ dialControlFunc) (net.Conn, error) {
+		return fn(ctx, network, addr)
+	}
 	t.Cleanup(func() { netDial = orig })
 }
 
