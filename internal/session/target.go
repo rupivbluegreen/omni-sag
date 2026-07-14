@@ -80,7 +80,7 @@ func (s *Server) dialTarget(ctx context.Context, sconn ssh.Conn, pr policy.Princ
 		// Residual risk documented in ADR-0002 and this plan's Global
 		// Constraints: ssh.Password requires a Go string; the conversion
 		// happens only in this expression, never bound to a variable.
-		cfg.Auth = []ssh.AuthMethod{ssh.Password(string(res.Secret.Bytes()))}
+		cfg.Auth = []ssh.AuthMethod{ssh.Password(string(res.Secret.Bytes()))} // omni-sag:target-auth-string — see ADR-0002 residual risk
 		res.Secret.Destroy()
 
 	case credential.ModePrompt:
@@ -88,7 +88,7 @@ func (s *Server) dialTarget(ctx context.Context, sconn ssh.Conn, pr policy.Princ
 		if sec == nil {
 			return nil, fmt.Errorf("%w: prompt mode for %s but no target password was collected", credential.ErrFailClosed, targetHost)
 		}
-		cfg.Auth = []ssh.AuthMethod{ssh.Password(string(sec.Bytes()))}
+		cfg.Auth = []ssh.AuthMethod{ssh.Password(string(sec.Bytes()))} // omni-sag:target-auth-string — see ADR-0002 residual risk
 		sec.Destroy()
 
 	case credential.ModePassthrough:

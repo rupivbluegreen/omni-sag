@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/rupivbluegreen/omni-sag/internal/api"
 	"github.com/rupivbluegreen/omni-sag/internal/approval"
@@ -180,6 +183,16 @@ func run(cfgPath string) error {
 		}
 		opts = append(opts, session.WithInspection(gate))
 		log.Printf("omni-sag: SFTP content inspection enabled (ICAP %s/%s)", cfg.Inspection.ICAP.Endpoint, cfg.Inspection.ICAP.Service)
+	}
+	if cfg.TargetKnownHosts != "" {
+		cb, err := knownhosts.New(cfg.TargetKnownHosts)
+		if err != nil {
+			return fmt.Errorf("target_known_hosts: %w", err)
+		}
+		opts = append(opts, session.WithTargetHostKeyCallback(cb))
+		log.Printf("omni-sag: real-target host keys verified against %s", cfg.TargetKnownHosts)
+	} else {
+		log.Printf("omni-sag: WARNING real-target host key verification is DISABLED (set target_known_hosts) — dev-lab only")
 	}
 	srv := session.New(hostKey, auth, d, met.CountingSink(ev.sessionSink), opts...)
 	met.SetActiveFn(srv.ActiveSessions)

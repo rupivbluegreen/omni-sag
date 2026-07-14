@@ -29,6 +29,8 @@ type File struct {
 	FIPS       *FIPSConfig       `yaml:"fips"`          // optional FIPS-readiness posture (off|warn|enforce)
 	DrainGrace int               `yaml:"drain_grace_seconds"`
 	Policy     PolicyConfig      `yaml:"policy"`
+
+	TargetKnownHosts string `yaml:"target_known_hosts"` // OpenSSH known_hosts path verifying real-target host keys; empty => insecure (dev only)
 }
 
 // MetricsConfig configures the Prometheus metrics endpoint, served on its own

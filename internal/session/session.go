@@ -126,6 +126,16 @@ func WithDialerPeek(peek func(pr policy.Principal, target policy.Target) policy.
 	return func(s *Server) { s.dialerPeek = peek }
 }
 
+// WithTargetHostKeyCallback verifies the real target's host key on the
+// gateway's second SSH leg (typically built from an OpenSSH known_hosts
+// file via golang.org/x/crypto/ssh/knownhosts). Nil/unset means
+// InsecureIgnoreHostKey — acceptable for the dev lab, loudly logged by
+// main() as insecure, matching the project's existing ldap.insecure_tls
+// precedent.
+func WithTargetHostKeyCallback(cb ssh.HostKeyCallback) Option {
+	return func(s *Server) { s.targetHostKeyCB = cb }
+}
+
 // WithBruteForceLimiter overrides the default per-source-IP brute-force
 // throttle. Passing nil is ignored (the defense cannot be disabled); use this
 // only to tune the Config.
