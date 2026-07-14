@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
@@ -82,10 +83,24 @@ func (s *Server) handleSession(ctx context.Context, newCh ssh.NewChannel, pr pol
 			}
 			_ = req.Reply(true, nil)
 			shellDone = make(chan struct{})
-			go func() {
+			// cols/rows are passed as arguments (not captured by closure) because
+			// this loop keeps running after dispatch — a further "pty-req" on this
+			// same channel would otherwise mutate the enclosing cols/rows variables
+			// concurrently with runRecordedShell reading them (data race, confirmed
+			// under -race by TestHandleSession_PtyReqAfterShellDoesNotRace).
+			go func(cols, rows int) {
 				defer close(shellDone)
+				// A panic in the shell bridge must not crash the whole gateway and
+				// drop every other live session, exactly like handleConn's own
+				// per-channel recover (session.go) — this goroutine runs off of
+				// handleSession's stack, so it needs its own.
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("omni-sag: recovered panic in shell goroutine (user=%s): %v", pr.User, r)
+					}
+				}()
 				s.runRecordedShell(ctx, channel, cols, rows, pr, srcIP, sconn, tch, pr.TargetHost, resizeCh)
-			}()
+			}(cols, rows)
 		case "subsystem":
 			if shellDone != nil {
 				_ = req.Reply(false, nil) // a shell was already dispatched on this channel
@@ -102,6 +117,21 @@ func (s *Server) handleSession(ctx context.Context, newCh ssh.NewChannel, pr pol
 			_ = req.Reply(false, nil)
 		}
 	}
+	// resizeCh is closed here, by its sole sender, immediately after this loop
+	// can no longer send to it — never inside runRecordedShell (the receiver).
+	// Closing it there instead, right after the bidirectional pipe finishes,
+	// was considered and rejected: this loop can still be alive and mid-way
+	// through a non-blocking `select { case resizeCh <- ...: default: }` at
+	// that exact moment (e.g. the target shell exits while the client is
+	// still connected and just resized), and a send that races a close on the
+	// same channel panics — Go's select does not fall through to default for
+	// a send on an already-closed channel, it panics immediately. Closing
+	// here, after the only sender is provably done, is race-free by
+	// construction and still lets the resize-forwarding goroutine's
+	// `for wc := range resizeCh` in runRecordedShell exit cleanly instead of
+	// blocking forever (a channel receive is not garbage-collected merely
+	// because the channel becomes unreferenced elsewhere).
+	close(resizeCh)
 	if shellDone != nil {
 		<-shellDone // wait for the real session (not just the request stream) to end
 	} else {
@@ -178,14 +208,14 @@ func (s *Server) runRecordedShell(ctx context.Context, channel ssh.Channel, cols
 	}
 
 	// Forward window-change sizes observed on the client's channel to the
-	// target session. This goroutine is abandoned (not explicitly stopped)
-	// when runRecordedShell returns below; resizeCh is owned by
-	// handleSession's request loop, not closed here, so the goroutine parks
-	// on the empty channel until GC once nothing else references resizeCh
-	// (handleSession's goroutine has by then also returned). This is a
-	// bounded, understood leak — one blocked goroutine per session until the
-	// runtime reclaims it — not a silent one; see this task's brief for why
-	// closing resizeCh here is deliberately deferred rather than done now.
+	// target session. This loop ends when resizeCh is closed — handleSession
+	// (the sole sender) closes it once its own request loop can no longer
+	// send, at the point right after that loop exits (see the comment there
+	// for why it must be closed by the sender, not from here). Without that
+	// close this goroutine would range over resizeCh forever: a Go channel
+	// blocked on receive is not garbage-collected just because it becomes
+	// unreferenced elsewhere, so this would otherwise leak one goroutine per
+	// session for the life of the process.
 	go func() {
 		for wc := range resizeCh {
 			_ = targetSession.WindowChange(wc[0], wc[1])
