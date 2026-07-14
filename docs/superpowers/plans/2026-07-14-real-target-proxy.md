@@ -1547,11 +1547,20 @@ func (s *Server) runRecordedShell(ctx context.Context, channel ssh.Channel, cols
 
 	decision := policy.Decision{}
 	if s.dialerPeek != nil {
-		decision = s.dialerPeek(pr, policy.Target{Host: targetHost})
+		decision = s.dialerPeek(pr, targetHost)
+	}
+	// decision.Port is internal/policy.Policy.DecideHost's resolved
+	// real-target port, reached here via internal/dialer.Dialer.PeekHost
+	// (Task 13 closed the "port always guessed" gap this earlier draft still
+	// had — see that task and this plan's Self-Review for the final shape).
+	// Fall back to 22 only for a test double that doesn't populate it.
+	targetPort := decision.Port
+	if targetPort <= 0 {
+		targetPort = 22
 	}
 	secretToken := "" // set by session.go's caller when auth resolved a prompt-mode secret; see Step 5's plumbing
 	targetClient, err := tch.getOrDial(func() (*ssh.Client, error) {
-		return s.dialTarget(ctx, sconn, pr, decision, targetHost, 22, secretToken)
+		return s.dialTarget(ctx, sconn, pr, decision, targetHost, targetPort, secretToken)
 	})
 	if err != nil {
 		_, _ = channel.Write([]byte(fmt.Sprintf("session refused: %s\r\n", err)))
@@ -1746,11 +1755,11 @@ Update `runRecordedShell`'s signature to accept `resizeCh <-chan [2]int` as the 
 
 ```go
 	targetClient, err := tch.getOrDial(func() (*ssh.Client, error) {
-		return s.dialTarget(ctx, sconn, pr, decision, targetHost, 22, pr.TargetSecretToken)
+		return s.dialTarget(ctx, sconn, pr, decision, targetHost, targetPort, pr.TargetSecretToken)
 	})
 ```
 
-(removing the now-redundant local `secretToken` variable).
+(removing the now-redundant local `secretToken` variable; `targetPort` is Step 4's `decision.Port`-derived value, not a hardcoded `22` — see that step's updated snippet).
 
 - [ ] **Step 6: Run the interactive tests, verify pass**
 
@@ -2464,10 +2473,20 @@ func (s *Server) runSFTP(ctx context.Context, channel ssh.Channel, pr policy.Pri
 	}
 	decision := policy.Decision{}
 	if s.dialerPeek != nil {
-		decision = s.dialerPeek(pr, policy.Target{Host: pr.TargetHost})
+		decision = s.dialerPeek(pr, pr.TargetHost)
+	}
+	// decision.Port is internal/policy.Policy.DecideHost's resolved
+	// real-target port, reached here via internal/dialer.Dialer.PeekHost —
+	// see Task 8 Step 4's identical note and this plan's Self-Review; Task 13
+	// is what actually closed the "port always guessed" gap this earlier
+	// draft still had. Fall back to 22 only for a test double that doesn't
+	// populate it.
+	targetPort := decision.Port
+	if targetPort <= 0 {
+		targetPort = 22
 	}
 	targetClient, err := tch.getOrDial(func() (*ssh.Client, error) {
-		return s.dialTarget(ctx, sconn, pr, decision, pr.TargetHost, 22, pr.TargetSecretToken)
+		return s.dialTarget(ctx, sconn, pr, decision, pr.TargetHost, targetPort, pr.TargetSecretToken)
 	})
 	if err != nil {
 		_ = channel.Close()
@@ -2779,4 +2798,6 @@ git commit -m "docs: close out ADR-0002's stand-in boundary — real target auth
 
 **Type consistency** — `dialTarget`'s signature (`ctx, sconn, pr, decision, targetHost, targetPort, secretToken`) is identical across Tasks 7, 8, and 11's `runSFTP`. `policy.Principal.TargetHost`/`TargetSecretToken` (added in Task 8) are the same names used by Task 11's `runSFTP`. `remoteFS`'s fields (`client, gate, srv, user, ctx`) are consistent between Task 9 (introduces `client`/`gate`) and Task 11 (adds `srv`/`user`/`ctx`).
 
-**Known follow-ups intentionally left out of this plan** (YAGNI — not gaps, deliberate scope cuts already called out inline): the resize-channel goroutine leak noted in Task 8 Step 4; the target port for `dialerPeek`'s prompt-mode lookup always being guessed rather than carried from the client's real target port (Task 5 Step 8); whether `credential: inject` actually has a mock CCP object to resolve in the dev lab (Task 12 Step 3, flagged for the implementer to verify and, if missing, wire up as a small addition to whatever mock-CCP fixture already exists).
+**Known follow-ups intentionally left out of this plan** (YAGNI — not gaps, deliberate scope cuts already called out inline): the resize-channel goroutine leak noted in Task 8 Step 4; whether `credential: inject` actually has a mock CCP object to resolve in the dev lab (Task 12 Step 3, flagged for the implementer to verify and, if missing, wire up as a small addition to whatever mock-CCP fixture already exists).
+
+**Update (post-Task-13):** this plan originally deferred the real-target port — Task 5 Step 8's `policy.Target{Host: targetHost}` intentionally omitted `Port`, and this section used to list "the target port for `dialerPeek`'s prompt-mode lookup always being guessed rather than carried from the client's real target port" as a follow-up left for later. Task 13 closed that gap for real: `internal/policy.Policy.DecideHost` resolves a host-only auth-time lookup to the matched rule's single configured port, `internal/dialer.Dialer.PeekHost` exposes it non-dialing, and `Decision.Port` carries it through to `dialTarget`'s actual dial address in both `interactive.go`'s `runRecordedShell` and `sftp.go`'s `runSFTP` (see those tasks' updated snippets above) — no hardcoded `22` remains in the shipped code, only as a defensive fallback for a Decision that doesn't populate Port (e.g. a test double).
