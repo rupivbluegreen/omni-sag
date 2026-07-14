@@ -76,6 +76,13 @@ type memFS struct {
 	uploads    map[string]bool
 	downloads  map[string]bool
 	inspectUps map[string]*inspectUpload
+	completed  []transfer // upload manifests captured at write-handle close
+}
+
+func (m *memFS) recordUpload(t transfer) {
+	m.mu.Lock()
+	m.completed = append(m.completed, t)
+	m.mu.Unlock()
 }
 
 func newMemFS(gate *inspectgate.Gate, ctx context.Context, user string) *memFS {
@@ -115,6 +122,13 @@ func (m *memFS) finalizePending() {
 	}
 }
 
+// maxMemFileSize caps the in-memory SFTP stand-in file size. The write offset
+// comes straight from the client's SSH_FXP_WRITE packet, so it must never be
+// used to size an allocation unchecked: a huge or negative offset would
+// otherwise panic (makeslice / slice bounds) — crashing the whole gateway,
+// since pkg/sftp's packet workers have no recover — or OOM the process.
+const maxMemFileSize = 64 << 20 // 64 MiB
+
 type memFile struct {
 	name    string
 	mu      sync.Mutex
@@ -123,9 +137,15 @@ type memFile struct {
 }
 
 func (f *memFile) WriteAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, fmt.Errorf("sftp: negative write offset %d", off)
+	}
+	end := off + int64(len(p))
+	if end < 0 || end > maxMemFileSize { // end<0 catches int64 overflow
+		return 0, fmt.Errorf("sftp: write exceeds %d-byte limit (offset=%d len=%d)", maxMemFileSize, off, len(p))
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	end := off + int64(len(p))
 	if int64(len(f.data)) < end {
 		grown := make([]byte, end)
 		copy(grown, f.data)
@@ -137,6 +157,9 @@ func (f *memFile) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func (f *memFile) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, fmt.Errorf("sftp: negative read offset %d", off)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if off >= int64(len(f.data)) {
@@ -174,7 +197,29 @@ func (m *memFS) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		f.mu.Unlock()
 	}
 	m.uploads[p] = true
-	return f, nil
+	// Return a write handle whose Close captures the transfer manifest at the
+	// path used for the upload, so a later Rename/Remove cannot erase the
+	// evidence that these bytes passed through the gateway.
+	return &memWriteHandle{fs: m, f: f, path: p}, nil
+}
+
+// memWriteHandle wraps a memFile for a single SFTP upload. pkg/sftp closes the
+// WriterAt when the transfer completes; Close records the manifest then.
+type memWriteHandle struct {
+	fs   *memFS
+	f    *memFile
+	path string
+}
+
+func (h *memWriteHandle) WriteAt(p []byte, off int64) (int, error) { return h.f.WriteAt(p, off) }
+
+func (h *memWriteHandle) Close() error {
+	h.f.mu.Lock()
+	sum := sha256.Sum256(h.f.data)
+	tr := transfer{path: h.path, direction: "upload", size: int64(len(h.f.data)), sha256: hex.EncodeToString(sum[:])}
+	h.f.mu.Unlock()
+	h.fs.recordUpload(tr)
+	return nil
 }
 
 // inspectUpload is an io.WriterAt+io.Closer that streams an SFTP upload through
@@ -317,28 +362,25 @@ type transfer struct {
 	sha256    string
 }
 
-// manifests computes a transfer record for every uploaded/downloaded path.
+// manifests returns a transfer record for every upload and download. Uploads
+// come from records captured at handle-close (immune to later rename/remove);
+// downloads are computed at session end from paths still present.
 func (m *memFS) manifests() []transfer {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var out []transfer
-	add := func(p, dir string) {
+	out := append([]transfer(nil), m.completed...) // uploads, captured at close
+	for p := range m.downloads {
+		if m.uploads[p] {
+			continue // a file both put and fetched reports once as upload
+		}
 		f := m.files[p]
 		if f == nil {
-			return
+			continue
 		}
 		f.mu.Lock()
 		sum := sha256.Sum256(f.data)
-		out = append(out, transfer{path: p, direction: dir, size: int64(len(f.data)), sha256: hex.EncodeToString(sum[:])})
+		out = append(out, transfer{path: p, direction: "download", size: int64(len(f.data)), sha256: hex.EncodeToString(sum[:])})
 		f.mu.Unlock()
-	}
-	for p := range m.uploads {
-		add(p, "upload")
-	}
-	for p := range m.downloads {
-		if !m.uploads[p] { // a file both put and fetched reports once as upload
-			add(p, "download")
-		}
 	}
 	return out
 }

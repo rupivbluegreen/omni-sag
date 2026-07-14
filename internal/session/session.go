@@ -41,6 +41,12 @@ const (
 	// RADIUS server cannot block the handshake goroutine forever. Kept below
 	// defaultHandshakeTimeout so auth fails with a clean error first.
 	authTimeout = 20 * time.Second
+
+	// maxChannelsPerConn bounds concurrent channels on a single authenticated
+	// connection so one client cannot exhaust goroutines/memory by opening an
+	// unbounded number of session/direct-tcpip channels. The handshake cap
+	// (maxInflightHandshakes) only covers the unauthenticated phase.
+	maxChannelsPerConn = 64
 )
 
 // Server is the SSH front door.
@@ -208,15 +214,36 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 	pr := principalFrom(sconn.Permissions)
 	srcIP := hostOf(sconn.RemoteAddr())
 
+	// Bound concurrent channels per connection; reject beyond the cap.
+	chSem := make(chan struct{}, maxChannelsPerConn)
 	for newCh := range chans {
-		switch newCh.ChannelType() {
-		case "direct-tcpip":
-			go s.handleDirectTCPIP(ctx, newCh, pr, srcIP)
-		case "session":
-			go s.handleSession(ctx, newCh, pr, srcIP)
-		default:
+		ct := newCh.ChannelType()
+		if ct != "direct-tcpip" && ct != "session" {
 			_ = newCh.Reject(ssh.UnknownChannelType, "unsupported channel type")
+			continue
 		}
+		select {
+		case chSem <- struct{}{}:
+		default:
+			_ = newCh.Reject(ssh.ResourceShortage, "too many concurrent channels")
+			continue
+		}
+		go func(newCh ssh.NewChannel, ct string) {
+			// A panic in one channel handler must not crash the whole gateway
+			// and drop every other live session; contain it to this channel.
+			defer func() {
+				<-chSem
+				if r := recover(); r != nil {
+					log.Printf("omni-sag: recovered panic in %s channel handler (user=%s): %v", ct, pr.User, r)
+				}
+			}()
+			switch ct {
+			case "direct-tcpip":
+				s.handleDirectTCPIP(ctx, newCh, pr, srcIP)
+			case "session":
+				s.handleSession(ctx, newCh, pr, srcIP)
+			}
+		}(newCh, ct)
 	}
 }
 

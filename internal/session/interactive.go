@@ -52,7 +52,7 @@ func (s *Server) handleSession(ctx context.Context, newCh ssh.NewChannel, pr pol
 			_ = req.Reply(true, nil)
 		case "shell":
 			_ = req.Reply(true, nil)
-			s.runRecordedShell(channel, cols, rows, pr, srcIP)
+			s.runRecordedShell(ctx, channel, cols, rows, pr, srcIP)
 			return
 		case "subsystem":
 			var sub subsystemRequest
@@ -72,7 +72,7 @@ func (s *Server) handleSession(ctx context.Context, newCh ssh.NewChannel, pr pol
 // runRecordedShell serves a minimal interactive shell over channel, recording
 // the terminal I/O as asciicast (when a store is configured) and emitting
 // session_start / recording / session_end evidence.
-func (s *Server) runRecordedShell(channel ssh.Channel, cols, rows int, pr policy.Principal, srcIP string) {
+func (s *Server) runRecordedShell(ctx context.Context, channel ssh.Channel, cols, rows int, pr policy.Principal, srcIP string) {
 	defer channel.Close()
 
 	s.emit(evidence.Event{
@@ -83,9 +83,30 @@ func (s *Server) runRecordedShell(channel ssh.Channel, cols, rows int, pr policy
 	var rec *recording.Recorder
 	var key string
 	if s.recordStore != nil {
+		// Recording is required when a store is configured. If it cannot be
+		// started, fail closed (refuse the session) rather than proceed
+		// unrecorded, and surface the failure as evidence.
 		key = fmt.Sprintf("recordings/%s/%s.cast", pr.User, time.Now().UTC().Format("20060102T150405.000000000Z"))
-		if dest, err := s.recordStore.Create(context.Background(), key); err == nil {
-			rec, _ = recording.NewRecorder(dest, key, cols, rows, nil)
+		dest, err := s.recordStore.Create(ctx, key)
+		if err == nil {
+			rec, err = recording.NewRecorder(dest, key, cols, rows, nil)
+			if err != nil {
+				_ = dest.Close() // avoid a leaked upload goroutine on the pipe
+			}
+		}
+		if err != nil {
+			s.emit(evidence.Event{
+				Time: time.Now().UTC(), Type: evidence.TypeRecording,
+				User: pr.User, SourceIP: srcIP, ObjectKey: key,
+				Allow: evidence.BoolPtr(false), Reason: "recording unavailable",
+				Detail: "recording start failed: " + err.Error(),
+			})
+			_, _ = channel.Write([]byte("session refused: recording unavailable\r\n"))
+			s.emit(evidence.Event{
+				Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
+				User: pr.User, SourceIP: srcIP, Detail: "refused: recording unavailable",
+			})
+			return
 		}
 	}
 
