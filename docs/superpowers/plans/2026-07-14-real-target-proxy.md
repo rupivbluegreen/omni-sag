@@ -877,7 +877,7 @@ git commit -m "feat: implement prompt-mode target credential via SSH keyboard-in
 - Modify: `internal/session/interactive.go:34-70` (`handleSession`'s request loop)
 
 **Interfaces:**
-- Produces: `(s *Server) forwardedAgentSigners(sconn ssh.Conn) ([]ssh.Signer, error)`
+- Produces: `(s *Server) forwardedAgentSigners(sconn ssh.Conn) ([]ssh.Signer, io.Closer, error)` — the `io.Closer` must be closed by the caller only after it's done using the signers (see the correction note in Step 3)
 - Consumes: `ssh.Conn.OpenChannel(name string, data []byte) (ssh.Channel, <-chan *ssh.Request, error)` (stdlib)
 
 The client must send `auth-agent-req@openssh.com` as a channel request on its `session` channel (what `ssh -A` does automatically); the gateway acknowledges it, and later — only when passthrough-mode auth is actually needed — opens a *new*, separate `auth-agent@openssh.com` channel back to the client to reach its forwarded agent.
@@ -915,9 +915,12 @@ func (f *fakeConn) OpenChannel(name string, data []byte) (ssh.Channel, <-chan *s
 
 func TestForwardedAgentSigners_NoForwardingFailsClosed(t *testing.T) {
 	s := &Server{}
-	_, err := s.forwardedAgentSigners(&fakeConn{openErr: errors.New("channel open failed")})
+	_, closer, err := s.forwardedAgentSigners(&fakeConn{openErr: errors.New("channel open failed")})
 	if err == nil {
 		t.Fatal("want an error when the client never forwarded an agent, got nil")
+	}
+	if closer != nil {
+		t.Fatal("a failure must never leak a non-nil closer")
 	}
 }
 ```
@@ -936,6 +939,7 @@ package session
 
 import (
 	"fmt"
+	"io"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -949,32 +953,39 @@ const agentForwardChannelType = "auth-agent@openssh.com"
 // forwardedAgentSigners opens a new auth-agent@openssh.com channel back to
 // the connected client (which must have sent an auth-agent-req@openssh.com
 // channel request first — see interactive.go's handleSession) and returns
-// the signers offered by the client's local agent. This is how passthrough
+// the signers offered by the client's local agent, plus a closer the CALLER
+// must Close() once done using the signers (e.g. after the target SSH
+// handshake completes, success or failure) — NOT before. The signers'
+// Sign() calls happen lazily, later, over this same channel; closing it
+// early makes every returned signer non-functional. This is how passthrough
 // mode authenticates the gateway's second SSH leg AS the human user, not as
 // the gateway: the target sees the client's own key.
 //
 // Failure (no forwarding requested, agent has no keys, channel rejected)
 // returns an error and never falls back to another credential mode — the
 // caller (dialTarget, Task 7) must fail closed.
-func (s *Server) forwardedAgentSigners(sconn ssh.Conn) ([]ssh.Signer, error) {
+func (s *Server) forwardedAgentSigners(sconn ssh.Conn) ([]ssh.Signer, io.Closer, error) {
 	ch, reqs, err := sconn.OpenChannel(agentForwardChannelType, nil)
 	if err != nil {
-		return nil, fmt.Errorf("session: no forwarded agent available (client must connect with ssh -A): %w", err)
+		return nil, nil, fmt.Errorf("session: no forwarded agent available (client must connect with ssh -A): %w", err)
 	}
 	go ssh.DiscardRequests(reqs)
-	defer ch.Close()
 
 	client := agent.NewClient(ch)
 	signers, err := client.Signers()
 	if err != nil {
-		return nil, fmt.Errorf("session: forwarded agent has no usable keys: %w", err)
+		ch.Close()
+		return nil, nil, fmt.Errorf("session: forwarded agent has no usable keys: %w", err)
 	}
 	if len(signers) == 0 {
-		return nil, fmt.Errorf("session: forwarded agent returned no signers")
+		ch.Close()
+		return nil, nil, fmt.Errorf("session: forwarded agent returned no signers")
 	}
-	return signers, nil
+	return signers, ch, nil // ch (ssh.Channel) satisfies io.Closer directly
 }
 ```
+
+**Correction note (post-implementation):** the first version of this task's code closed `ch` via `defer` before returning, which broke every returned signer (the agent protocol's `Sign()` RPC runs later, over the same channel, not during `Signers()`'s `List()` RPC). Task review caught this; the code above is the corrected version, and this is what actually landed in the branch. Task 7's `dialTarget` (below) reflects the corrected 3-value signature.
 
 - [ ] **Step 4: Run the test, verify it passes**
 
@@ -1186,10 +1197,14 @@ func (s *Server) dialTarget(ctx context.Context, sconn ssh.Conn, pr policy.Princ
 		if sconn == nil {
 			return nil, fmt.Errorf("%w: passthrough mode for %s but no client connection to forward from", credential.ErrFailClosed, targetHost)
 		}
-		signers, err := s.forwardedAgentSigners(sconn)
+		signers, closer, err := s.forwardedAgentSigners(sconn)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", credential.ErrFailClosed, err)
 		}
+		// closer stays open until dialTarget returns (this defer runs at
+		// function exit, not end-of-case) — signers only sign lazily, during
+		// ssh.NewClientConn below, over this same forwarded-agent channel.
+		defer closer.Close()
 		cfg.Auth = []ssh.AuthMethod{ssh.PublicKeys(signers...)}
 
 	default:
