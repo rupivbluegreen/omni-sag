@@ -153,9 +153,10 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		// bounded, so it slows the guessing source without letting anyone lock a
 		// victim out permanently.
 		if ok, retry := s.bfLimiter.Allow(srcIP); !ok {
+			loginUser, _, _ := splitTargetUser(meta.User())
 			s.emit(evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeAuth,
-				User: meta.User(), SourceIP: srcIP,
+				User: loginUser, SourceIP: srcIP,
 				Allow: evidence.BoolPtr(false), Reason: "rate limited: too many failed attempts",
 				Detail: fmt.Sprintf("locked out, retry after %s", retry.Round(time.Second)),
 			})
@@ -167,12 +168,13 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		ctx, cancel := context.WithTimeout(context.Background(), authTimeout)
 		defer cancel()
 
-		id, err := auth.Authenticate(ctx, meta.User(), string(password))
+		loginUser, targetHost, hasTarget := splitTargetUser(meta.User())
+		id, err := auth.Authenticate(ctx, loginUser, string(password))
 		if err != nil {
 			s.bfLimiter.RecordFailure(srcIP)
 			s.emit(evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeAuth,
-				User: meta.User(), SourceIP: srcIP,
+				User: loginUser, SourceIP: srcIP,
 				Allow: evidence.BoolPtr(false), Reason: "authentication failed",
 			})
 			return nil, errors.New("authentication failed")
@@ -214,10 +216,14 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		// Fully authenticated: clear any accumulated failure/lockout state so a
 		// legitimate user who mistyped is not penalized after a real success.
 		s.bfLimiter.RecordSuccess(srcIP)
-		return &ssh.Permissions{Extensions: map[string]string{
+		perms := &ssh.Permissions{Extensions: map[string]string{
 			"user":   id.User,
 			"groups": strings.Join(id.Groups, groupSep),
-		}}, nil
+		}}
+		if hasTarget {
+			perms.Extensions["target_host"] = targetHost
+		}
+		return perms, nil
 	}
 }
 
