@@ -4,11 +4,18 @@ set -euo pipefail
 module="github.com/rupivbluegreen/omni-sag"
 fail=0
 
-echo "== net.Dial restricted to internal/dialer =="
+echo "== net.Dial restricted to internal/dialer (+ marked integration clients) =="
+# Only internal/dialer may dial session TARGETS. Integration clients (LDAP,
+# RADIUS, S3) dial their operator-configured endpoint inside vendored deps and
+# so never appear here. The ICAP client (internal/inspect) hand-rolls TCP, so
+# its single dial site is explicitly annotated with the marker below; that one
+# line is exempt. The marker names an operator-configured integration endpoint,
+# NOT a session target, so the single-target-dialer invariant is preserved.
 matches=$(grep -rnE '\bnet\.Dial(er)?\b' --include='*.go' \
   --exclude-dir='.git' --exclude-dir='.claude' --exclude-dir='vendor' . \
   | grep -v '_test\.go:' \
-  | grep -v '^\./internal/dialer/' || true)
+  | grep -v '^\./internal/dialer/' \
+  | grep -v 'omni-sag:integration-dial' || true)
 if [ -n "$matches" ]; then
   echo "net.Dial/net.Dialer used outside internal/dialer:"
   echo "$matches"
