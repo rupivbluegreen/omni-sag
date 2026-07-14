@@ -15,6 +15,8 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/config"
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
+	"github.com/rupivbluegreen/omni-sag/internal/inspect"
+	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
 	"github.com/rupivbluegreen/omni-sag/internal/recording"
 	"github.com/rupivbluegreen/omni-sag/internal/session"
 )
@@ -80,6 +82,14 @@ func run(cfgPath string) error {
 		opts = append(opts, session.WithRecording(store))
 		log.Printf("omni-sag: session recording enabled")
 	}
+	if cfg.Inspection != nil && cfg.Inspection.Enabled {
+		gate, err := buildInspection(ctx, cfg.Inspection)
+		if err != nil {
+			return err
+		}
+		opts = append(opts, session.WithInspection(gate))
+		log.Printf("omni-sag: SFTP content inspection enabled (ICAP %s/%s)", cfg.Inspection.ICAP.Endpoint, cfg.Inspection.ICAP.Service)
+	}
 	srv := session.New(hostKey, auth, d, ev.sessionSink, opts...)
 
 	ln, err := net.Listen("tcp", cfg.Listen)
@@ -91,6 +101,51 @@ func run(cfgPath string) error {
 	err = srv.Serve(ctx, ln)
 	log.Printf("omni-sag: shutting down")
 	return err
+}
+
+// buildInspection wires the ICAP client, holding area, and quarantine store
+// into a content-inspection gate for SFTP uploads.
+func buildInspection(ctx context.Context, ic *config.InspectionConfig) (*inspectgate.Gate, error) {
+	insp := inspect.New(inspect.Config{
+		Endpoint:     ic.ICAP.Endpoint,
+		Service:      ic.ICAP.Service,
+		PreviewBytes: ic.ICAP.PreviewBytes,
+		Timeout:      time.Duration(ic.ICAP.TimeoutSeconds) * time.Second,
+	})
+	quar, err := inspectgate.NewWORMStore(ctx, inspectgate.WORMConfig{
+		S3Config: inspectgate.S3Config{
+			Endpoint:  ic.Quarantine.Endpoint,
+			AccessKey: ic.Quarantine.AccessKey,
+			SecretKey: ic.Quarantine.SecretKey,
+			Bucket:    ic.Quarantine.Bucket,
+			UseSSL:    ic.Quarantine.UseSSL,
+		},
+		Compliance:    ic.Quarantine.Mode != "GOVERNANCE",
+		RetentionDays: ic.Quarantine.RetentionDays,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var holding inspectgate.BlobStore
+	if ic.Holding != nil {
+		h, err := inspectgate.NewPlainStore(ctx, inspectgate.S3Config{
+			Endpoint:  ic.Holding.Endpoint,
+			AccessKey: ic.Holding.AccessKey,
+			SecretKey: ic.Holding.SecretKey,
+			Bucket:    ic.Holding.Bucket,
+			UseSSL:    ic.Holding.UseSSL,
+		})
+		if err != nil {
+			return nil, err
+		}
+		holding = h
+	}
+	return inspectgate.New(inspectgate.Config{
+		Inspector:  insp,
+		Holding:    holding,
+		Quarantine: quar,
+		Threshold:  ic.ThresholdBytes,
+	})
 }
 
 // buildRecordingStore returns the recording store for interactive sessions.

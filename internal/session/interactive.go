@@ -31,7 +31,7 @@ type subsystemRequest struct{ Name string }
 // echoes input; its purpose is to exercise the recording pipeline end-to-end.
 // Proxying the recorded PTY to a target host's shell is later work (it needs an
 // interactive target-selection mechanism not yet defined).
-func (s *Server) handleSession(_ context.Context, newCh ssh.NewChannel, pr policy.Principal, srcIP string) {
+func (s *Server) handleSession(ctx context.Context, newCh ssh.NewChannel, pr policy.Principal, srcIP string) {
 	channel, requests, err := newCh.Accept()
 	if err != nil {
 		return
@@ -58,7 +58,7 @@ func (s *Server) handleSession(_ context.Context, newCh ssh.NewChannel, pr polic
 			var sub subsystemRequest
 			if ssh.Unmarshal(req.Payload, &sub) == nil && sub.Name == "sftp" {
 				_ = req.Reply(true, nil)
-				s.runSFTP(channel, pr, srcIP)
+				s.runSFTP(ctx, channel, pr, srcIP)
 				return
 			}
 			_ = req.Reply(false, nil)

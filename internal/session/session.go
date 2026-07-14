@@ -18,6 +18,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/authn"
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
+	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 	"github.com/rupivbluegreen/omni-sag/internal/recording"
 	"golang.org/x/crypto/ssh"
@@ -49,6 +50,7 @@ type Server struct {
 	sink             evidence.Sink
 	mfa              authn.MFAProvider // optional second factor; nil disables MFA
 	recordStore      recording.Store   // optional; when set, interactive sessions are recorded
+	inspect          *inspectgate.Gate // optional; when set, SFTP uploads are content-inspected
 	handshakeTimeout time.Duration
 	sem              chan struct{} // bounds concurrent in-flight handshakes
 }
@@ -67,6 +69,13 @@ func WithMFA(p authn.MFAProvider) Option {
 // recording.
 func WithRecording(store recording.Store) Option {
 	return func(s *Server) { s.recordStore = store }
+}
+
+// WithInspection routes SFTP uploads through the content-inspection gate:
+// blocked or unscannable content is quarantined and the transfer is refused.
+// Nil (the default) disables inspection.
+func WithInspection(g *inspectgate.Gate) Option {
+	return func(s *Server) { s.inspect = g }
 }
 
 // New builds an SSH server that authenticates with auth and forwards through d.

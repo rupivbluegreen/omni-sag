@@ -201,3 +201,59 @@ policy:
 		t.Fatalf("compiled full record mode not applied: %+v", d)
 	}
 }
+
+func TestValidate_Inspection(t *testing.T) {
+	ok := `
+listen: ":2222"
+evidence:
+  file: "e.jsonl"
+inspection:
+  enabled: true
+  icap:
+    endpoint: "127.0.0.1:1344"
+    service: "avscan"
+  threshold_bytes: 1048576
+  quarantine:
+    endpoint: "127.0.0.1:9000"
+    bucket: "omni-sag-quarantine"
+policy:
+  roles: []
+`
+	if _, err := Load(writeTemp(t, ok)); err != nil {
+		t.Fatalf("valid inspection config should load: %v", err)
+	}
+
+	// enabled without quarantine bucket must fail
+	bad := `
+listen: ":2222"
+evidence:
+  file: "e.jsonl"
+inspection:
+  enabled: true
+  icap:
+    endpoint: "127.0.0.1:1344"
+    service: "avscan"
+policy:
+  roles: []
+`
+	if _, err := Load(writeTemp(t, bad)); err == nil {
+		t.Fatal("inspection enabled without quarantine must be rejected")
+	}
+
+	// enabled without icap endpoint/service must fail
+	bad2 := `
+listen: ":2222"
+evidence:
+  file: "e.jsonl"
+inspection:
+  enabled: true
+  quarantine:
+    endpoint: "127.0.0.1:9000"
+    bucket: "q"
+policy:
+  roles: []
+`
+	if _, err := Load(writeTemp(t, bad2)); err == nil {
+		t.Fatal("inspection enabled without icap endpoint/service must be rejected")
+	}
+}

@@ -68,6 +68,34 @@ evidence:
   #     mode: COMPLIANCE             # or GOVERNANCE
   #     retention_days: 3650
 
+# Content inspection (Slice 5): ICAP scanning of SFTP uploads. Disabled by
+# default. When enabled, uploads stream through the ICAP service; blocked or
+# unscannable content is quarantined (WORM) and the transfer is refused.
+# Files larger than threshold_bytes stream via the transient holding bucket so
+# a large clean file is never buffered whole (no OOM).
+inspection:
+  enabled: false
+  icap:
+    endpoint: "127.0.0.1:1344"
+    service: "avscan"
+    preview_bytes: 4096
+    timeout_seconds: 30
+  threshold_bytes: 1048576
+  holding: # transient (non-locked) bucket for large files being inspected
+    endpoint: "127.0.0.1:9000"
+    access_key: "omnisag"
+    secret_key: "omnisag-dev-secret"
+    bucket: "omni-sag-holding"
+    use_ssl: false
+  quarantine: # Object-Lock-enabled bucket for blocked/unscannable content
+    endpoint: "127.0.0.1:9000"
+    access_key: "omnisag"
+    secret_key: "omnisag-dev-secret"
+    bucket: "omni-sag-quarantine" # must be Object-Lock enabled at creation
+    use_ssl: false
+    mode: COMPLIANCE
+    retention_days: 3650
+
 policy:
   roles:
     - name: dba

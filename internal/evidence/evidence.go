@@ -24,6 +24,7 @@ const (
 	TypeSessionEnd     Type = "session_end"     // interactive session closed
 	TypeRecording      Type = "recording"       // a session recording was produced (asciicast)
 	TypeTransfer       Type = "transfer"        // an SFTP file transfer manifest
+	TypeInspection     Type = "inspection"      // a content-inspection (ICAP) verdict
 )
 
 // Event is a single evidence record. Fields are additive: new event kinds add
@@ -43,12 +44,16 @@ type Event struct {
 	MatchedRole string `json:"matched_role,omitempty"`
 	RecordMode  string `json:"record_mode,omitempty"` // none | metadata-only | full
 
-	// Recording / transfer fields (recording / transfer events).
-	ObjectKey string `json:"object_key,omitempty"` // S3 (or local) key of the artifact
+	// Recording / transfer / inspection fields.
+	ObjectKey string `json:"object_key,omitempty"` // S3 (or local) key of the artifact (or quarantine key)
 	SHA256    string `json:"sha256,omitempty"`     // digest of the artifact/file
 	Bytes     int64  `json:"bytes,omitempty"`      // size in bytes
 	Path      string `json:"path,omitempty"`       // SFTP path
 	Direction string `json:"direction,omitempty"`  // upload | download
+
+	// Content-inspection fields (inspection events).
+	Verdict    string `json:"verdict,omitempty"`     // clean | blocked | modified | error
+	ICAPStatus int    `json:"icap_status,omitempty"` // raw ICAP status code
 
 	// Freeform detail for anything not yet promoted to a field.
 	Detail string `json:"detail,omitempty"`

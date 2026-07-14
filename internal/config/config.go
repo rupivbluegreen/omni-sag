@@ -13,13 +13,33 @@ import (
 
 // File is the on-disk configuration document.
 type File struct {
-	Listen    string           `yaml:"listen"`   // SSH listen address, e.g. ":2222"
-	HostKey   string           `yaml:"host_key"` // path to the SSH host key (created if absent)
-	LDAP      LDAPConfig       `yaml:"ldap"`
-	MFA       MFAConfig        `yaml:"mfa"`
-	Evidence  EvidenceConfig   `yaml:"evidence"`
-	Recording *RecordingConfig `yaml:"recording"` // optional session-recording store
-	Policy    PolicyConfig     `yaml:"policy"`
+	Listen     string            `yaml:"listen"`   // SSH listen address, e.g. ":2222"
+	HostKey    string            `yaml:"host_key"` // path to the SSH host key (created if absent)
+	LDAP       LDAPConfig        `yaml:"ldap"`
+	MFA        MFAConfig         `yaml:"mfa"`
+	Evidence   EvidenceConfig    `yaml:"evidence"`
+	Recording  *RecordingConfig  `yaml:"recording"`  // optional session-recording store
+	Inspection *InspectionConfig `yaml:"inspection"` // optional SFTP content inspection (ICAP)
+	Policy     PolicyConfig      `yaml:"policy"`
+}
+
+// InspectionConfig configures ICAP content inspection of SFTP transfers. When
+// Enabled, uploads are streamed through the ICAP service; blocked or unscannable
+// content is quarantined to an Object-Locked bucket and the transfer refused.
+type InspectionConfig struct {
+	Enabled        bool              `yaml:"enabled"`
+	ICAP           ICAPConfig        `yaml:"icap"`
+	ThresholdBytes int64             `yaml:"threshold_bytes"` // files larger than this stream via the holding area
+	Holding        *EvidenceS3Conf   `yaml:"holding"`         // transient (non-locked) bucket for large files
+	Quarantine     *EvidenceWORMConf `yaml:"quarantine"`      // Object-Locked bucket for blocked content
+}
+
+// ICAPConfig configures the ICAP client.
+type ICAPConfig struct {
+	Endpoint       string `yaml:"endpoint"` // ICAP server host:port
+	Service        string `yaml:"service"`  // service path, e.g. "avscan"
+	PreviewBytes   int    `yaml:"preview_bytes"`
+	TimeoutSeconds int    `yaml:"timeout_seconds"`
 }
 
 // RecordingConfig selects where interactive session recordings (asciicast) are
@@ -178,6 +198,17 @@ func (f *File) validate() error {
 		}
 		if r.LocalDir != "" && r.S3 != nil {
 			return fmt.Errorf("config: set only one of recording.local_dir or recording.s3")
+		}
+	}
+	if in := f.Inspection; in != nil && in.Enabled {
+		if in.ICAP.Endpoint == "" || in.ICAP.Service == "" {
+			return fmt.Errorf("config: inspection.icap requires endpoint and service")
+		}
+		if in.Quarantine == nil || in.Quarantine.Endpoint == "" || in.Quarantine.Bucket == "" {
+			return fmt.Errorf("config: inspection.quarantine requires endpoint and bucket")
+		}
+		if in.Quarantine.Mode != "" && in.Quarantine.Mode != "COMPLIANCE" && in.Quarantine.Mode != "GOVERNANCE" {
+			return fmt.Errorf("config: inspection.quarantine.mode must be COMPLIANCE or GOVERNANCE")
 		}
 	}
 	if f.MFA.Enabled {
