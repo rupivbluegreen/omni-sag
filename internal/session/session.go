@@ -428,6 +428,12 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 		defer dereg()
 	}
 
+	// tch lazily dials and caches one target *ssh.Client per connection,
+	// shared across every channel (shell, sftp) opened on it, and closed once
+	// here when the connection ends.
+	tch := &targetConnCache{}
+	defer tch.close()
+
 	// Bound concurrent channels per connection; reject beyond the cap.
 	chSem := make(chan struct{}, maxChannelsPerConn)
 	for newCh := range chans {
@@ -465,7 +471,7 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 			case "direct-tcpip":
 				s.handleDirectTCPIP(ctx, newCh, pr, srcIP)
 			case "session":
-				s.handleSession(ctx, newCh, pr, srcIP)
+				s.handleSession(ctx, newCh, pr, srcIP, sconn, tch)
 			}
 		}(newCh, ct)
 	}
@@ -520,7 +526,12 @@ func principalFrom(perms *ssh.Permissions) policy.Principal {
 	if g := perms.Extensions["groups"]; g != "" {
 		groups = strings.Split(g, groupSep)
 	}
-	return policy.Principal{User: perms.Extensions["user"], Groups: groups}
+	return policy.Principal{
+		User:              perms.Extensions["user"],
+		Groups:            groups,
+		TargetHost:        perms.Extensions["target_host"],
+		TargetSecretToken: perms.Extensions["target_secret_token"],
+	}
 }
 
 func hostOf(addr net.Addr) string {

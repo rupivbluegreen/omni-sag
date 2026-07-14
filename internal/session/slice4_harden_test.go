@@ -92,8 +92,10 @@ func TestRecording_FailsClosedWhenStoreUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	targetHost, targetOpts := wireFakeTarget(t, "targetpw", nil)
+	opts := append([]Option{WithRecording(failStore{})}, targetOpts...)
 	d := dialer.New(policy.Policy{}, sink)
-	srv := New(hostKey, fakeAuth{users: map[string][]string{"alice": {"dba"}}}, d, sink, WithRecording(failStore{}))
+	srv := New(hostKey, fakeAuth{users: map[string][]string{"alice": {"dba"}}}, d, sink, opts...)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -103,7 +105,7 @@ func TestRecording_FailsClosedWhenStoreUnavailable(t *testing.T) {
 	t.Cleanup(cancel)
 	go srv.Serve(ctx, ln)
 
-	client := sshClient(t, ln.Addr().String(), "alice")
+	client := sshClient(t, ln.Addr().String(), "alice%"+targetHost)
 	sess, err := client.NewSession()
 	if err != nil {
 		t.Fatal(err)

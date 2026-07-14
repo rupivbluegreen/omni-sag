@@ -143,8 +143,10 @@ func TestSlice4_RecordedShellProducesAsciicastAndManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink := evidence.NewMemSink()
-	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, WithRecording(store))
-	client := sshClient(t, addr, "alice")
+	targetHost, targetOpts := wireFakeTarget(t, "targetpw", nil)
+	opts := append([]Option{WithRecording(store)}, targetOpts...)
+	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, opts...)
+	client := sshClient(t, addr, "alice%"+targetHost)
 
 	sess, err := client.NewSession()
 	if err != nil {

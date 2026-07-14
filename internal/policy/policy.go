@@ -21,6 +21,15 @@ func (t Target) String() string { return fmt.Sprintf("%s:%d", t.Host, t.Port) }
 type Principal struct {
 	User   string
 	Groups []string
+
+	// TargetHost and TargetSecretToken are pure carrier fields threaded from
+	// the SSH auth layer (session.principalFrom, packed into
+	// ssh.Permissions.Extensions during password/keyboard-interactive auth)
+	// through to the session layer, which uses them to select and dial the
+	// real target on the gateway's second SSH leg. No Decide logic depends on
+	// them — they ride along on Principal the same way Groups does.
+	TargetHost        string
+	TargetSecretToken string
 }
 
 // RecordMode is the recording posture required for a target (PRD FR-10).

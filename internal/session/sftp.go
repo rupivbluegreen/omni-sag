@@ -27,7 +27,12 @@ import (
 // accepted — blocked/unscannable content is quarantined and the transfer is
 // refused. It then emits an inspection verdict (when inspecting) and a transfer
 // manifest for every file put or fetched.
-func (s *Server) runSFTP(ctx context.Context, channel ssh.Channel, pr policy.Principal, srcIP string) {
+//
+// sconn and tch are threaded through so a future slice can proxy SFTP to the
+// real target (Task 9/11) using the same per-connection dial cache as the
+// interactive shell; unused for now — SFTP still serves an in-memory
+// filesystem at the gateway.
+func (s *Server) runSFTP(ctx context.Context, channel ssh.Channel, pr policy.Principal, srcIP string, sconn ssh.Conn, tch *targetConnCache) {
 	fs := newMemFS(s.inspect, ctx, pr.User)
 	server := sftp.NewRequestServer(channel, sftp.Handlers{
 		FileGet:  fs,

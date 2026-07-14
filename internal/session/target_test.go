@@ -96,6 +96,127 @@ func fakeTargetPipe(t *testing.T) (net.Conn, net.Conn) {
 	return c1, c2
 }
 
+// startFakeTargetShell runs a minimal SSH server, like startFakeTarget, that
+// additionally serves a toy interactive shell over any "session" channel: it
+// echoes every byte written to it straight back out, and closes the channel
+// once it reads a line consisting of exactly "exit" (terminated by \r or
+// \n) — just enough behavior for a real client to drive runRecordedShell's
+// bridge (Task 8) end-to-end in tests, without a real target host. Channel
+// types other than "session" are rejected.
+//
+// If resizeObserved is non-nil, every "window-change" request this fake
+// target receives is decoded and sent to it (non-blocking; a full buffer
+// drops the sample), letting a test assert that runRecordedShell's
+// resize-forwarding goroutine actually reached the target.
+func startFakeTargetShell(t *testing.T, wantPassword string, resizeObserved chan<- [2]int) net.Conn {
+	t.Helper()
+	signer := testHostKey(t)
+	cfg := &ssh.ServerConfig{
+		PasswordCallback: func(_ ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			if string(password) != wantPassword {
+				return nil, errors.New("wrong password")
+			}
+			return nil, nil
+		},
+	}
+	cfg.AddHostKey(signer)
+
+	clientConn, serverConn := fakeTargetPipe(t)
+	t.Cleanup(func() { clientConn.Close(); serverConn.Close() })
+	go func() {
+		sconn, chans, reqs, err := ssh.NewServerConn(serverConn, cfg)
+		if err != nil {
+			return
+		}
+		defer sconn.Close()
+		go ssh.DiscardRequests(reqs)
+		for newCh := range chans {
+			if newCh.ChannelType() != "session" {
+				_ = newCh.Reject(ssh.UnknownChannelType, "unsupported")
+				continue
+			}
+			ch, requests, err := newCh.Accept()
+			if err != nil {
+				continue
+			}
+			go func(requests <-chan *ssh.Request) {
+				for req := range requests {
+					if req.Type == "window-change" && resizeObserved != nil {
+						var wc struct{ Cols, Rows, WidthPx, HeightPx uint32 }
+						if ssh.Unmarshal(req.Payload, &wc) == nil {
+							select {
+							case resizeObserved <- [2]int{int(wc.Rows), int(wc.Cols)}:
+							default:
+							}
+						}
+					}
+					_ = req.Reply(true, nil)
+				}
+			}(requests)
+			go echoShell(ch)
+		}
+	}()
+	return clientConn
+}
+
+// echoShell is a toy "shell" used only by startFakeTargetShell: it echoes
+// every byte written to ch straight back out, and closes ch once it reads a
+// line consisting of exactly "exit" — just enough for a test client to end
+// the session the way it would end a real one.
+func echoShell(ch ssh.Channel) {
+	defer ch.Close()
+	buf := make([]byte, 1)
+	var line []byte
+	for {
+		n, err := ch.Read(buf)
+		if n > 0 {
+			b := buf[0]
+			if _, werr := ch.Write(buf[:1]); werr != nil {
+				return
+			}
+			switch b {
+			case '\r', '\n':
+				if string(line) == "exit" {
+					return
+				}
+				line = line[:0]
+			default:
+				line = append(line, b)
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// wireFakeTarget starts a fake target SSH server (startFakeTargetShell) that
+// accepts wantPassword over its toy shell, and returns a target host string
+// to dial (arbitrary — dialNet is overridden to redirect to the fake target
+// regardless of address, restored on test cleanup) plus the Options needed
+// to route a real shell session (Task 8) to it in inject-credential mode.
+// resizeObserved is forwarded to startFakeTargetShell (see its doc comment);
+// pass nil when a test doesn't care about observed window-change requests.
+func wireFakeTarget(t *testing.T, wantPassword string, resizeObserved chan<- [2]int) (targetHost string, opts []Option) {
+	t.Helper()
+	fakeConn := startFakeTargetShell(t, wantPassword, resizeObserved)
+	orig := dialNet
+	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	t.Cleanup(func() { dialNet = orig })
+
+	prov := credential.NewProvider(credential.Config{
+		Fetcher: fakeFetcher{secret: []byte(wantPassword)},
+		Query:   func(credential.Request) credential.Query { return credential.Query{} },
+	})
+	return "fake-target.lab.local", []Option{
+		WithCredentialProvider(prov),
+		WithDialerPeek(func(policy.Principal, policy.Target) policy.Decision {
+			return policy.Decision{Allow: true, CredentialMode: "inject"}
+		}),
+		WithInsecureTargetHostKey(),
+	}
+}
+
 func testHostKey(t *testing.T) ssh.Signer {
 	t.Helper()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
