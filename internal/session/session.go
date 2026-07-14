@@ -10,9 +10,12 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rupivbluegreen/omni-sag/internal/authn"
@@ -61,6 +64,10 @@ type Server struct {
 	reg              *sessions.Registry // optional; when set, live sessions are registered for the API
 	handshakeTimeout time.Duration
 	sem              chan struct{} // bounds concurrent in-flight handshakes
+
+	wg       sync.WaitGroup // tracks active connections for graceful drain
+	active   atomic.Int64   // current active connections
+	draining atomic.Bool    // set once ctx is cancelled; refuses new connections
 }
 
 // WithRegistry registers each authenticated connection in reg so the
@@ -177,10 +184,14 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 	}
 }
 
-// Serve accepts connections on ln until ctx is cancelled or ln is closed.
+// Serve accepts connections on ln until ctx is cancelled or ln is closed. On
+// cancel it stops accepting (and refuses any connection accepted in the race
+// window); existing sessions keep running until they finish or Drain's grace
+// period elapses.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	go func() {
 		<-ctx.Done()
+		s.draining.Store(true)
 		_ = ln.Close()
 	}()
 	for {
@@ -191,6 +202,10 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			}
 			return err
 		}
+		if s.draining.Load() {
+			_ = conn.Close() // draining: refuse new connections
+			continue
+		}
 		// Acquire a handshake slot before spawning, so a flood of stalled
 		// connections cannot grow goroutines/FDs without bound. Block here (not
 		// in the goroutine) so back-pressure reaches Accept.
@@ -200,9 +215,39 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			_ = conn.Close()
 			return nil
 		}
-		go s.handleConn(ctx, conn)
+		s.wg.Add(1)
+		s.active.Add(1)
+		go func(c net.Conn) {
+			defer func() {
+				s.active.Add(-1)
+				s.wg.Done()
+			}()
+			s.handleConn(ctx, c)
+		}(conn)
 	}
 }
+
+// Drain waits for active connections to finish, up to grace. It returns the
+// number of sessions still active if the grace period elapses first (the caller
+// then exits, forcibly ending them). Call after Serve returns (i.e. after the
+// context is cancelled and the listener is closed).
+func (s *Server) Drain(grace time.Duration) (int64, error) {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return 0, nil
+	case <-time.After(grace):
+		n := s.active.Load()
+		return n, fmt.Errorf("drain: %d session(s) still active after %s", n, grace)
+	}
+}
+
+// ActiveSessions returns the current active connection count.
+func (s *Server) ActiveSessions() int64 { return s.active.Load() }
 
 func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 	// Bound the handshake with a deadline, then release the slot and clear the

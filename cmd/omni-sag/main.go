@@ -24,6 +24,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/inspect"
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
+	"github.com/rupivbluegreen/omni-sag/internal/metrics"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 	"github.com/rupivbluegreen/omni-sag/internal/policysource"
 	"github.com/rupivbluegreen/omni-sag/internal/recording"
@@ -110,7 +111,11 @@ func run(cfgPath string) error {
 		log.Printf("omni-sag: four-eyes approvals enabled")
 	}
 
-	d := dialer.New(cfg.CompilePolicy(), ev.dialerSink, dopts...)
+	// Metrics: count security events by decorating the evidence sinks (no
+	// data-path hot-loop instrumentation; metrics is a leaf that never imports
+	// the control plane). Exposed on its own listener below.
+	met := metrics.New()
+	d := dialer.New(cfg.CompilePolicy(), met.CountingSink(ev.dialerSink), dopts...)
 
 	// Policy hot-reload: watch the policy file and atomically swap the dialer's
 	// policy (and the API's read view) without dropping in-flight sessions.
@@ -158,7 +163,8 @@ func run(cfgPath string) error {
 		opts = append(opts, session.WithInspection(gate))
 		log.Printf("omni-sag: SFTP content inspection enabled (ICAP %s/%s)", cfg.Inspection.ICAP.Endpoint, cfg.Inspection.ICAP.Service)
 	}
-	srv := session.New(hostKey, auth, d, ev.sessionSink, opts...)
+	srv := session.New(hostKey, auth, d, met.CountingSink(ev.sessionSink), opts...)
+	met.SetActiveFn(srv.ActiveSessions)
 
 	// Control-plane API on its OWN listener + goroutine. Its lifecycle is
 	// independent of the SSH data path: if it dies, SSH sessions keep running
@@ -172,15 +178,51 @@ func run(cfgPath string) error {
 		}
 	}
 
+	// Metrics endpoint on its own listener (control-plane, out-of-band). A
+	// scrape reads only atomic counters, so it cannot stall the SSH data path.
+	if cfg.Metrics != nil && cfg.Metrics.Listen != "" {
+		startMetricsServer(ctx, cfg.Metrics.Listen, met)
+	}
+
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return err
 	}
 	log.Printf("omni-sag listening on %s (SSH)", cfg.Listen)
 
-	err = srv.Serve(ctx, ln)
-	log.Printf("omni-sag: shutting down")
-	return err
+	if err := srv.Serve(ctx, ln); err != nil {
+		return err
+	}
+
+	// Graceful drain: the listener has stopped accepting; let existing sessions
+	// finish up to the grace period, then exit (rolling-upgrade friendly).
+	grace := time.Duration(cfg.DrainGraceSeconds()) * time.Second
+	log.Printf("omni-sag: draining, waiting up to %s for %d active session(s)", grace, srv.ActiveSessions())
+	if n, err := srv.Drain(grace); err != nil {
+		log.Printf("omni-sag: %v; exiting", err)
+	} else {
+		log.Printf("omni-sag: drained cleanly (%d sessions remained)", n)
+	}
+	return nil
+}
+
+// startMetricsServer serves Prometheus metrics on addr until ctx is cancelled.
+func startMetricsServer(ctx context.Context, addr string, met *metrics.Metrics) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", met.Handler())
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("omni-sag: metrics endpoint did not start (SSH unaffected): %v", err)
+		return
+	}
+	go func() { <-ctx.Done(); _ = srv.Close() }()
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Printf("omni-sag: metrics endpoint stopped: %v", err)
+		}
+	}()
+	log.Printf("omni-sag: metrics on %s/metrics (out-of-band)", addr)
 }
 
 // startAPIServer builds and starts the control-plane API on its own listener.

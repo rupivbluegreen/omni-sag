@@ -1,0 +1,9 @@
+apiVersion: v2
+name: omni-sag
+description: Auditable SSH/SFTP privileged-access gateway (Omni-SAG)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.25.0-0"
+sources:
+  - https://github.com/rupivbluegreen/omni-sag

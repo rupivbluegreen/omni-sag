@@ -1,0 +1,64 @@
+image:
+  repository: ghcr.io/rupivbluegreen/omni-sag
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+replicaCount: 2      # HA; sessions drain on rolling upgrade
+
+# Rolling-upgrade drain. terminationGracePeriodSeconds must exceed the gateway's
+# drain_grace_seconds so in-flight SSH sessions can finish before SIGKILL.
+drainGraceSeconds: 30
+terminationGracePeriodSeconds: 45
+
+ports:
+  ssh: 2222
+  api: 8443
+  metrics: 9090
+
+# Raw-TCP SSH ingress. Use LoadBalancer (MetalLB / cloud LB) for real ingress.
+sshService:
+  type: LoadBalancer
+  port: 22
+  # loadBalancerIP: ""    # pin if your LB supports it
+
+apiService:
+  type: ClusterIP
+
+metrics:
+  enabled: true
+  # A ServiceMonitor is out of scope here; scrape :9090/metrics.
+
+# The gateway config is templated into a ConfigMap. Secrets (bind passwords,
+# shared secrets, TLS, signing keys) belong in a Secret referenced here — do NOT
+# put them in values in production.
+configSecretName: ""   # optional Secret mounted at /etc/omni-sag alongside config
+
+# restricted-v2 / ADR-0001 compatible pod security. No IPC_LOCK, no privilege,
+# read-only rootfs, seccomp RuntimeDefault, non-root. Swap-off is a NODE
+# requirement (kubelet failSwapOn / node config), not settable here.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+  fsGroup: 0
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop: ["ALL"]
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# Writable ephemeral dirs (rootfs is read-only): host key, evidence data_dir,
+# approval store. Back with a PVC in production for durable evidence/approvals.
+persistence:
+  enabled: false
+  size: 5Gi
+  storageClass: ""

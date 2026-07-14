@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "omni-sag.fullname" . }}-ssh
+  labels: {{- include "omni-sag.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.sshService.type }}
+  {{- if .Values.sshService.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.sshService.loadBalancerIP }}
+  {{- end }}
+  selector: {{- include "omni-sag.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: ssh
+      port: {{ .Values.sshService.port }}
+      targetPort: ssh
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "omni-sag.fullname" . }}-api
+  labels: {{- include "omni-sag.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.apiService.type }}
+  selector: {{- include "omni-sag.selectorLabels" . | nindent 4 }}
+  ports:
+    - {name: api, port: {{ .Values.ports.api }}, targetPort: api}
+    {{- if .Values.metrics.enabled }}
+    - {name: metrics, port: {{ .Values.ports.metrics }}, targetPort: metrics}
+    {{- end }}
