@@ -133,7 +133,7 @@ func (r Rule) matches(t Target) bool {
 func (p Policy) Decide(pr Principal, t Target) Decision {
 	roles := p.rolesFor(pr)
 	if len(roles) == 0 {
-		return Decision{Allow: false, Reason: "no role: principal holds no role granting any access"}
+		return Decision{Allow: false, RecordMode: RecordNone, Reason: "no role: principal holds no role granting any access"}
 	}
 	for _, r := range roles {
 		for _, rule := range r.Allow {
@@ -149,7 +149,7 @@ func (p Policy) Decide(pr Principal, t Target) Decision {
 			}
 		}
 	}
-	return Decision{Allow: false, Reason: fmt.Sprintf("no rule in roles %s permits %s", roleNames(roles), t)}
+	return Decision{Allow: false, RecordMode: RecordNone, Reason: fmt.Sprintf("no rule in roles %s permits %s", roleNames(roles), t)}
 }
 
 func roleNames(roles []Role) string {
