@@ -109,6 +109,12 @@ func startFakeSFTPTarget(t *testing.T, files map[string][]byte) net.Conn {
 	if err != nil {
 		t.Fatalf("startFakeSFTPTarget: seed dial: %v", err)
 	}
+	// seedClient.Close() below only closes the SFTP subsystem session, not
+	// the underlying ssh.Client/net.Conn (pkg/sftp's Client.Close tears down
+	// its own session but doesn't own the transport it was built over) — so
+	// the raw conn needs its own cleanup or its server- and client-side
+	// transport goroutines leak for the life of the test binary.
+	t.Cleanup(func() { seedConn.Close() })
 	seedClient, err := sftp.NewClient(sshClientOver(t, seedConn))
 	if err != nil {
 		t.Fatalf("startFakeSFTPTarget: seed sftp client: %v", err)
