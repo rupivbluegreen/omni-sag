@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -119,43 +118,27 @@ func New(p policy.Policy, sink evidence.Sink, opts ...Option) *Dialer {
 	return d
 }
 
-// CyberArkParams configures credential injection from CyberArk. Plain types so
-// the composition root (cmd) need not import internal/credential.
-type CyberArkParams struct {
-	BaseURL, ClientCert, ClientKey, CACert string
-	AppID, Safe, ObjectTemplate            string
-	TimeoutSeconds                         int
-	BreakerFailures                        int
-	BreakerCooldownSeconds                 int
+// CyberArkParams configures credential injection from CyberArk.
+type CyberArkParams = credential.CyberArkParams
+
+// NewCyberArkProvider builds a CyberArk-backed credential provider without
+// wrapping it in an Option. It exists so the composition root (cmd) can build
+// ONE provider and share it between the dialer (via WithCredentialProvider)
+// and internal/session (via session.WithCredentialProvider) without itself
+// importing internal/credential — that package's CI-enforced import
+// allowlist permits only internal/session and internal/dialer.
+func NewCyberArkProvider(p CyberArkParams) (*credential.Provider, error) {
+	return credential.NewCyberArkProvider(p)
 }
 
-// WithCyberArk builds a credential provider that resolves inject-mode secrets
-// from CyberArk CCP over mTLS, and returns it as an Option. Errors on bad
-// certs.
+// WithCyberArk builds a credential provider that resolves inject-mode
+// secrets from CyberArk CCP over mTLS, and returns it as an Option. Errors on
+// bad certs.
 func WithCyberArk(p CyberArkParams) (Option, error) {
-	ccp, err := credential.NewCCPClient(credential.CCPConfig{
-		BaseURL:        p.BaseURL,
-		ClientCertPath: p.ClientCert,
-		ClientKeyPath:  p.ClientKey,
-		CACertPath:     p.CACert,
-		Timeout:        time.Duration(p.TimeoutSeconds) * time.Second,
-	})
+	prov, err := NewCyberArkProvider(p)
 	if err != nil {
 		return nil, err
 	}
-	appID, safe, tmpl := p.AppID, p.Safe, p.ObjectTemplate
-	query := func(req credential.Request) credential.Query {
-		host := req.Target
-		if h, _, err := net.SplitHostPort(req.Target); err == nil {
-			host = h
-		}
-		return credential.Query{AppID: appID, Safe: safe, Object: strings.ReplaceAll(tmpl, "{host}", host)}
-	}
-	breaker := credential.NewBreaker(credential.BreakerConfig{
-		Threshold: p.BreakerFailures,
-		Cooldown:  time.Duration(p.BreakerCooldownSeconds) * time.Second,
-	})
-	prov := credential.NewProvider(credential.Config{Fetcher: ccp, Query: query, Breaker: breaker})
 	return WithCredentialProvider(prov), nil
 }
 

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/rupivbluegreen/omni-sag/internal/authn"
+	"github.com/rupivbluegreen/omni-sag/internal/credential"
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
@@ -59,11 +60,12 @@ type Server struct {
 	sshCfg           *ssh.ServerConfig
 	dialer           *dialer.Dialer
 	sink             evidence.Sink
-	mfa              authn.MFAProvider  // optional second factor; nil disables MFA
-	recordStore      recording.Store    // optional; when set, interactive sessions are recorded
-	inspect          *inspectgate.Gate  // optional; when set, SFTP uploads are content-inspected
-	reg              *sessions.Registry // optional; when set, live sessions are registered for the API
-	bfLimiter        *ratelimit.Limiter // per-source-IP brute-force throttle (always set)
+	mfa              authn.MFAProvider    // optional second factor; nil disables MFA
+	recordStore      recording.Store      // optional; when set, interactive sessions are recorded
+	inspect          *inspectgate.Gate    // optional; when set, SFTP uploads are content-inspected
+	cred             *credential.Provider // optional; used to resolve inject-mode target credentials for real shell/SFTP sessions
+	reg              *sessions.Registry   // optional; when set, live sessions are registered for the API
+	bfLimiter        *ratelimit.Limiter   // per-source-IP brute-force throttle (always set)
 	handshakeTimeout time.Duration
 	sem              chan struct{} // bounds concurrent in-flight handshakes
 
@@ -99,6 +101,13 @@ func WithRecording(store recording.Store) Option {
 // Nil (the default) disables inspection.
 func WithInspection(g *inspectgate.Gate) Option {
 	return func(s *Server) { s.inspect = g }
+}
+
+// WithCredentialProvider resolves inject-mode target credentials for the
+// gateway's second SSH leg to a real target (shell/SFTP). Nil (the default)
+// means inject-mode targets fail closed (see Task 7's dialTarget).
+func WithCredentialProvider(p *credential.Provider) Option {
+	return func(s *Server) { s.cred = p }
 }
 
 // WithBruteForceLimiter overrides the default per-source-IP brute-force

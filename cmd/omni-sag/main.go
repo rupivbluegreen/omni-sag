@@ -87,8 +87,9 @@ func run(cfgPath string) error {
 	})
 
 	var dopts []dialer.Option
+	var sessOpts []session.Option // collected here, appended to `opts` further down where session.Option values are built
 	if ca := cfg.CyberArk; ca != nil {
-		opt, err := dialer.WithCyberArk(dialer.CyberArkParams{
+		prov, err := dialer.NewCyberArkProvider(dialer.CyberArkParams{
 			BaseURL:                ca.BaseURL,
 			ClientCert:             ca.ClientCertPath,
 			ClientKey:              ca.ClientKeyPath,
@@ -103,7 +104,8 @@ func run(cfgPath string) error {
 		if err != nil {
 			return err
 		}
-		dopts = append(dopts, opt)
+		dopts = append(dopts, dialer.WithCredentialProvider(prov))
+		sessOpts = append(sessOpts, session.WithCredentialProvider(prov))
 		log.Printf("omni-sag: CyberArk credential injection enabled (CCP %s)", ca.BaseURL)
 	}
 
@@ -149,6 +151,7 @@ func run(cfgPath string) error {
 
 	var opts []session.Option
 	opts = append(opts, session.WithRegistry(reg))
+	opts = append(opts, sessOpts...)
 	if cfg.MFA.Enabled {
 		rc := cfg.MFA.RADIUS
 		opts = append(opts, session.WithMFA(authn.NewRADIUS(authn.RADIUSConfig{
