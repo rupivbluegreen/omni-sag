@@ -127,6 +127,7 @@ func run(cfgPath string) error {
 			approvalStore = fs
 		}
 		dopts = append(dopts, dialer.WithApprovals(approvalStore, time.Duration(cfg.Approval.ApprovalTTL())*time.Second))
+		sessOpts = append(sessOpts, session.WithApprovals(approvalStore, time.Duration(cfg.Approval.ApprovalTTL())*time.Second))
 		log.Printf("omni-sag: four-eyes approvals enabled")
 	}
 
