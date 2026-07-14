@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/rupivbluegreen/omni-sag/internal/approval"
 	"github.com/rupivbluegreen/omni-sag/internal/sessions"
 )
 
@@ -85,4 +86,29 @@ func (c *Client) GetPolicy(ctx context.Context) (PolicyView, error) {
 	var pv PolicyView
 	err := c.do(ctx, http.MethodGet, "/api/v1/policy", &pv)
 	return pv, err
+}
+
+// ListApprovals returns all approval requests.
+func (c *Client) ListApprovals(ctx context.Context) ([]approval.Request, error) {
+	var out struct {
+		Approvals []approval.Request `json:"approvals"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/api/v1/approvals", &out); err != nil {
+		return nil, err
+	}
+	return out.Approvals, nil
+}
+
+// ApproveApproval approves a pending request (requires operator+, four-eyes).
+func (c *Client) ApproveApproval(ctx context.Context, id string) (approval.Request, error) {
+	var req approval.Request
+	err := c.do(ctx, http.MethodPost, "/api/v1/approvals/"+id+"/approve", &req)
+	return req, err
+}
+
+// DenyApproval denies a pending request (requires operator+).
+func (c *Client) DenyApproval(ctx context.Context, id string) (approval.Request, error) {
+	var req approval.Request
+	err := c.do(ctx, http.MethodPost, "/api/v1/approvals/"+id+"/deny", &req)
+	return req, err
 }

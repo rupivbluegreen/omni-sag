@@ -251,12 +251,16 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 		go func(newCh ssh.NewChannel, ct string) {
 			if s.reg != nil {
 				s.reg.AddChannels(sessID, 1)
+				// Publish a live supervision event so an attached supervisor sees
+				// the channel open in real time.
+				s.reg.Publish(sessID, sessions.Event{Kind: "channel_open", Detail: ct})
 			}
 			// A panic in one channel handler must not crash the whole gateway
 			// and drop every other live session; contain it to this channel.
 			defer func() {
 				if s.reg != nil {
 					s.reg.AddChannels(sessID, -1)
+					s.reg.Publish(sessID, sessions.Event{Kind: "channel_close", Detail: ct})
 				}
 				<-chSem
 				if r := recover(); r != nil {

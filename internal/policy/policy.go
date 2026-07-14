@@ -60,6 +60,9 @@ type Rule struct {
 	// "inject" | "prompt" | "passthrough" | "deny" (empty ⇒ passthrough). Kept
 	// as a plain string so policy stays free of the internal/credential import.
 	Credential string
+	// RequireApproval gates matching targets behind a four-eyes approval: the
+	// session blocks until a second human approves it (PRD approvals).
+	RequireApproval bool
 }
 
 // Role binds AD group membership to a set of allow rules.
@@ -77,11 +80,12 @@ type Policy struct {
 
 // Decision is the outcome of evaluating a Principal against a Target.
 type Decision struct {
-	Allow          bool
-	Reason         string
-	MatchedRole    string     // role that granted access, empty on deny
-	RecordMode     RecordMode // recording posture of the matched target (RecordNone on deny)
-	CredentialMode string     // credential posture of the matched target (empty on deny)
+	Allow           bool
+	Reason          string
+	MatchedRole     string     // role that granted access, empty on deny
+	RecordMode      RecordMode // recording posture of the matched target (RecordNone on deny)
+	CredentialMode  string     // credential posture of the matched target (empty on deny)
+	RequireApproval bool       // matched target requires a four-eyes approval
 }
 
 // ForwardingAllowed reports whether port-forwarding (-L) is permitted for this
@@ -135,11 +139,12 @@ func (p Policy) Decide(pr Principal, t Target) Decision {
 		for _, rule := range r.Allow {
 			if rule.matches(t) {
 				return Decision{
-					Allow:          true,
-					Reason:         "allowed by role " + r.Name,
-					MatchedRole:    r.Name,
-					RecordMode:     rule.Record.Normalize(),
-					CredentialMode: rule.Credential,
+					Allow:           true,
+					Reason:          "allowed by role " + r.Name,
+					MatchedRole:     r.Name,
+					RecordMode:      rule.Record.Normalize(),
+					CredentialMode:  rule.Credential,
+					RequireApproval: rule.RequireApproval,
 				}
 			}
 		}

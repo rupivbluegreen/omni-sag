@@ -313,3 +313,47 @@ policy:
 		t.Fatal("inspection enabled without icap endpoint/service must be rejected")
 	}
 }
+
+func TestValidate_RequireApprovalNeedsStore(t *testing.T) {
+	// A rule sets require_approval but no approval block is configured -> error.
+	bad := `
+listen: ":2222"
+evidence:
+  file: "e.jsonl"
+policy:
+  roles:
+    - name: dba
+      groups: ["dba"]
+      allow:
+        - host: "crown"
+          ports: [22]
+          require_approval: true
+`
+	if _, err := Load(writeTemp(t, bad)); err == nil {
+		t.Fatal("require_approval without an approval block must fail validation")
+	}
+
+	// With an approval block it loads and compiles the flag.
+	good := `
+listen: ":2222"
+evidence:
+  file: "e.jsonl"
+approval:
+  store_path: "approvals.json"
+policy:
+  roles:
+    - name: dba
+      groups: ["dba"]
+      allow:
+        - host: "crown"
+          ports: [22]
+          require_approval: true
+`
+	f, err := Load(writeTemp(t, good))
+	if err != nil {
+		t.Fatalf("valid approval config should load: %v", err)
+	}
+	if !f.CompilePolicy().Roles[0].Allow[0].RequireApproval {
+		t.Fatal("require_approval flag should compile into the policy rule")
+	}
+}

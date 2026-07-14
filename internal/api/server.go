@@ -7,21 +7,24 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 
+	"github.com/rupivbluegreen/omni-sag/internal/approval"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 	"github.com/rupivbluegreen/omni-sag/internal/sessions"
 )
 
 // Server serves the control-plane API.
 type Server struct {
-	reg    *sessions.Registry
-	policy func() policy.Policy
-	authz  Authorizer
-	ready  func() bool
-	mux    *http.ServeMux
+	reg       *sessions.Registry
+	policy    func() policy.Policy
+	authz     Authorizer
+	approvals approval.Store
+	ready     func() bool
+	mux       *http.ServeMux
 }
 
 // Config configures a Server.
@@ -29,17 +32,19 @@ type Config struct {
 	Registry   *sessions.Registry
 	Policy     func() policy.Policy // reads the current (hot-reloadable) policy
 	Authorizer Authorizer
-	Ready      func() bool // readiness probe; nil ⇒ always ready
+	Approvals  approval.Store // optional; enables the approvals endpoints
+	Ready      func() bool    // readiness probe; nil ⇒ always ready
 }
 
 // NewServer builds the API server and registers its routes.
 func NewServer(cfg Config) *Server {
 	s := &Server{
-		reg:    cfg.Registry,
-		policy: cfg.Policy,
-		authz:  cfg.Authorizer,
-		ready:  cfg.Ready,
-		mux:    http.NewServeMux(),
+		reg:       cfg.Registry,
+		policy:    cfg.Policy,
+		authz:     cfg.Authorizer,
+		approvals: cfg.Approvals,
+		ready:     cfg.Ready,
+		mux:       http.NewServeMux(),
 	}
 	if s.ready == nil {
 		s.ready = func() bool { return true }
@@ -67,7 +72,23 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/sessions", s.require(RoleViewer, s.listSessions))
 	s.mux.Handle("GET /api/v1/sessions/{id}", s.require(RoleViewer, s.getSession))
 	s.mux.Handle("DELETE /api/v1/sessions/{id}", s.require(RoleOperator, s.terminateSession))
+	s.mux.Handle("GET /api/v1/sessions/{id}/stream", s.require(RoleViewer, s.streamSession))
 	s.mux.Handle("GET /api/v1/policy", s.require(RoleViewer, s.getPolicy))
+
+	// Approvals (four-eyes). Read requires viewer; deciding requires operator and
+	// the store enforces approver != requester.
+	s.mux.Handle("GET /api/v1/approvals", s.require(RoleViewer, s.listApprovals))
+	s.mux.Handle("GET /api/v1/approvals/{id}", s.require(RoleViewer, s.getApproval))
+	s.mux.Handle("POST /api/v1/approvals/{id}/approve", s.require(RoleOperator, s.approveApproval))
+	s.mux.Handle("POST /api/v1/approvals/{id}/deny", s.require(RoleOperator, s.denyApproval))
+}
+
+// idCtxKey carries the authenticated Identity into handlers.
+type idCtxKey struct{}
+
+func identityFrom(r *http.Request) Identity {
+	id, _ := r.Context().Value(idCtxKey{}).(Identity)
+	return id
 }
 
 // require wraps h with authentication + a minimum-role check (fail closed).
@@ -82,7 +103,7 @@ func (s *Server) require(min Role, h http.HandlerFunc) http.Handler {
 			writeError(w, http.StatusForbidden, "forbidden: requires "+string(min))
 			return
 		}
-		h(w, r)
+		h(w, r.WithContext(context.WithValue(r.Context(), idCtxKey{}, id)))
 	})
 }
 

@@ -26,6 +26,8 @@ const (
 	TypeTransfer       Type = "transfer"        // an SFTP file transfer manifest
 	TypeInspection     Type = "inspection"      // a content-inspection (ICAP) verdict
 	TypeCredential     Type = "credential"      // a credential-mode resolution outcome
+	TypeApproval       Type = "approval"        // a four-eyes approval request/decision
+	TypeSupervision    Type = "supervision"     // a supervisor attached to / killed a session
 )
 
 // Event is a single evidence record. Fields are additive: new event kinds add

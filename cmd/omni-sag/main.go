@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/rupivbluegreen/omni-sag/internal/api"
+	"github.com/rupivbluegreen/omni-sag/internal/approval"
 	"github.com/rupivbluegreen/omni-sag/internal/authn"
 	"github.com/rupivbluegreen/omni-sag/internal/config"
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
@@ -90,6 +91,25 @@ func run(cfgPath string) error {
 		dopts = append(dopts, opt)
 		log.Printf("omni-sag: CyberArk credential injection enabled (CCP %s)", ca.BaseURL)
 	}
+
+	// Four-eyes approval store (leaf, shared with the API). The dialer blocks an
+	// approval-gated target on it; the API decides requests. The data path never
+	// imports the API.
+	var approvalStore approval.Store
+	if cfg.Approval != nil {
+		if cfg.Approval.UseCRD {
+			approvalStore = approval.CRDStore{}
+		} else {
+			fs, err := approval.NewFileStore(cfg.Approval.StorePath)
+			if err != nil {
+				return err
+			}
+			approvalStore = fs
+		}
+		dopts = append(dopts, dialer.WithApprovals(approvalStore, time.Duration(cfg.Approval.ApprovalTTL())*time.Second))
+		log.Printf("omni-sag: four-eyes approvals enabled")
+	}
+
 	d := dialer.New(cfg.CompilePolicy(), ev.dialerSink, dopts...)
 
 	// Policy hot-reload: watch the policy file and atomically swap the dialer's
@@ -144,7 +164,7 @@ func run(cfgPath string) error {
 	// independent of the SSH data path: if it dies, SSH sessions keep running
 	// and new ones still connect.
 	if cfg.API != nil {
-		if err := startAPIServer(ctx, cfg.API, reg, holder); err != nil {
+		if err := startAPIServer(ctx, cfg.API, reg, holder, approvalStore); err != nil {
 			return err
 		}
 	}
@@ -163,7 +183,7 @@ func run(cfgPath string) error {
 // startAPIServer builds and starts the control-plane API on its own listener.
 // It never blocks the caller and never shares state with the SSH data path
 // beyond the read-only registry and policy holder.
-func startAPIServer(ctx context.Context, cfg *config.APIConfig, reg *sessions.Registry, holder *policy.Holder) error {
+func startAPIServer(ctx context.Context, cfg *config.APIConfig, reg *sessions.Registry, holder *policy.Holder, approvals approval.Store) error {
 	authz, err := buildAuthorizer(cfg)
 	if err != nil {
 		return err
@@ -172,6 +192,7 @@ func startAPIServer(ctx context.Context, cfg *config.APIConfig, reg *sessions.Re
 		Registry:   reg,
 		Policy:     holder.Load,
 		Authorizer: authz,
+		Approvals:  approvals,
 	})
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {

@@ -50,6 +50,30 @@ func dispatch(ctx context.Context, c *api.Client, args []string) error {
 			return err
 		}
 		return printJSON(list)
+	case "approvals":
+		list, err := c.ListApprovals(ctx)
+		if err != nil {
+			return err
+		}
+		return printJSON(list)
+	case "approve":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: omnictl approve <id>")
+		}
+		req, err := c.ApproveApproval(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		return printJSON(req)
+	case "deny":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: omnictl deny <id>")
+		}
+		req, err := c.DenyApproval(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		return printJSON(req)
 	case "policy":
 		pv, err := c.GetPolicy(ctx)
 		if err != nil {
@@ -81,6 +105,9 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `omnictl [-api URL] [-token TOK] <command>
   sessions            list live sessions
   sessions kill <id>  terminate a session
+  approvals           list approval requests
+  approve <id>        approve a request (operator; four-eyes enforced)
+  deny <id>           deny a request (operator)
   policy              show the compiled policy
   health              check the API`)
 }

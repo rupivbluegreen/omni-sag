@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rupivbluegreen/omni-sag/internal/approval"
 	"github.com/rupivbluegreen/omni-sag/internal/credential"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
@@ -38,6 +39,11 @@ var ErrForwardingRefused = errors.New("dialer: forwarding refused on full-record
 // fails closed. No socket is opened; there is no downgrade (PRD FR-18).
 var ErrCredentialRefused = errors.New("dialer: credential refused")
 
+// ErrApprovalRefused is returned when a target requires a four-eyes approval and
+// the request was denied, expired, cancelled, or the approval store is
+// unavailable. Fail closed: no socket is opened.
+var ErrApprovalRefused = errors.New("dialer: approval refused")
+
 // netDial is the ONLY net.Dial call site for targets in the codebase. It is a
 // package variable solely so tests can substitute a fake transport; production
 // always uses the real dialer.
@@ -48,11 +54,13 @@ var netDial = func(ctx context.Context, network, addr string) (net.Conn, error) 
 
 // Dialer authorizes and opens target connections.
 type Dialer struct {
-	mu      sync.RWMutex // guards policy for hot-reload
-	policy  policy.Policy
-	sink    evidence.Sink
-	timeout time.Duration
-	cred    *credential.Provider // optional; nil ⇒ all targets are passthrough
+	mu          sync.RWMutex // guards policy for hot-reload
+	policy      policy.Policy
+	sink        evidence.Sink
+	timeout     time.Duration
+	cred        *credential.Provider // optional; nil ⇒ all targets are passthrough
+	approvals   approval.Store       // optional; required when a target sets RequireApproval
+	approvalTTL time.Duration
 }
 
 // SetPolicy atomically replaces the dialer's policy. A control-plane policy
@@ -76,6 +84,14 @@ type Option func(*Dialer)
 // | passthrough | deny) as part of establishing the connection.
 func WithCredentialProvider(p *credential.Provider) Option {
 	return func(d *Dialer) { d.cred = p }
+}
+
+// WithApprovals gates targets marked RequireApproval behind a four-eyes
+// approval: the session blocks (up to ttl) until a second human approves it via
+// the control plane, and fails closed on denial/expiry/cancel. store is a leaf
+// shared with the API — the data path never imports the control plane.
+func WithApprovals(store approval.Store, ttl time.Duration) Option {
+	return func(d *Dialer) { d.approvals = store; d.approvalTTL = ttl }
 }
 
 // New returns a Dialer bound to a policy and an evidence sink. A credential
@@ -177,6 +193,14 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 		return nil, fmt.Errorf("%w: %s", ErrForwardingRefused, target)
 	}
 
+	// A four-eyes approval-gated target blocks here until a second human approves
+	// it (or it is denied/expires) — before any credential fetch or socket.
+	if decision.RequireApproval {
+		if err := d.gateApproval(ctx, pr, sourceIP, target); err != nil {
+			return nil, err
+		}
+	}
+
 	// Resolve the target's credential mode before opening a socket, so a deny or
 	// an inject fail-closed never leaves a dangling connection. No downgrade.
 	if err := d.resolveCredential(ctx, pr, sourceIP, target, decision); err != nil {
@@ -190,6 +214,56 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 		return nil, fmt.Errorf("dialer: dial %s: %w", target, err)
 	}
 	return conn, nil
+}
+
+// gateApproval blocks the session until a four-eyes approval for this target is
+// granted. It fails closed: with no store configured, or on denial, expiry, or
+// cancellation, it returns ErrApprovalRefused and no socket is opened. Both the
+// request and the outcome are evidenced (never a secret).
+func (d *Dialer) gateApproval(ctx context.Context, pr policy.Principal, sourceIP string, target policy.Target) error {
+	if d.approvals == nil {
+		// Target requires approval but no store is wired: refuse, do not admit.
+		return fmt.Errorf("%w: approval required but no approval store configured", ErrApprovalRefused)
+	}
+	req, err := d.approvals.Create(approval.Request{
+		Kind:      approval.KindSession,
+		Requester: pr.User,
+		Subject:   target.String(),
+		Reason:    "session access to an approval-gated target",
+	}, d.approvalTTL)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrApprovalRefused, err)
+	}
+	d.emitApproval(pr, sourceIP, target, req.ID, "requested", "pending")
+
+	final, werr := d.approvals.Wait(ctx, req.ID)
+	if werr != nil { // ctx cancelled etc.
+		d.emitApproval(pr, sourceIP, target, req.ID, "refused", string(final.Status))
+		return fmt.Errorf("%w: %v", ErrApprovalRefused, werr)
+	}
+	if !final.Approved(time.Now()) {
+		d.emitApproval(pr, sourceIP, target, req.ID, "refused", string(final.EffectiveStatus(time.Now())))
+		return fmt.Errorf("%w: request %s is %s", ErrApprovalRefused, req.ID, final.EffectiveStatus(time.Now()))
+	}
+	d.emitApproval(pr, sourceIP, target, req.ID, "granted", string(approval.StatusApproved))
+	return nil
+}
+
+func (d *Dialer) emitApproval(pr policy.Principal, sourceIP string, target policy.Target, reqID, outcome, status string) {
+	allow := outcome == "granted"
+	if err := d.sink.Emit(evidence.Event{
+		Time:      time.Now().UTC(),
+		Type:      evidence.TypeApproval,
+		User:      pr.User,
+		SourceIP:  sourceIP,
+		Target:    target.String(),
+		Allow:     evidence.BoolPtr(allow),
+		Outcome:   outcome,
+		Reason:    "approval " + status,
+		ObjectKey: reqID,
+	}); err != nil {
+		log.Printf("omni-sag: evidence emit failed (approval user=%s target=%s): %v", pr.User, target, err)
+	}
 }
 
 // resolveCredential applies the target's credential mode and emits a credential
