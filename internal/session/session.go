@@ -445,6 +445,25 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 	tch := &targetConnCache{}
 	defer tch.close()
 
+	// connCtx is cancelled either when the caller's ctx is (gateway
+	// shutdown/drain) or when this specific client connection goes away
+	// (sconn.Wait returns), whichever comes first. It exists for SFTP's
+	// quarantine-release approval wait (runSFTP/quarantineWriteHandle.Close,
+	// sftp.go): that wait can otherwise block for the full approval TTL even
+	// after the client that requested the upload has vanished. One goroutine
+	// here, shared by every channel on this connection (however many SFTP
+	// subsystems get opened sequentially on it), rather than one per
+	// runSFTP invocation — sconn.Wait() blocks until the whole connection
+	// shuts down, so a per-invocation version would accumulate one
+	// live-until-teardown goroutine per sequential SFTP open on a
+	// long-lived connection.
+	connCtx, cancelConnCtx := context.WithCancel(ctx)
+	defer cancelConnCtx()
+	go func() {
+		_ = sconn.Wait()
+		cancelConnCtx()
+	}()
+
 	// Bound concurrent channels per connection; reject beyond the cap.
 	chSem := make(chan struct{}, maxChannelsPerConn)
 	for newCh := range chans {
@@ -482,7 +501,7 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 			case "direct-tcpip":
 				s.handleDirectTCPIP(ctx, newCh, pr, srcIP)
 			case "session":
-				s.handleSession(ctx, newCh, pr, srcIP, sconn, tch)
+				s.handleSession(ctx, connCtx, newCh, pr, srcIP, sconn, tch)
 			}
 		}(newCh, ct)
 	}

@@ -32,6 +32,13 @@ type subsystemRequest struct{ Name string }
 // passthrough-mode agent forwarding); tch is the per-connection target dial
 // cache shared across every channel opened on this connection, so a shell and
 // an SFTP subsystem on the same connection reuse one dial to the target.
+// connCtx is handleConn's connection-scoped context (distinct from ctx, the
+// whole-gateway shutdown context): it is cancelled on shutdown too, but also
+// as soon as this specific client connection goes away (sconn.Wait), which
+// runSFTP needs for its quarantine-release approval wait — see handleConn's
+// doc comment on connCtx and runSFTP's on its use of it. Only runSFTP uses
+// it today; the shell path has no equivalent long-blocking-on-a-human-decision
+// operation.
 //
 // The "shell" case launches runRecordedShell in its own goroutine rather than
 // calling it inline: runRecordedShell blocks for the lifetime of the session,
@@ -46,7 +53,7 @@ type subsystemRequest struct{ Name string }
 // handleSession then waits on shellDone before returning, so the caller's
 // channel-slot/registry accounting (chSem, sessions.Registry) still reflects
 // the shell's real lifetime, not just the request loop's.
-func (s *Server) handleSession(ctx context.Context, newCh ssh.NewChannel, pr policy.Principal, srcIP string, sconn ssh.Conn, tch *targetConnCache) {
+func (s *Server) handleSession(ctx, connCtx context.Context, newCh ssh.NewChannel, pr policy.Principal, srcIP string, sconn ssh.Conn, tch *targetConnCache) {
 	channel, requests, err := newCh.Accept()
 	if err != nil {
 		return
@@ -109,7 +116,7 @@ func (s *Server) handleSession(ctx context.Context, newCh ssh.NewChannel, pr pol
 			var sub subsystemRequest
 			if ssh.Unmarshal(req.Payload, &sub) == nil && sub.Name == "sftp" {
 				_ = req.Reply(true, nil)
-				s.runSFTP(ctx, channel, pr, srcIP, sconn, tch)
+				s.runSFTP(ctx, connCtx, channel, pr, srcIP, sconn, tch)
 				return
 			}
 			_ = req.Reply(false, nil)

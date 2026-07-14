@@ -171,9 +171,15 @@ func TestSFTP_InspectionBlocksAndQuarantines(t *testing.T) {
 	// closing here is just normal cleanup.
 	_ = client.Close()
 
-	// Evidence: one clean allow, one blocked deny.
+	// Evidence: one clean allow, one blocked deny. Both must carry the
+	// client's SourceIP — restored in Close() alongside the disconnect-
+	// cancellation fix; the pre-Task-11 runSFTP always included it, and the
+	// first draft of remoteFS/quarantineWriteHandle silently dropped it for
+	// every emission (inspection, approval, transfer), for both the clean
+	// and blocked/unscannable cases.
 	deadline := time.Now().Add(2 * time.Second)
 	var clean, blocked bool
+	var cleanSrcIP, blockedSrcIP string
 	for time.Now().Before(deadline) {
 		clean, blocked = false, false
 		for _, e := range sink.Events() {
@@ -181,16 +187,110 @@ func TestSFTP_InspectionBlocksAndQuarantines(t *testing.T) {
 				continue
 			}
 			if e.Verdict == "clean" && e.Allow != nil && *e.Allow {
-				clean = true
+				clean, cleanSrcIP = true, e.SourceIP
 			}
 			if e.Verdict == "blocked" && e.Allow != nil && !*e.Allow && e.ObjectKey != "" {
-				blocked = true
+				blocked, blockedSrcIP = true, e.SourceIP
 			}
 		}
 		if clean && blocked {
+			if cleanSrcIP == "" {
+				t.Fatal("clean inspection evidence is missing SourceIP")
+			}
+			if blockedSrcIP == "" {
+				t.Fatal("blocked inspection evidence is missing SourceIP")
+			}
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("expected clean+blocked inspection evidence (clean=%v blocked=%v)", clean, blocked)
+}
+
+// TestSFTP_ClientDisconnectDuringApprovalWaitUnblocksPromptly is a regression
+// test for the connection-scoped disconnect-cancellation fix (handleConn's
+// connCtx, threaded through handleSession/runSFTP into remoteFS.ctx): if the
+// client's underlying SSH connection to the GATEWAY goes away while a write
+// handle's Close() is parked in approvals.Wait — waiting on a human release
+// decision that never comes — the gateway must notice promptly, not ride out
+// the full approval TTL. startInspectingServer configures a 5s TTL
+// specifically so "promptly" (asserted well under that) is distinguishable
+// from "the TTL happened to expire".
+func TestSFTP_ClientDisconnectDuringApprovalWaitUnblocksPromptly(t *testing.T) {
+	sink := evidence.NewMemSink()
+	addr, targetHost, _, store := startInspectingServer(t, sink) // 5s approval TTL
+
+	client := sshClient(t, addr, "alice%"+targetHost)
+	sc, err := sftp.NewClient(client)
+	if err != nil {
+		t.Fatalf("sftp client: %v", err)
+	}
+
+	f, err := sc.Create("/upload.txt")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := f.Write([]byte("clean content")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// f.Close() sends FXP_CLOSE; the gateway's quarantineWriteHandle.Close()
+	// creates the KindQuarantineRelease request and blocks in approvals.Wait.
+	// The client-side call blocks too, waiting for the FXP_STATUS reply that
+	// only comes once the gateway's Close() returns — closing the connection
+	// below makes this error out on its own; its return value isn't asserted.
+	clientCloseErr := make(chan error, 1)
+	go func() { clientCloseErr <- f.Close() }()
+
+	// Wait for the pending release request to show up: only past this point
+	// do we know the gateway's Close() is actually inside approvals.Wait.
+	var reqID string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && reqID == "" {
+		for _, r := range store.List() {
+			if r.Kind == approval.KindQuarantineRelease && r.Status == approval.StatusPending {
+				reqID = r.ID
+			}
+		}
+		if reqID == "" {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if reqID == "" {
+		t.Fatal("no pending release request was created")
+	}
+
+	// Deliberately do NOT approve or deny: sever the client's connection to
+	// the GATEWAY instead, simulating the client vanishing while the request
+	// is still undecided. If connCtx weren't wired to sconn.Wait(), the
+	// gateway's Close() would keep blocking regardless, for up to the full
+	// 5s TTL.
+	killedAt := time.Now()
+	if err := client.Close(); err != nil {
+		t.Fatalf("client.Close: %v", err)
+	}
+
+	// The gateway must refuse the request well before the 5s TTL elapses —
+	// proving Close() reacted to the disconnect, not the TTL.
+	var refused bool
+	watchDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(watchDeadline) && !refused {
+		for _, e := range sink.Events() {
+			if e.Type == evidence.TypeApproval && e.ObjectKey == reqID && e.Outcome == "refused" {
+				refused = true
+			}
+		}
+		if !refused {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	elapsed := time.Since(killedAt)
+	if !refused {
+		t.Fatalf("gateway did not refuse the release within %s of the client disconnecting (approval TTL is 5s) — Close() appears to be riding out the TTL instead of reacting to the disconnect", elapsed)
+	}
+	if elapsed >= 4*time.Second {
+		t.Fatalf("release was refused %s after the disconnect — too close to the 5s TTL to prove the disconnect (not the TTL expiring) unblocked Close()", elapsed)
+	}
+	t.Logf("Close() unblocked %s after the client disconnected (TTL was 5s)", elapsed)
+	<-clientCloseErr // drain; the client-side call errors once the conn is closed
 }

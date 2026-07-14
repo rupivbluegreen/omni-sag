@@ -29,7 +29,22 @@ import (
 // human release decision (remoteFS.Filewrite/quarantineWriteHandle) —
 // blocked/unscannable content is refused outright and never reaches that
 // release step.
-func (s *Server) runSFTP(ctx context.Context, channel ssh.Channel, pr policy.Principal, srcIP string, sconn ssh.Conn, tch *targetConnCache) {
+//
+// connCtx (handleConn's connection-scoped context — see its doc comment) is
+// what remoteFS uses for the quarantine-release approval wait, not ctx: a
+// quarantine-release approval can block a write handle's Close() for as long
+// as the configured approval TTL, and connCtx (unlike ctx, which is only
+// cancelled on whole-gateway shutdown) is ALSO cancelled the moment this
+// specific client connection goes away (sconn.Wait, in handleConn) — e.g.
+// the client vanishes mid-upload after the final write+close but before a
+// human acts on the release request. Without that, a stuck Close() would
+// hold its pkg/sftp packetWorker goroutine (and the pending release request)
+// open for the full TTL even though nobody is listening anymore:
+// pkg/sftp's own Serve() cannot return (and so cannot run its own
+// per-request cleanup) until every packetWorker, including the one blocked
+// in Close(), returns — the two are circular, so external cancellation is
+// the only way out short of the TTL.
+func (s *Server) runSFTP(ctx, connCtx context.Context, channel ssh.Channel, pr policy.Principal, srcIP string, sconn ssh.Conn, tch *targetConnCache) {
 	if pr.TargetHost == "" {
 		_ = channel.Close()
 		s.emit(evidence.Event{
@@ -60,32 +75,7 @@ func (s *Server) runSFTP(ctx context.Context, channel ssh.Channel, pr policy.Pri
 	}
 	defer sftpClient.Close()
 
-	// A quarantine-release approval can block a write handle's Close() for as
-	// long as the configured approval TTL (quarantineWriteHandle.Close(),
-	// below). sessCtx ties that wait to this SFTP session's real lifetime
-	// rather than just to whole-gateway shutdown: it is cancelled either when
-	// the caller's ctx is (shutdown/drain) or when the client's underlying
-	// SSH connection goes away (sconn.Wait returns) — e.g. the client
-	// vanishes mid-upload after the final write+close but before a human
-	// acts on the release request. Without the sconn.Wait() side of this, a
-	// stuck Close() would hold its pkg/sftp packetWorker goroutine (and the
-	// pending release request) open for the full TTL even though nobody is
-	// listening anymore — ctx alone (shutdown-only) does not catch that
-	// case, since pkg/sftp's own Serve() cannot return (and so cannot run
-	// its own per-request cleanup) until every packetWorker, including the
-	// one blocked in this Close(), returns; the two are circular. sconn.Wait
-	// is safe to call from an additional goroutine (x/crypto/ssh's mux
-	// broadcasts to every waiter), so this does not interfere with anything
-	// else on the connection (e.g. a concurrent shell on the same
-	// connection, Task 8).
-	sessCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go func() {
-		_ = sconn.Wait()
-		cancel()
-	}()
-
-	fs := &remoteFS{client: sftpClient, gate: s.inspect, srv: s, user: pr.User, ctx: sessCtx}
+	fs := &remoteFS{client: sftpClient, gate: s.inspect, srv: s, user: pr.User, srcIP: srcIP, ctx: connCtx}
 	server := sftp.NewRequestServer(channel, sftp.Handlers{
 		FileGet:  fs,
 		FilePut:  fs,
@@ -109,6 +99,7 @@ type remoteFS struct {
 	gate   *inspectgate.Gate // set when inspection is configured; used by Filewrite
 	srv    *Server           // for approvals/evidence; nil only in Task 9's read-only tests
 	user   string
+	srcIP  string // source IP of the client connection; threaded into every evidence event Close() emits
 	ctx    context.Context
 }
 
@@ -229,7 +220,7 @@ func (h *quarantineWriteHandle) Close() error {
 	if h.fs.srv != nil {
 		h.fs.srv.emit(evidence.Event{
 			Time: time.Now().UTC(), Type: evidence.TypeInspection,
-			User: h.fs.user, Path: h.path, Direction: "upload",
+			User: h.fs.user, SourceIP: h.fs.srcIP, Path: h.path, Direction: "upload",
 			Bytes: dec.Bytes, SHA256: dec.SHA256,
 			Verdict: dec.Verdict, ICAPStatus: dec.ICAPStatus,
 			ObjectKey: dec.QuarantineKey, Allow: evidence.BoolPtr(dec.Allow),
@@ -253,7 +244,7 @@ func (h *quarantineWriteHandle) Close() error {
 	}
 	h.fs.srv.emit(evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeApproval,
-		User: h.fs.user, Target: h.path, ObjectKey: req.ID,
+		User: h.fs.user, SourceIP: h.fs.srcIP, Target: h.path, ObjectKey: req.ID,
 		Outcome: "requested", Reason: "quarantine release pending",
 	})
 
@@ -261,7 +252,7 @@ func (h *quarantineWriteHandle) Close() error {
 	approved := werr == nil && final.Approved(time.Now())
 	h.fs.srv.emit(evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeApproval,
-		User: h.fs.user, Target: h.path, ObjectKey: req.ID,
+		User: h.fs.user, SourceIP: h.fs.srcIP, Target: h.path, ObjectKey: req.ID,
 		Allow:   evidence.BoolPtr(approved),
 		Outcome: map[bool]string{true: "granted", false: "refused"}[approved],
 		Reason:  "quarantine release " + string(final.EffectiveStatus(time.Now())),
@@ -286,7 +277,7 @@ func (h *quarantineWriteHandle) Close() error {
 
 	h.fs.srv.emit(evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeTransfer,
-		User: h.fs.user, Path: h.path, Direction: "upload",
+		User: h.fs.user, SourceIP: h.fs.srcIP, Path: h.path, Direction: "upload",
 		Bytes: dec.Bytes, SHA256: dec.SHA256, ObjectKey: dec.QuarantineKey,
 		Detail: "sftp transfer (released from quarantine)",
 	})
