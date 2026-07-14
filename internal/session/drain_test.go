@@ -20,7 +20,7 @@ func drainServer(t *testing.T, p policy.Policy) (*Server, string, context.Cancel
 		t.Fatal(err)
 	}
 	sink := evidence.NewMemSink()
-	d := dialer.New(p, sink)
+	d := dialer.New(p, sink, dialer.WithLoopbackTargetsAllowed())
 	srv := New(hostKey, fakeAuth{users: map[string][]string{"alice": {"dba"}}}, d, sink)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

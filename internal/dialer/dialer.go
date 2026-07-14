@@ -47,8 +47,12 @@ var ErrApprovalRefused = errors.New("dialer: approval refused")
 // netDial is the ONLY net.Dial call site for targets in the codebase. It is a
 // package variable solely so tests can substitute a fake transport; production
 // always uses the real dialer.
-var netDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
-	var d net.Dialer
+var netDial = func(ctx context.Context, network, addr string, control dialControlFunc) (net.Conn, error) {
+	// control runs after the resolver produces a concrete IP and before the
+	// socket connects, so the resolved-address guard validates the ACTUAL
+	// resolved address (closing the DNS-rebinding/TOCTOU gap) and fails closed
+	// on any blocked range. See guard.go.
+	d := net.Dialer{Control: control}
 	return d.DialContext(ctx, network, addr)
 }
 
@@ -61,6 +65,10 @@ type Dialer struct {
 	cred        *credential.Provider // optional; nil ⇒ all targets are passthrough
 	approvals   approval.Store       // optional; required when a target sets RequireApproval
 	approvalTTL time.Duration
+	// dialControl is the net.Dialer.Control installed at the single dial site;
+	// it is the resolved-address (SSRF/DNS-rebinding) guard. Defaults to the
+	// strict production guard; an Option may relax it for test/dev harnesses.
+	dialControl dialControlFunc
 }
 
 // SetPolicy atomically replaces the dialer's policy. A control-plane policy
@@ -98,12 +106,15 @@ func WithApprovals(store approval.Store, ttl time.Duration) Option {
 // provider is always installed (a fetcher-less default when none is supplied) so
 // deny/prompt/passthrough modes are enforced; only inject needs CyberArk.
 func New(p policy.Policy, sink evidence.Sink, opts ...Option) *Dialer {
-	d := &Dialer{policy: p, sink: sink, timeout: 10 * time.Second}
+	d := &Dialer{policy: p, sink: sink, timeout: 10 * time.Second, dialControl: guardResolvedAddr}
 	for _, opt := range opts {
 		opt(d)
 	}
 	if d.cred == nil {
 		d.cred = credential.NewProvider(credential.Config{})
+	}
+	if d.dialControl == nil {
+		d.dialControl = guardResolvedAddr
 	}
 	return d
 }
@@ -209,7 +220,7 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 
 	dialCtx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
-	conn, err := netDial(dialCtx, "tcp", target.String())
+	conn, err := netDial(dialCtx, "tcp", target.String(), d.dialControl)
 	if err != nil {
 		return nil, fmt.Errorf("dialer: dial %s: %w", target, err)
 	}
