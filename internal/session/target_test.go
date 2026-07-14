@@ -136,6 +136,20 @@ func TestDialTarget_PromptNoStashedSecretFailsClosed(t *testing.T) {
 	}
 }
 
+func TestDialTarget_PassthroughNoConnFailsClosed(t *testing.T) {
+	// sconn is dialTarget's own guard (distinct from forwardedAgentSigners's
+	// internal checks, already covered by Task 6's agentfwd_test.go) — it
+	// must fail closed, not panic or fall through, when there is no gateway
+	// connection to the client to forward an agent from (e.g. sconn is nil
+	// in every other dialTarget test in this file).
+	s := &Server{}
+	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
+		policy.Decision{CredentialMode: "passthrough"}, "db1.lab.local", 22, "")
+	if !errors.Is(err, credential.ErrFailClosed) {
+		t.Fatalf("want ErrFailClosed, got %v", err)
+	}
+}
+
 func TestDialTarget_InjectSucceeds(t *testing.T) {
 	fakeConn := startFakeTarget(t, "injected-secret")
 	orig := dialNet
