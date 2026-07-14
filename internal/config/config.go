@@ -18,10 +18,41 @@ type File struct {
 	LDAP       LDAPConfig        `yaml:"ldap"`
 	MFA        MFAConfig         `yaml:"mfa"`
 	Evidence   EvidenceConfig    `yaml:"evidence"`
-	Recording  *RecordingConfig  `yaml:"recording"`  // optional session-recording store
-	Inspection *InspectionConfig `yaml:"inspection"` // optional SFTP content inspection (ICAP)
-	CyberArk   *CyberArkConfig   `yaml:"cyberark"`   // optional; required if any rule uses credential "inject"
+	Recording  *RecordingConfig  `yaml:"recording"`     // optional session-recording store
+	Inspection *InspectionConfig `yaml:"inspection"`    // optional SFTP content inspection (ICAP)
+	CyberArk   *CyberArkConfig   `yaml:"cyberark"`      // optional; required if any rule uses credential "inject"
+	API        *APIConfig        `yaml:"api"`           // optional control-plane API (out-of-band)
+	PolicySrc  *PolicySource     `yaml:"policy_source"` // optional; hot-reload policy from a file
 	Policy     PolicyConfig      `yaml:"policy"`
+}
+
+// APIConfig configures the control-plane API server. It runs on a listener
+// separate from the SSH data path.
+type APIConfig struct {
+	Listen   string      `yaml:"listen"`    // e.g. ":8443"
+	TLSCert  string      `yaml:"tls_cert"`  // PEM server cert; empty ⇒ plain HTTP (dev only)
+	TLSKey   string      `yaml:"tls_key"`   // PEM server key
+	ClientCA string      `yaml:"client_ca"` // PEM CA to verify client certs; enables mTLS auth
+	Tokens   []APIToken  `yaml:"tokens"`    // static bearer tokens (dev/OIDC stand-in)
+	CNRoles  []APICNRole `yaml:"cn_roles"`  // client-cert CommonName -> role (mTLS)
+}
+
+// APIToken binds a bearer token to a subject and role.
+type APIToken struct {
+	Token   string `yaml:"token"`
+	Subject string `yaml:"subject"`
+	Role    string `yaml:"role"` // viewer | operator | admin
+}
+
+// APICNRole binds a client-certificate CommonName to a role.
+type APICNRole struct {
+	CN   string `yaml:"cn"`
+	Role string `yaml:"role"`
+}
+
+// PolicySource selects where the policy is loaded from and hot-reloaded.
+type PolicySource struct {
+	File string `yaml:"file"` // policy YAML path; empty ⇒ reuse the gateway config file
 }
 
 // CyberArkConfig configures the CyberArk CCP client used by credential mode
@@ -271,6 +302,24 @@ func (f *File) validate() error {
 }
 
 // CompilePolicy builds the immutable policy.Policy from the config document.
+// LoadPolicyDoc reads only the policy section of a YAML document and compiles
+// it, without validating the rest of the gateway config. The control-plane
+// policy source uses it to hot-reload the policy from a file.
+func LoadPolicyDoc(path string) (policy.Policy, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return policy.Policy{}, fmt.Errorf("read policy %s: %w", path, err)
+	}
+	var doc struct {
+		Policy PolicyConfig `yaml:"policy"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return policy.Policy{}, fmt.Errorf("parse policy %s: %w", path, err)
+	}
+	f := &File{Policy: doc.Policy}
+	return f.CompilePolicy(), nil
+}
+
 func (f *File) CompilePolicy() policy.Policy {
 	roles := make([]policy.Role, 0, len(f.Policy.Roles))
 	for _, rc := range f.Policy.Roles {

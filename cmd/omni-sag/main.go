@@ -4,22 +4,33 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"flag"
 	"log"
 	"net"
+	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/rupivbluegreen/omni-sag/internal/api"
 	"github.com/rupivbluegreen/omni-sag/internal/authn"
 	"github.com/rupivbluegreen/omni-sag/internal/config"
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/inspect"
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
+	"github.com/rupivbluegreen/omni-sag/internal/policy"
+	"github.com/rupivbluegreen/omni-sag/internal/policysource"
 	"github.com/rupivbluegreen/omni-sag/internal/recording"
 	"github.com/rupivbluegreen/omni-sag/internal/session"
+	"github.com/rupivbluegreen/omni-sag/internal/sessions"
 )
+
+var errBadClientCA = errors.New("api: client_ca is not valid PEM")
 
 func main() {
 	cfgPath := flag.String("config", "config.yaml", "path to configuration file")
@@ -81,7 +92,24 @@ func run(cfgPath string) error {
 	}
 	d := dialer.New(cfg.CompilePolicy(), ev.dialerSink, dopts...)
 
+	// Policy hot-reload: watch the policy file and atomically swap the dialer's
+	// policy (and the API's read view) without dropping in-flight sessions.
+	holder := policy.NewHolder(cfg.CompilePolicy())
+	polPath := cfgPath
+	if cfg.PolicySrc != nil && cfg.PolicySrc.File != "" {
+		polPath = cfg.PolicySrc.File
+	}
+	go policysource.NewFileSource(polPath, 0).Watch(ctx, func(p policy.Policy) {
+		holder.Store(p)
+		d.SetPolicy(p)
+	})
+
+	// Registry of live sessions for the control-plane API (a leaf shared by the
+	// session package and the API; the data path never imports the API).
+	reg := sessions.NewRegistry()
+
 	var opts []session.Option
+	opts = append(opts, session.WithRegistry(reg))
 	if cfg.MFA.Enabled {
 		rc := cfg.MFA.RADIUS
 		opts = append(opts, session.WithMFA(authn.NewRADIUS(authn.RADIUSConfig{
@@ -112,6 +140,15 @@ func run(cfgPath string) error {
 	}
 	srv := session.New(hostKey, auth, d, ev.sessionSink, opts...)
 
+	// Control-plane API on its OWN listener + goroutine. Its lifecycle is
+	// independent of the SSH data path: if it dies, SSH sessions keep running
+	// and new ones still connect.
+	if cfg.API != nil {
+		if err := startAPIServer(ctx, cfg.API, reg, holder); err != nil {
+			return err
+		}
+	}
+
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return err
@@ -121,6 +158,92 @@ func run(cfgPath string) error {
 	err = srv.Serve(ctx, ln)
 	log.Printf("omni-sag: shutting down")
 	return err
+}
+
+// startAPIServer builds and starts the control-plane API on its own listener.
+// It never blocks the caller and never shares state with the SSH data path
+// beyond the read-only registry and policy holder.
+func startAPIServer(ctx context.Context, cfg *config.APIConfig, reg *sessions.Registry, holder *policy.Holder) error {
+	authz, err := buildAuthorizer(cfg)
+	if err != nil {
+		return err
+	}
+	apiSrv := api.NewServer(api.Config{
+		Registry:   reg,
+		Policy:     holder.Load,
+		Authorizer: authz,
+	})
+	ln, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return err
+	}
+	httpSrv := &http.Server{Handler: apiSrv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+
+	tlsCfg, err := apiTLSConfig(cfg)
+	if err != nil {
+		return err
+	}
+	go func() {
+		<-ctx.Done()
+		_ = httpSrv.Close()
+	}()
+	go func() {
+		var serr error
+		if tlsCfg != nil {
+			httpSrv.TLSConfig = tlsCfg
+			serr = httpSrv.ServeTLS(ln, "", "")
+		} else {
+			serr = httpSrv.Serve(ln)
+		}
+		if serr != nil && serr != http.ErrServerClosed {
+			log.Printf("omni-sag: control-plane API stopped: %v", serr)
+		}
+	}()
+	log.Printf("omni-sag: control-plane API on %s (out-of-band)", cfg.Listen)
+	return nil
+}
+
+// buildAuthorizer prefers mTLS (client-cert CN -> role) when cn_roles are set,
+// otherwise static bearer tokens.
+func buildAuthorizer(cfg *config.APIConfig) (api.Authorizer, error) {
+	if len(cfg.CNRoles) > 0 {
+		m := make(map[string]api.Role, len(cfg.CNRoles))
+		for _, c := range cfg.CNRoles {
+			m[c.CN] = api.Role(c.Role)
+		}
+		return api.NewMTLSAuthorizer(m), nil
+	}
+	m := make(map[string]api.Identity, len(cfg.Tokens))
+	for _, t := range cfg.Tokens {
+		m[t.Token] = api.Identity{Subject: t.Subject, Role: api.Role(t.Role)}
+	}
+	return api.NewTokenAuthorizer(m), nil
+}
+
+// apiTLSConfig builds the server TLS config: server cert (required for HTTPS)
+// plus, when client_ca is set, mandatory client-cert verification (mTLS).
+func apiTLSConfig(cfg *config.APIConfig) (*tls.Config, error) {
+	if cfg.TLSCert == "" {
+		return nil, nil // dev: plain HTTP + bearer token
+	}
+	cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+	if err != nil {
+		return nil, err
+	}
+	tc := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	if cfg.ClientCA != "" {
+		caPEM, err := os.ReadFile(cfg.ClientCA)
+		if err != nil {
+			return nil, err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return nil, errBadClientCA
+		}
+		tc.ClientCAs = pool
+		tc.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return tc, nil
 }
 
 // buildInspection wires the ICAP client, holding area, and quarantine store

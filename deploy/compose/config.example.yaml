@@ -112,6 +112,28 @@ inspection:
 #   breaker_failures: 3
 #   breaker_cooldown_seconds: 30
 
+# Control-plane API (Slice 7): runs on its own listener, out-of-band from SSH —
+# stopping it never drops live SSH sessions or blocks new ones. Disabled unless
+# this block is present. Dev uses plain HTTP + bearer tokens; production sets
+# tls_cert/tls_key (HTTPS) and either tokens (OIDC JWTs) or client_ca + cn_roles
+# (mTLS). RBAC: viewer (read) < operator (terminate) < admin.
+# api:
+#   listen: ":8443"
+#   # tls_cert: "api-cert.pem"   # HTTPS; omit for dev HTTP
+#   # tls_key:  "api-key.pem"
+#   # client_ca: "client-ca.pem" # enables mTLS; map CNs below
+#   tokens:
+#     - { token: "dev-viewer",  subject: "ops-read",  role: "viewer" }
+#     - { token: "dev-operator", subject: "ops",      role: "operator" }
+#   # cn_roles:
+#   #   - { cn: "ops@corp", role: "operator" }
+
+# Policy hot-reload source (Slice 7). Omit to reload from this config file.
+# CRD-backed source (Kubernetes informer) lands as a follow-up; until then the
+# file source hot-reloads on change and a bad edit keeps the last good policy.
+# policy_source:
+#   file: "policy.yaml"
+
 policy:
   roles:
     - name: dba

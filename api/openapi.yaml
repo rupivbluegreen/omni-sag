@@ -1,8 +1,138 @@
 openapi: 3.1.0
 info:
-  title: Omni-SAG API
-  version: 0.0.0
+  title: Omni-SAG Control-Plane API
+  version: 1.0.0
   description: >
-    Control-plane API contract (sessions, policies, health).
-    Populated in Slice 7 — server stubs and SDKs are generated from this file.
-paths: {}
+    Control plane for the Omni-SAG SSH bastion: list, inspect, and terminate
+    live sessions, read the compiled access policy, and health probes.
+
+    This API runs on a listener separate from the SSH data path. Stopping the
+    API never drops live SSH sessions and never blocks new ones
+    (control-plane-out-of-band).
+
+    AuthN is bearer token (OIDC JWT in production) or mutual TLS; AuthZ is RBAC
+    with roles viewer < operator < admin. Reads require viewer; terminating a
+    session requires operator. Auth fails closed.
+servers:
+  - url: https://gateway:8443
+security:
+  - bearerAuth: []
+  - mutualTLS: []
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe (unauthenticated)
+      security: []
+      responses:
+        "200": { description: alive }
+  /readyz:
+    get:
+      summary: Readiness probe (unauthenticated)
+      security: []
+      responses:
+        "200": { description: ready }
+        "503": { description: not ready }
+  /api/v1/sessions:
+    get:
+      summary: List live sessions
+      description: Requires viewer.
+      responses:
+        "200":
+          description: the live sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/sessions/{id}:
+    get:
+      summary: Inspect one session
+      description: Requires viewer.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: the session
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Terminate one session
+      description: Closes the session's SSH connection. Requires operator.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: terminated }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: session cannot be terminated }
+  /api/v1/policy:
+    get:
+      summary: Read the compiled access policy
+      description: Requires viewer.
+      responses:
+        "200":
+          description: the compiled policy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Policy" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+    mutualTLS: { type: mutualTLS }
+  responses:
+    Unauthorized:
+      description: missing or invalid credentials
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Forbidden:
+      description: role does not permit this action
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotFound:
+      description: not found
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+    Session:
+      type: object
+      properties:
+        id: { type: string }
+        user: { type: string }
+        source_ip: { type: string }
+        target: { type: string }
+        start: { type: string, format: date-time }
+        channels: { type: integer }
+    Policy:
+      type: object
+      properties:
+        roles:
+          type: array
+          items: { $ref: "#/components/schemas/Role" }
+    Role:
+      type: object
+      properties:
+        name: { type: string }
+        groups: { type: array, items: { type: string } }
+        allow:
+          type: array
+          items: { $ref: "#/components/schemas/Rule" }
+    Rule:
+      type: object
+      properties:
+        host: { type: string }
+        ports: { type: array, items: { type: integer } }
+        record: { type: string, enum: [none, metadata-only, full] }
+        credential: { type: string, enum: [inject, prompt, passthrough, deny] }

@@ -21,6 +21,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 	"github.com/rupivbluegreen/omni-sag/internal/recording"
+	"github.com/rupivbluegreen/omni-sag/internal/sessions"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -54,11 +55,18 @@ type Server struct {
 	sshCfg           *ssh.ServerConfig
 	dialer           *dialer.Dialer
 	sink             evidence.Sink
-	mfa              authn.MFAProvider // optional second factor; nil disables MFA
-	recordStore      recording.Store   // optional; when set, interactive sessions are recorded
-	inspect          *inspectgate.Gate // optional; when set, SFTP uploads are content-inspected
+	mfa              authn.MFAProvider  // optional second factor; nil disables MFA
+	recordStore      recording.Store    // optional; when set, interactive sessions are recorded
+	inspect          *inspectgate.Gate  // optional; when set, SFTP uploads are content-inspected
+	reg              *sessions.Registry // optional; when set, live sessions are registered for the API
 	handshakeTimeout time.Duration
 	sem              chan struct{} // bounds concurrent in-flight handshakes
+}
+
+// WithRegistry registers each authenticated connection in reg so the
+// control-plane API can list and terminate it. Nil (the default) disables it.
+func WithRegistry(reg *sessions.Registry) Option {
+	return func(s *Server) { s.reg = reg }
 }
 
 // Option configures a Server.
@@ -214,6 +222,18 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 	pr := principalFrom(sconn.Permissions)
 	srcIP := hostOf(sconn.RemoteAddr())
 
+	// Register the live session so the control-plane API can list/terminate it.
+	// terminate closes the SSH connection; the data path stays independent of
+	// the API (this registry is a leaf package neither imports).
+	var sessID string
+	if s.reg != nil {
+		var dereg func()
+		sessID, dereg = s.reg.Register(sessions.Info{User: pr.User, SourceIP: srcIP}, func() error {
+			return sconn.Close()
+		})
+		defer dereg()
+	}
+
 	// Bound concurrent channels per connection; reject beyond the cap.
 	chSem := make(chan struct{}, maxChannelsPerConn)
 	for newCh := range chans {
@@ -229,9 +249,15 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 			continue
 		}
 		go func(newCh ssh.NewChannel, ct string) {
+			if s.reg != nil {
+				s.reg.AddChannels(sessID, 1)
+			}
 			// A panic in one channel handler must not crash the whole gateway
 			// and drop every other live session; contain it to this channel.
 			defer func() {
+				if s.reg != nil {
+					s.reg.AddChannels(sessID, -1)
+				}
 				<-chSem
 				if r := recover(); r != nil {
 					log.Printf("omni-sag: recovered panic in %s channel handler (user=%s): %v", ct, pr.User, r)

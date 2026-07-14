@@ -16,6 +16,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rupivbluegreen/omni-sag/internal/credential"
@@ -47,10 +48,25 @@ var netDial = func(ctx context.Context, network, addr string) (net.Conn, error) 
 
 // Dialer authorizes and opens target connections.
 type Dialer struct {
+	mu      sync.RWMutex // guards policy for hot-reload
 	policy  policy.Policy
 	sink    evidence.Sink
 	timeout time.Duration
 	cred    *credential.Provider // optional; nil ⇒ all targets are passthrough
+}
+
+// SetPolicy atomically replaces the dialer's policy. A control-plane policy
+// source calls this to hot-reload without dropping in-flight sessions.
+func (d *Dialer) SetPolicy(p policy.Policy) {
+	d.mu.Lock()
+	d.policy = p
+	d.mu.Unlock()
+}
+
+func (d *Dialer) currentPolicy() policy.Policy {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.policy
 }
 
 // Option configures a Dialer.
@@ -126,7 +142,7 @@ func WithCyberArk(p CyberArkParams) (Option, error) {
 // Non-forwarding uses (e.g. an SFTP or interactive session layered on the
 // target) pass forwarding=false.
 func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP string, target policy.Target, forwarding bool) (net.Conn, error) {
-	decision := d.policy.Decide(pr, target)
+	decision := d.currentPolicy().Decide(pr, target)
 
 	forwardRefused := decision.Allow && forwarding && !decision.ForwardingAllowed()
 	effectiveAllow := decision.Allow && !forwardRefused
