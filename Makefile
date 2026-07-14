@@ -1,7 +1,22 @@
-.PHONY: build test lint check-imports ci lab-up lab-down lab-logs lab-seed
+.PHONY: build binaries test lint check-imports ci lab-up lab-down lab-logs lab-seed
 
 build:
 	go build ./...
+
+# Cross-compilable, statically-linked release binaries for every command.
+BINARIES := omni-sag omnictl omni-verify omni-operator
+GOOS   ?= $(shell go env GOOS)
+GOARCH ?= $(shell go env GOARCH)
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
+binaries:
+	@mkdir -p bin
+	@for b in $(BINARIES); do \
+	  echo "building $$b ($(GOOS)/$(GOARCH), $(VERSION))"; \
+	  CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) \
+	    go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" \
+	    -o bin/$${b}_$(GOOS)_$(GOARCH) ./cmd/$$b || exit 1; \
+	done
 
 test:
 	go test ./...
