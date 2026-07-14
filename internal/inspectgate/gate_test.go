@@ -88,7 +88,10 @@ func (c *countingStore) Put(_ context.Context, _, _ string, r io.Reader, _ int64
 	return err
 }
 func (c *countingStore) Get(context.Context, string) (io.ReadCloser, error) {
-	return nil, errors.New("not supported")
+	c.mu.Lock()
+	n := c.bytes
+	c.mu.Unlock()
+	return io.NopCloser(io.LimitReader(zeroReader{}, n)), nil
 }
 func (c *countingStore) Delete(context.Context, string) error { return nil }
 
@@ -117,8 +120,22 @@ func TestGate_SmallClean(t *testing.T) {
 	if dec.SHA256 != sha(body) || dec.Bytes != int64(len(body)) {
 		t.Fatalf("digest/size wrong: %+v", dec)
 	}
-	if q.count() != 0 {
-		t.Fatal("clean content must not be quarantined")
+	// Every upload — clean or not — gets a permanent, byte-level evidentiary
+	// copy in WORM quarantine; verify the actual bytes are recoverable, not
+	// just that a key was assigned.
+	if dec.QuarantineKey == "" {
+		t.Fatal("clean content must still be quarantined (byte-level evidentiary copy)")
+	}
+	stored, err := q.Get(context.Background(), dec.QuarantineKey)
+	if err != nil {
+		t.Fatalf("quarantine store missing the clean upload's bytes: %v", err)
+	}
+	got, err := io.ReadAll(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("quarantined content = %q, want %q", got, body)
 	}
 }
 
@@ -154,7 +171,7 @@ func TestGate_FailClosedOnInspectorError(t *testing.T) {
 	}
 }
 
-func TestGate_LargeCleanStreamsToHolding(t *testing.T) {
+func TestGate_LargeCleanIsQuarantined(t *testing.T) {
 	holding := newMemStore()
 	q := newMemStore()
 	g := newGate(t, fakeInspector{verdict: inspect.VerdictClean, status: 204}, holding, q, 8)
@@ -163,17 +180,29 @@ func TestGate_LargeCleanStreamsToHolding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !dec.Allow || dec.Verdict != "clean" || dec.HoldingKey == "" {
-		t.Fatalf("large clean file must be delivered via holding: %+v", dec)
-	}
-	if holding.len(dec.HoldingKey) != len(body) {
-		t.Fatalf("holding must hold the full streamed content, got %d want %d", holding.len(dec.HoldingKey), len(body))
+	if !dec.Allow || dec.Verdict != "clean" || dec.QuarantineKey == "" {
+		t.Fatalf("large clean file must be delivered and quarantined: %+v", dec)
 	}
 	if dec.SHA256 != sha(body) || dec.Bytes != int64(len(body)) {
 		t.Fatalf("digest/size wrong: %+v", dec)
 	}
-	if q.count() != 0 {
-		t.Fatal("clean content must not be quarantined")
+	// Verify the actual bytes are recoverable from quarantine, not just that a
+	// key was assigned — this is the whole point of the evidentiary copy.
+	stored, err := q.Get(context.Background(), dec.QuarantineKey)
+	if err != nil {
+		t.Fatalf("quarantine store missing the clean upload's bytes: %v", err)
+	}
+	got, err := io.ReadAll(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("quarantined content = %q, want %q", got, body)
+	}
+	// The transient holding copy is promoted then deleted, exactly as the
+	// existing blocked-content path already does.
+	if holding.count() != 0 {
+		t.Fatal("holding copy should have been deleted after promotion to quarantine")
 	}
 }
 
@@ -198,11 +227,12 @@ func TestGate_LargeBlockedPromotedToQuarantine(t *testing.T) {
 }
 
 func TestGate_LargeNoOOM(t *testing.T) {
-	// Stream 64 MiB through the gate with a small threshold and a discarding
-	// holding store; if this buffered the whole file it would allocate 64 MiB.
+	// Stream 64 MiB through the gate with a small threshold and discarding
+	// holding/quarantine stores; if this buffered the whole file at any stage
+	// (streaming tee, or promotion into quarantine) it would allocate 64 MiB.
 	const size = 64 << 20
 	holding := &countingStore{}
-	q := newMemStore()
+	q := &countingStore{}
 	g := newGate(t, fakeInspector{verdict: inspect.VerdictClean, status: 204}, holding, q, 4096)
 	dec, err := g.Inspect(context.Background(), inspect.TransferMeta{Filename: "huge.bin"}, io.LimitReader(zeroReader{}, size))
 	if err != nil {
@@ -213,6 +243,12 @@ func TestGate_LargeNoOOM(t *testing.T) {
 	}
 	if holding.bytes != size {
 		t.Fatalf("holding must have received the full stream: got %d want %d", holding.bytes, size)
+	}
+	if dec.QuarantineKey == "" {
+		t.Fatal("clean content must be quarantined")
+	}
+	if q.bytes != size {
+		t.Fatalf("quarantine must hold the full promoted content: got %d want %d", q.bytes, size)
 	}
 }
 

@@ -113,9 +113,11 @@ func TestSFTP_InspectionBlocksAndQuarantines(t *testing.T) {
 		t.Fatal("EICAR upload must be refused")
 	}
 
-	// Quarantine holds exactly the blocked content (captured at upload time).
-	if q.count() != 1 {
-		t.Fatalf("expected 1 quarantined object, got %d", q.count())
+	// Quarantine holds a byte-level evidentiary copy of every upload now
+	// (Task 10: unconditional quarantine on clean, not only blocked content),
+	// so both the clean and the blocked upload land in quarantine.
+	if q.count() != 2 {
+		t.Fatalf("expected 2 quarantined objects (clean + blocked), got %d", q.count())
 	}
 
 	// End the SFTP session so the gateway emits the batched inspection evidence.
