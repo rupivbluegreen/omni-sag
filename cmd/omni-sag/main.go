@@ -151,6 +151,7 @@ func run(cfgPath string) error {
 
 	var opts []session.Option
 	opts = append(opts, session.WithRegistry(reg))
+	opts = append(opts, session.WithDialerPeek(d.Peek))
 	opts = append(opts, sessOpts...)
 	if cfg.MFA.Enabled {
 		rc := cfg.MFA.RADIUS

@@ -9,6 +9,8 @@ package session
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -69,6 +71,9 @@ type Server struct {
 	handshakeTimeout time.Duration
 	sem              chan struct{} // bounds concurrent in-flight handshakes
 
+	pendingSecrets sync.Map                                                        // token(string) -> *credential.Secret; prompt-mode target passwords awaiting first use
+	dialerPeek     func(pr policy.Principal, target policy.Target) policy.Decision // non-dialing decision lookup; nil disables prompt-mode chaining
+
 	wg       sync.WaitGroup // tracks active connections for graceful drain
 	active   atomic.Int64   // current active connections
 	draining atomic.Bool    // set once ctx is cancelled; refuses new connections
@@ -110,6 +115,15 @@ func WithCredentialProvider(p *credential.Provider) Option {
 	return func(s *Server) { s.cred = p }
 }
 
+// WithDialerPeek supplies a non-dialing policy-decision lookup (typically
+// (*dialer.Dialer).Peek), used at auth time to decide whether a prompt-mode
+// target needs a keyboard-interactive round before the connection is fully
+// authenticated. Nil (the default) disables prompt-mode entirely — such a
+// target's channels later fail closed in dialTarget (Task 7).
+func WithDialerPeek(peek func(pr policy.Principal, target policy.Target) policy.Decision) Option {
+	return func(s *Server) { s.dialerPeek = peek }
+}
+
 // WithBruteForceLimiter overrides the default per-source-IP brute-force
 // throttle. Passing nil is ignored (the defense cannot be disabled); use this
 // only to tune the Config.
@@ -147,6 +161,29 @@ func (s *Server) emit(e evidence.Event) {
 	if err := s.sink.Emit(e); err != nil {
 		log.Printf("omni-sag: evidence emit failed (type=%s user=%s): %v", e.Type, e.User, err)
 	}
+}
+
+// stashTargetSecret holds sec under a random single-use token until the
+// target dial consumes it (Task 7) or the connection closes without ever
+// opening a channel (handleConn's cleanup) — either path zeroizes it. Never
+// logged, never placed in evidence.
+func (s *Server) stashTargetSecret(sec *credential.Secret) string {
+	buf := make([]byte, 16)
+	_, _ = rand.Read(buf)
+	token := hex.EncodeToString(buf)
+	s.pendingSecrets.Store(token, sec)
+	return token
+}
+
+// takeTargetSecret retrieves and removes the secret for token. Single-use:
+// a second call for the same token returns nil. Returns nil for an unknown
+// or already-consumed token.
+func (s *Server) takeTargetSecret(token string) *credential.Secret {
+	v, ok := s.pendingSecrets.LoadAndDelete(token)
+	if !ok {
+		return nil
+	}
+	return v.(*credential.Secret)
 }
 
 // passwordCallback verifies the password via the authenticator, emits an auth
@@ -225,6 +262,39 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		// Fully authenticated: clear any accumulated failure/lockout state so a
 		// legitimate user who mistyped is not penalized after a real success.
 		s.bfLimiter.RecordSuccess(srcIP)
+
+		if hasTarget && s.dialerPeek != nil {
+			// Port is intentionally omitted: Peek here only inspects
+			// CredentialMode, which today's Rule.matches distinguishes only by
+			// Host in the demo config. A deployment with multiple rules for the
+			// same host differing only by port is a known limitation; a
+			// follow-up could carry the target port from the client's first
+			// channel-open request instead of guessing it here (out of scope
+			// for this plan).
+			decision := s.dialerPeek(policy.Principal{User: id.User, Groups: id.Groups}, policy.Target{Host: targetHost})
+			if credential.Mode(decision.CredentialMode).Normalize() == credential.ModePrompt {
+				groups := strings.Join(id.Groups, groupSep)
+				return nil, &ssh.PartialSuccessError{Next: ssh.ServerAuthCallbacks{
+					KeyboardInteractiveCallback: func(_ ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+						answers, err := challenge("", "", []string{"Target password: "}, []bool{false})
+						if err != nil {
+							return nil, errors.New("authentication failed")
+						}
+						if len(answers) != 1 || answers[0] == "" {
+							return nil, errors.New("authentication failed")
+						}
+						token := s.stashTargetSecret(credential.New([]byte(answers[0])))
+						return &ssh.Permissions{Extensions: map[string]string{
+							"user":                id.User,
+							"groups":              groups,
+							"target_host":         targetHost,
+							"target_secret_token": token,
+						}}, nil
+					},
+				}}
+			}
+		}
+
 		perms := &ssh.Permissions{Extensions: map[string]string{
 			"user":   id.User,
 			"groups": strings.Join(id.Groups, groupSep),
@@ -315,6 +385,14 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 	}
 	defer sconn.Close()
 	go ssh.DiscardRequests(reqs)
+
+	if tok := sconn.Permissions.Extensions["target_secret_token"]; tok != "" {
+		defer func() {
+			if sec := s.takeTargetSecret(tok); sec != nil {
+				sec.Destroy() // connection closed without ever opening a channel that consumed it
+			}
+		}()
+	}
 
 	pr := principalFrom(sconn.Permissions)
 	srcIP := hostOf(sconn.RemoteAddr())

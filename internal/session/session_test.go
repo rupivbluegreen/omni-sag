@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,9 +11,11 @@ import (
 	"time"
 
 	"github.com/rupivbluegreen/omni-sag/internal/authn"
+	"github.com/rupivbluegreen/omni-sag/internal/credential"
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
+	"github.com/rupivbluegreen/omni-sag/internal/ratelimit"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -29,6 +32,34 @@ func (f fakeAuth) Authenticate(_ context.Context, username, password string) (au
 	}
 	return authn.Identity{User: username, Groups: groups}, nil
 }
+
+// fakeAuthenticator always authenticates successfully as the configured
+// identity, regardless of the password supplied. Used for unit tests that
+// drive passwordCallback directly (not through a real SSH handshake) and
+// only care about post-authentication behavior.
+type fakeAuthenticator struct{ identity authn.Identity }
+
+func (f fakeAuthenticator) Authenticate(_ context.Context, _, _ string) (authn.Identity, error) {
+	return f.identity, nil
+}
+
+// fakeConnMeta is a minimal ssh.ConnMetadata for unit-testing auth callbacks
+// directly, without a real SSH handshake.
+type fakeConnMeta struct{ user string }
+
+func (f fakeConnMeta) User() string          { return f.user }
+func (f fakeConnMeta) SessionID() []byte     { return nil }
+func (f fakeConnMeta) ClientVersion() []byte { return nil }
+func (f fakeConnMeta) ServerVersion() []byte { return nil }
+func (f fakeConnMeta) RemoteAddr() net.Addr  { return nil }
+func (f fakeConnMeta) LocalAddr() net.Addr   { return nil }
+
+// noopSink discards all evidence events; used where a test doesn't care about
+// evidence content, only behavior.
+type noopSink struct{}
+
+func (noopSink) Emit(evidence.Event) error { return nil }
+func (noopSink) Close() error              { return nil }
 
 // startEcho starts a TCP echo server and returns its host and port.
 func startEcho(t *testing.T) (string, int) {
@@ -221,4 +252,71 @@ func assertDecision(t *testing.T, sink *evidence.MemSink, user string, wantAllow
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("no tunnel_decision evidence for %s", user)
+}
+
+func TestTargetSecretStash_RoundTrips(t *testing.T) {
+	s := &Server{}
+	sec := credential.New([]byte("hunter2"))
+	token := s.stashTargetSecret(sec)
+	if token == "" {
+		t.Fatal("stashTargetSecret returned empty token")
+	}
+	got := s.takeTargetSecret(token)
+	if got != sec {
+		t.Fatalf("takeTargetSecret returned a different *Secret")
+	}
+	// A token is single-use: taking it again must return nil, not the same secret.
+	if again := s.takeTargetSecret(token); again != nil {
+		t.Fatal("takeTargetSecret must be single-use — second call returned non-nil")
+	}
+}
+
+func TestTargetSecretStash_UnknownTokenReturnsNil(t *testing.T) {
+	s := &Server{}
+	if got := s.takeTargetSecret("no-such-token"); got != nil {
+		t.Fatal("takeTargetSecret(unknown) must return nil")
+	}
+}
+
+func TestPasswordCallback_PromptModeChainsKeyboardInteractive(t *testing.T) {
+	fakeAuth := fakeAuthenticator{identity: authn.Identity{User: "alice", Groups: []string{"dba"}}}
+	s := &Server{
+		bfLimiter: ratelimit.New(ratelimit.DefaultConfig()),
+		sink:      noopSink{},
+		dialerPeek: func(pr policy.Principal, target policy.Target) policy.Decision {
+			return policy.Decision{Allow: true, CredentialMode: "prompt", MatchedRole: "dba"}
+		},
+	}
+	cb := s.passwordCallback(fakeAuth)
+	_, err := cb(fakeConnMeta{user: "alice%db1.lab.local"}, []byte("password123"))
+
+	var partial *ssh.PartialSuccessError
+	if !errors.As(err, &partial) {
+		t.Fatalf("want *ssh.PartialSuccessError for a prompt-mode target, got %v (%T)", err, err)
+	}
+	if partial.Next.KeyboardInteractiveCallback == nil {
+		t.Fatal("PartialSuccessError.Next.KeyboardInteractiveCallback is nil")
+	}
+
+	challenge := func(name, instruction string, questions []string, echos []bool) ([]string, error) {
+		if len(questions) != 1 || echos[0] != false {
+			t.Fatalf("want one echo-off question, got questions=%v echos=%v", questions, echos)
+		}
+		return []string{"targetpass"}, nil
+	}
+	perms, err := partial.Next.KeyboardInteractiveCallback(fakeConnMeta{user: "alice%db1.lab.local"}, challenge)
+	if err != nil {
+		t.Fatalf("KeyboardInteractiveCallback: %v", err)
+	}
+	if perms.Extensions["target_host"] != "db1.lab.local" {
+		t.Fatalf("target_host = %q, want db1.lab.local", perms.Extensions["target_host"])
+	}
+	token := perms.Extensions["target_secret_token"]
+	if token == "" {
+		t.Fatal("target_secret_token not set")
+	}
+	sec := s.takeTargetSecret(token)
+	if sec == nil || string(sec.Bytes()) != "targetpass" {
+		t.Fatalf("stashed secret = %v, want \"targetpass\"", sec)
+	}
 }
