@@ -14,7 +14,7 @@ controller-runtime manager is the remaining work.
 | `StagedPolicyChange` | a proposed `Policy` pending four-eyes before it applies |
 
 ## Boundary
-`cmd/omni-operator` builds and documents the reconciler mapping but does not
+`cmd/omnisag-operator` builds and documents the reconciler mapping but does not
 import controller-runtime (so `make ci` stays green without a cluster). To make
 it live: add controller-runtime, implement a Reconcile loop per CRD, and swap the
 stubbed `policysource.CRDSource` / `approval.CRDStore` for informer-backed

@@ -444,7 +444,7 @@ func (m Model) viewPolicy() string {
 			b.WriteString("  " + l + "\n")
 		}
 	} else {
-		b.WriteString("\n" + dimStyle.Render("(rule-trace: call SetTrace or use omnictl trace)\n"))
+		b.WriteString("\n" + dimStyle.Render("(rule-trace: call SetTrace or use omnisag-ctl trace)\n"))
 	}
 	return b.String()
 }
@@ -481,7 +481,7 @@ func (m Model) viewHealth() string {
 
 func (m Model) viewPlayer() string {
 	if !m.hasCast {
-		return dimStyle.Render("no recording loaded (open with: omnictl tui -play <file.cast>)\n")
+		return dimStyle.Render("no recording loaded (open with: omnisag-ctl tui -play <file.cast>)\n")
 	}
 	var b strings.Builder
 	state := "playing"

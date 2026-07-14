@@ -161,7 +161,7 @@ type PolicyView struct {
 func policyView(p policy.Policy) PolicyView { return PolicyToView(p) }
 
 // PolicyToView converts a compiled policy to its API view. Exported so the
-// omnictl rule-trace can round-trip the view back to a policy and evaluate it
+// omnisag-ctl rule-trace can round-trip the view back to a policy and evaluate it
 // with policy.Decide, keeping the explanation consistent with real decisions.
 func PolicyToView(p policy.Policy) PolicyView {
 	pv := PolicyView{Roles: make([]RoleView, 0, len(p.Roles))}

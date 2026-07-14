@@ -33,7 +33,7 @@ distributed-systems tax.
   `dialer` → target. Self-contained and fail-closed. It does **not** import the
   control plane (`internal/api`); CI enforces this. Killing the API never drops
   or blocks SSH.
-- **Control plane** (`internal/api` + `omnictl`/`tui`): sessions
+- **Control plane** (`internal/api` + `omnisag-ctl`/`tui`): sessions
   list/inspect/terminate, policy read + rule-trace, approvals, live supervision,
   health, metrics. Runs on its own listener; best-effort startup.
 

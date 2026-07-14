@@ -14,9 +14,9 @@ RUN go mod download
 COPY . .
 # Static, stripped binaries. CGO off so the runtime needs no libc beyond UBI's.
 ENV CGO_ENABLED=0 GOOS=linux
-RUN go build -trimpath -ldflags="-s -w" -o /out/omni-sag    ./cmd/omni-sag  && \
-    go build -trimpath -ldflags="-s -w" -o /out/omnictl     ./cmd/omnictl   && \
-    go build -trimpath -ldflags="-s -w" -o /out/omni-verify ./cmd/omni-verify
+RUN go build -trimpath -ldflags="-s -w" -o /out/omni-sag     ./cmd/omni-sag     && \
+    go build -trimpath -ldflags="-s -w" -o /out/omnisag-ctl  ./cmd/omnisag-ctl  && \
+    go build -trimpath -ldflags="-s -w" -o /out/omni-verify  ./cmd/omni-verify
 
 # ---- runtime stage ----
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
@@ -30,9 +30,9 @@ RUN microdnf -y install shadow-utils && \
     useradd -r -u 10001 -g 0 -s /sbin/nologin omnisag && \
     microdnf -y remove shadow-utils && microdnf clean all
 
-COPY --from=build --chown=10001:0 /out/omni-sag    /usr/local/bin/omni-sag
-COPY --from=build --chown=10001:0 /out/omnictl     /usr/local/bin/omnictl
-COPY --from=build --chown=10001:0 /out/omni-verify /usr/local/bin/omni-verify
+COPY --from=build --chown=10001:0 /out/omni-sag     /usr/local/bin/omni-sag
+COPY --from=build --chown=10001:0 /out/omnisag-ctl  /usr/local/bin/omnisag-ctl
+COPY --from=build --chown=10001:0 /out/omni-verify  /usr/local/bin/omni-verify
 
 USER 10001
 # SSH data plane + control-plane API + metrics (bind addresses come from config).

@@ -1,4 +1,4 @@
-// Package tui implements the omnictl Bubble Tea terminal UI over the
+// Package tui implements the omnisag-ctl Bubble Tea terminal UI over the
 // control-plane SDK (internal/api.Client). It never bypasses the API for
 // control-plane data; it may evaluate the policy locally (internal/policy) for
 // the rule-trace and parse recordings locally (internal/recording) for replay.

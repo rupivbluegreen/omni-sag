@@ -94,7 +94,7 @@ council can agree the least-intrusive posture per system class:
 Council-relevant guarantees:
 
 - Recording scope is **declared per target in policy**, reviewable via
-  `omnictl` policy rule-trace ("why can Alice reach X, and is it recorded?").
+  `omnisag-ctl` policy rule-trace ("why can Alice reach X, and is it recorded?").
 - **Keystroke suppression** ensures injected credentials are never recorded.
 - Recording **cannot be silently disabled**: if a `full` target's recording
   store is unavailable, the session is **refused** and the failure is evidenced

@@ -282,7 +282,7 @@ cd omni-sag
 
 make lab-up        <span class="c-dim"># samba-AD + MinIO + FreeRADIUS</span>
 make lab-seed      <span class="c-dim"># create alice (dba) and bob (not)</span>
-make binaries      <span class="c-dim"># build omni-sag, omnictl, omni-verify</span>
+make binaries      <span class="c-dim"># build omni-sag, omnisag-ctl, omni-verify</span>
 
 ./bin/omni-sag_linux_amd64 -config deploy/compose/config.example.yaml
 <span class="c-dim"># then: ssh -L … alice@gw  → allowed</span>
@@ -307,7 +307,7 @@ make binaries      <span class="c-dim"># build omni-sag, omnictl, omni-verify</s
    ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  out-of-band  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
    operator ──mTLS──▶ <b>[ api ]</b> ──▶ sessions · policy · approvals · supervision   <span class="c-dim">(never imported by the data path)</span>
                         ▲
-                   <b>omnictl / TUI</b></div>
+                   <b>omnisag-ctl / TUI</b></div>
   </div>
 </section>
 

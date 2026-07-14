@@ -1,4 +1,4 @@
-// Command omni-operator is the Kubernetes operator that reconciles Omni-SAG
+// Command omnisag-operator is the Kubernetes operator that reconciles Omni-SAG
 // CustomResources (Policy, ApprovalRequest, QuarantineRelease,
 // StagedPolicyChange — see deploy/operator/crds) into the running gateway's
 // policy and approval state.
@@ -30,7 +30,7 @@ func main() {
 	kubeconfig := flag.String("kubeconfig", "", "path to a kubeconfig (in-cluster if empty)")
 	flag.Parse()
 
-	fmt.Fprintln(os.Stderr, "omni-operator: scaffold — requires a Kubernetes cluster and controller-runtime wiring.")
+	fmt.Fprintln(os.Stderr, "omnisag-operator: scaffold — requires a Kubernetes cluster and controller-runtime wiring.")
 	fmt.Fprintln(os.Stderr, "Apply deploy/operator/crds/crds.yaml, then run the reconcilers documented in deploy/operator/README.md.")
 	if *kubeconfig != "" {
 		fmt.Fprintf(os.Stderr, "kubeconfig=%s (not yet used)\n", *kubeconfig)

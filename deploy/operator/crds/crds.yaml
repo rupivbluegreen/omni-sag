@@ -1,6 +1,6 @@
 # CustomResourceDefinitions for the Omni-SAG operator. These mirror the objects
 # the gateway already models in-process (internal/policy, internal/approval); the
-# operator (deploy/operator, cmd/omni-operator) watches them and reconciles the
+# operator (deploy/operator, cmd/omnisag-operator) watches them and reconciles the
 # gateway's config/policy. Applying and reconciling these REQUIRES a Kubernetes
 # cluster — see deploy/operator/README.md.
 apiVersion: apiextensions.k8s.io/v1

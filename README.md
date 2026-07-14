@@ -68,7 +68,7 @@ cd omni-sag
 
 make lab-up        # samba-AD + MinIO + FreeRADIUS
 make lab-seed      # create alice (dba) and bob (not)
-make binaries      # build omni-sag, omnictl, omni-verify
+make binaries      # build omni-sag, omnisag-ctl, omni-verify
 
 ./bin/omni-sag_linux_amd64 -config deploy/compose/config.example.yaml
 # ssh -L 5432:db1.lab.local:5432 alice@gw  → allowed
@@ -92,7 +92,7 @@ client ──ssh──▶ [ session ] ──▶ authn + ratelimit ──▶ poli
 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  out-of-band control plane  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
 operator ──mTLS──▶ [ api ] ──▶ sessions · policy · approvals · supervision
                      ▲                       (the data path never imports this)
-                omnictl / TUI
+                omnisag-ctl / TUI
 ```
 
 **Load-bearing invariants** (each CI- or test-enforced):

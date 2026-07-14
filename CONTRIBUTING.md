@@ -53,7 +53,7 @@ New invariant, new CI check — that's how the monolith stays modular.
 ## Project layout
 
 ```
-cmd/            omni-sag (daemon) · omnictl (CLI/TUI) · omni-verify (offline verifier) · omni-operator
+cmd/            omni-sag (daemon) · omnisag-ctl (CLI/TUI) · omni-verify (offline verifier) · omnisag-operator
 internal/       one package per concern (authn, policy, dialer, session, evidence, …)
 api/            openapi.yaml — the control-plane contract
 deploy/         compose lab · Helm chart · Containerfile · operator CRDs

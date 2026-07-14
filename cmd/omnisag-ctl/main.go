@@ -1,4 +1,4 @@
-// Command omnictl is a thin CLI over the Omni-SAG control-plane SDK
+// Command omnisag-ctl is a thin CLI over the Omni-SAG control-plane SDK
 // (internal/api.Client). It lists and terminates live sessions and reads the
 // policy. The Bubble Tea TUI (Slice 9) is layered on the same SDK.
 package main
@@ -30,7 +30,7 @@ func main() {
 	c := api.NewClient(*base, *token, nil)
 	ctx := context.Background()
 	if err := dispatch(ctx, c, args); err != nil {
-		fmt.Fprintln(os.Stderr, "omnictl:", err)
+		fmt.Fprintln(os.Stderr, "omnisag-ctl:", err)
 		os.Exit(1)
 	}
 }
@@ -40,7 +40,7 @@ func dispatch(ctx context.Context, c *api.Client, args []string) error {
 	case "sessions":
 		if len(args) >= 2 && args[1] == "kill" {
 			if len(args) < 3 {
-				return fmt.Errorf("usage: omnictl sessions kill <id>")
+				return fmt.Errorf("usage: omnisag-ctl sessions kill <id>")
 			}
 			if err := c.TerminateSession(ctx, args[2]); err != nil {
 				return err
@@ -61,7 +61,7 @@ func dispatch(ctx context.Context, c *api.Client, args []string) error {
 		return printJSON(list)
 	case "approve":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: omnictl approve <id>")
+			return fmt.Errorf("usage: omnisag-ctl approve <id>")
 		}
 		req, err := c.ApproveApproval(ctx, args[1])
 		if err != nil {
@@ -70,7 +70,7 @@ func dispatch(ctx context.Context, c *api.Client, args []string) error {
 		return printJSON(req)
 	case "deny":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: omnictl deny <id>")
+			return fmt.Errorf("usage: omnisag-ctl deny <id>")
 		}
 		req, err := c.DenyApproval(ctx, args[1])
 		if err != nil {
@@ -90,9 +90,9 @@ func dispatch(ctx context.Context, c *api.Client, args []string) error {
 		fmt.Println("ok")
 		return nil
 	case "trace":
-		// omnictl trace <user> <group,group,...> <host> <port>
+		// omnisag-ctl trace <user> <group,group,...> <host> <port>
 		if len(args) < 5 {
-			return fmt.Errorf("usage: omnictl trace <user> <group,group> <host> <port>")
+			return fmt.Errorf("usage: omnisag-ctl trace <user> <group,group> <host> <port>")
 		}
 		pv, err := c.GetPolicy(ctx)
 		if err != nil {
@@ -147,7 +147,7 @@ func printJSON(v any) error {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `omnictl [-api URL] [-token TOK] <command>
+	fmt.Fprintln(os.Stderr, `omnisag-ctl [-api URL] [-token TOK] <command>
   sessions            list live sessions
   sessions kill <id>  terminate a session
   approvals           list approval requests
