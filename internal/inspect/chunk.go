@@ -13,6 +13,13 @@ import (
 // implement just enough of it for the client; the standard library's chunked
 // reader/writer live in internal packages we cannot import.
 
+// maxChunkedBodyBytes bounds the total decoded size of a chunked ICAP body.
+// Without it a hostile or broken ICAP server can declare a chunk size of up to
+// 2^32-1 (e.g. "7fffffff") and force an unbounded make([]byte, n) — an OOM/DoS
+// via a single response line, before io.ReadFull ever notices the body is
+// short. The cap is checked against the remaining budget BEFORE any allocation.
+const maxChunkedBodyBytes = 64 << 20 // 64 MiB
+
 // writeChunk writes a single non-empty chunk: <hexlen>CRLF <data> CRLF.
 func writeChunk(w io.Writer, data []byte) error {
 	if len(data) == 0 {
@@ -64,6 +71,11 @@ func readChunked(r *bufio.Reader) ([]byte, error) {
 				return nil, err
 			}
 			return out, nil
+		}
+		// Bound total decoded size before allocating, so a hostile chunk-size
+		// line cannot force a giant allocation.
+		if n > uint64(maxChunkedBodyBytes-len(out)) {
+			return nil, fmt.Errorf("chunked body exceeds %d-byte limit", maxChunkedBodyBytes)
 		}
 		buf := make([]byte, n)
 		if _, err := io.ReadFull(r, buf); err != nil {
