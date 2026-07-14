@@ -43,6 +43,9 @@ PASS — evidence bundle is intact and authentic.
 FAIL — TAMPER: record hash mismatch. loudly.
 ```
 
+That's not a mockup — it's a real recorded run: **[▶ watch it live](https://rupivbluegreen.github.io/omni-sag/#start)**
+(same lab, same two users, same tamper — the raw [asciicast](docs/assets/demo.cast) is in the repo too).
+
 ## ✨ Features
 
 | | |

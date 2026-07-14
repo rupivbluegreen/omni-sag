@@ -168,7 +168,10 @@
   @media(max-width:820px){ .three,.grid,.stats{grid-template-columns:1fr 1fr} .navlinks a:not(.btn){display:none} }
   @media(max-width:560px){ .three,.grid,.stats{grid-template-columns:1fr} header.hero{padding-top:60px} }
   @media(prefers-reduced-motion:reduce){ .rev{animation:none;opacity:1;transform:none} .brand .cur{animation:none} }
+  #demo-player{padding:14px}
 </style>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/asciinema-player@3.9.0/dist/bundle/asciinema-player.css"
+  integrity="sha384-YkKPt/hL/Wqsna2xm5FbCDG49fs+IXOYvwLhPa0QT3PX0H8vlBWu4Bjn6QXehbHF" crossorigin="anonymous" />
 </head>
 <body>
 
@@ -289,6 +292,12 @@ make binaries      <span class="c-dim"># build omni-sag, omnisag-ctl, omni-verif
 <span class="c-dim">#       ssh -L … bob@gw    → administratively prohibited</span>
 <span class="c-dim"># and:  ./bin/omni-verify_linux_amd64 -bundle ./evidence</span></pre>
     </div>
+
+    <div class="term rev" style="margin-top:24px">
+      <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+        <span class="title mono">not a mockup — an actual recorded run</span></div>
+      <div id="demo-player"></div>
+    </div>
   </div>
 </section>
 
@@ -362,6 +371,14 @@ make binaries      <span class="c-dim"># build omni-sag, omnisag-ctl, omni-verif
   // reveal-on-scroll for elements below the fold
   const io = new IntersectionObserver((es)=>es.forEach(e=>{ if(e.isIntersecting){ e.target.style.animationPlayState='running'; io.unobserve(e.target);} }),{threshold:.12});
   document.querySelectorAll('.rev').forEach(el=>{ const r=el.getBoundingClientRect(); if(r.top>window.innerHeight){ el.style.animationPlayState='paused'; io.observe(el);} });
+</script>
+<script src="https://cdn.jsdelivr.net/npm/asciinema-player@3.9.0/dist/bundle/asciinema-player.min.js"
+  integrity="sha384-qmLAPlXer6PI9nzHCKGyGuivxXgkMva3YAYIUF++pSy25D6Ynz+w7Xo9+TYtDO7B" crossorigin="anonymous"></script>
+<script>
+  AsciinemaPlayer.create('assets/demo.cast', document.getElementById('demo-player'), {
+    theme: 'monokai', fit: 'width', idleTimeLimit: 2, autoPlay: false, preload: true,
+    poster: 'npt:0:01'
+  });
 </script>
 </body>
 </html>
