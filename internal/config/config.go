@@ -38,11 +38,13 @@ type RADIUSConfig struct {
 	AllowInteractiveChallenge bool   `yaml:"allow_interactive_challenge"`
 }
 
-// EvidenceConfig selects the evidence sink. Exactly one of File or S3 must be
-// set. Slice 3 replaces this with the full evidence pipeline.
+// EvidenceConfig selects the evidence backend. Exactly one of File, S3, or
+// Pipeline must be set. File/S3 are the crude Slice-1 sinks; Pipeline is the
+// Slice-3 ordered, hash-chained, signed-checkpoint pipeline.
 type EvidenceConfig struct {
-	File string          `yaml:"file"` // JSONL path
-	S3   *EvidenceS3Conf `yaml:"s3"`
+	File     string                `yaml:"file"` // JSONL path (Slice 1)
+	S3       *EvidenceS3Conf       `yaml:"s3"`   // per-event S3 objects (Slice 1)
+	Pipeline *EvidencePipelineConf `yaml:"pipeline"`
 }
 
 // EvidenceS3Conf configures the S3/MinIO evidence sink.
@@ -52,6 +54,26 @@ type EvidenceS3Conf struct {
 	SecretKey string `yaml:"secret_key"`
 	Bucket    string `yaml:"bucket"`
 	UseSSL    bool   `yaml:"use_ssl"`
+}
+
+// EvidencePipelineConf configures the Slice-3 evidence pipeline: a local
+// segment/checkpoint store plus an optional Object-Locked (WORM) S3 archive.
+type EvidencePipelineConf struct {
+	DataDir     string            `yaml:"data_dir"`     // local root for segments/, checkpoints/, epoch
+	SigningKey  string            `yaml:"signing_key"`  // Ed25519 key path (created 0600 if absent)
+	SegmentSize int               `yaml:"segment_size"` // records per segment (default 128)
+	WORM        *EvidenceWORMConf `yaml:"worm"`         // optional Object-Locked archive
+}
+
+// EvidenceWORMConf configures the Object-Locked S3 archive.
+type EvidenceWORMConf struct {
+	Endpoint      string `yaml:"endpoint"`
+	AccessKey     string `yaml:"access_key"`
+	SecretKey     string `yaml:"secret_key"`
+	Bucket        string `yaml:"bucket"`
+	UseSSL        bool   `yaml:"use_ssl"`
+	Mode          string `yaml:"mode"`           // COMPLIANCE (default) or GOVERNANCE
+	RetentionDays int    `yaml:"retention_days"` // default 3650
 }
 
 // LDAPConfig configures the LDAPS bind used for authentication.
@@ -106,11 +128,38 @@ func (f *File) validate() error {
 	if f.HostKey == "" {
 		f.HostKey = "hostkey.pem"
 	}
-	if f.Evidence.File == "" && f.Evidence.S3 == nil {
-		return fmt.Errorf("config: evidence.file or evidence.s3 is required")
+	evCount := 0
+	if f.Evidence.File != "" {
+		evCount++
 	}
-	if f.Evidence.File != "" && f.Evidence.S3 != nil {
-		return fmt.Errorf("config: set only one of evidence.file or evidence.s3")
+	if f.Evidence.S3 != nil {
+		evCount++
+	}
+	if f.Evidence.Pipeline != nil {
+		evCount++
+	}
+	if evCount == 0 {
+		return fmt.Errorf("config: one of evidence.file, evidence.s3, or evidence.pipeline is required")
+	}
+	if evCount > 1 {
+		return fmt.Errorf("config: set only one of evidence.file, evidence.s3, or evidence.pipeline")
+	}
+	if p := f.Evidence.Pipeline; p != nil {
+		if p.DataDir == "" {
+			return fmt.Errorf("config: evidence.pipeline.data_dir is required")
+		}
+		if p.SigningKey == "" {
+			return fmt.Errorf("config: evidence.pipeline.signing_key is required")
+		}
+		if p.WORM != nil {
+			w := p.WORM
+			if w.Endpoint == "" || w.Bucket == "" {
+				return fmt.Errorf("config: evidence.pipeline.worm requires endpoint and bucket")
+			}
+			if w.Mode != "" && w.Mode != "COMPLIANCE" && w.Mode != "GOVERNANCE" {
+				return fmt.Errorf("config: evidence.pipeline.worm.mode must be COMPLIANCE or GOVERNANCE")
+			}
+		}
 	}
 	if f.MFA.Enabled {
 		if f.MFA.RADIUS == nil {

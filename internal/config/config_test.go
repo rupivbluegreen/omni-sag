@@ -86,3 +86,50 @@ policy:
 		t.Fatal("expected error for empty rule host")
 	}
 }
+
+func TestValidate_PipelineEvidence(t *testing.T) {
+	ok := `
+listen: ":2222"
+evidence:
+  pipeline:
+    data_dir: "evidence"
+    signing_key: "evidence-key.pem"
+policy:
+  roles: []
+`
+	f, err := Load(writeTemp(t, ok))
+	if err != nil {
+		t.Fatalf("valid pipeline config should load: %v", err)
+	}
+	if f.Evidence.Pipeline == nil || f.Evidence.Pipeline.DataDir != "evidence" {
+		t.Fatal("pipeline config not parsed")
+	}
+
+	// Pipeline missing signing_key must be rejected.
+	bad := `
+listen: ":2222"
+evidence:
+  pipeline:
+    data_dir: "evidence"
+policy:
+  roles: []
+`
+	if _, err := Load(writeTemp(t, bad)); err == nil {
+		t.Fatal("expected error for pipeline without signing_key")
+	}
+
+	// Two evidence backends at once must be rejected.
+	both := `
+listen: ":2222"
+evidence:
+  file: "e.jsonl"
+  pipeline:
+    data_dir: "evidence"
+    signing_key: "k.pem"
+policy:
+  roles: []
+`
+	if _, err := Load(writeTemp(t, both)); err == nil {
+		t.Fatal("expected error for two evidence backends")
+	}
+}
