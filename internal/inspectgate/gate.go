@@ -143,9 +143,17 @@ func (g *Gate) inspectSmall(ctx context.Context, meta inspect.TransferMeta, data
 		key, qerr := g.quarantineBytes(ctx, meta, data)
 		dec.QuarantineKey = key
 		return dec, qerr
-	default:
+	case res.Verdict == inspect.VerdictClean:
 		dec.Allow, dec.Verdict = true, "clean"
 		return dec, nil
+	default:
+		// Defense in depth: an unrecognized verdict is NOT a pass. A buggy or
+		// compromised inspector returning an out-of-range verdict must fail
+		// closed (quarantine + refuse), never fall through to allow.
+		dec.Verdict, dec.Reason = "error", fmt.Sprintf("unrecognized inspector verdict %d", res.Verdict)
+		key, qerr := g.quarantineBytes(ctx, meta, data)
+		dec.QuarantineKey = key
+		return dec, qerr
 	}
 }
 
@@ -194,7 +202,10 @@ func (g *Gate) inspectLarge(ctx context.Context, meta inspect.TransferMeta, cont
 	// Modified is treated as fail-closed like Blocked: we do not deliver modified
 	// bytes, and delivering the streamed original would defeat the DLP.
 	blocked := got.res.Verdict == inspect.VerdictBlocked || got.res.Verdict == inspect.VerdictModified
-	if failClosed || blocked {
+	// Defense in depth: only an explicit Clean verdict may be delivered. Any
+	// other (unrecognized) verdict fails closed rather than being delivered.
+	unknown := !failClosed && !blocked && got.res.Verdict != inspect.VerdictClean
+	if failClosed || blocked || unknown {
 		if failClosed {
 			dec.Verdict = "error"
 			if got.err != nil {
@@ -204,8 +215,10 @@ func (g *Gate) inspectLarge(ctx context.Context, meta inspect.TransferMeta, cont
 			}
 		} else if got.res.Verdict == inspect.VerdictModified {
 			dec.Verdict, dec.Reason = "modified", "content modification required; delivering sanitized content is not supported — refused: "+got.res.Reason
-		} else {
+		} else if got.res.Verdict == inspect.VerdictBlocked {
 			dec.Verdict, dec.Reason = "blocked", got.res.Reason
+		} else {
+			dec.Verdict, dec.Reason = "error", fmt.Sprintf("unrecognized inspector verdict %d", got.res.Verdict)
 		}
 		// Promote the held content into WORM quarantine, then drop the holding
 		// copy. Streamed, so a large blocked file is not buffered.
