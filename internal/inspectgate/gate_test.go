@@ -29,15 +29,26 @@ func (f fakeInspector) Inspect(_ context.Context, _ inspect.TransferMeta, body i
 	return inspect.Result{Verdict: f.verdict, Reason: f.reason, ICAPStatus: f.status}, nil
 }
 
-// memStore is an in-memory BlobStore.
+// errQuarantineDown is injected via memStore.putErr to simulate a WORM
+// quarantine store that fails writes; tests assert on it with errors.Is to
+// confirm the gate actually wraps and propagates the underlying failure.
+var errQuarantineDown = errors.New("quarantine store down")
+
+// memStore is an in-memory BlobStore. putErr, when set, makes every Put fail
+// with that error instead of storing anything — used to simulate a WORM
+// quarantine store that is down/full/otherwise failing writes.
 type memStore struct {
-	mu   sync.Mutex
-	objs map[string][]byte
+	mu     sync.Mutex
+	objs   map[string][]byte
+	putErr error
 }
 
 func newMemStore() *memStore { return &memStore{objs: map[string][]byte{}} }
 
 func (m *memStore) Put(_ context.Context, key, _ string, r io.Reader, _ int64) error {
+	if m.putErr != nil {
+		return m.putErr
+	}
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return err
@@ -139,6 +150,27 @@ func TestGate_SmallClean(t *testing.T) {
 	}
 }
 
+// TestGate_SmallCleanQuarantineWriteFailureFailsClosed locks in the
+// fail-closed ordering: a clean scan verdict must NOT be allowed through if
+// persisting the evidentiary quarantine copy itself fails. Regression guard
+// for a bug where Allow could be set true before the quarantine write was
+// confirmed to succeed.
+func TestGate_SmallCleanQuarantineWriteFailureFailsClosed(t *testing.T) {
+	q := newMemStore()
+	q.putErr = errQuarantineDown
+	g := newGate(t, fakeInspector{verdict: inspect.VerdictClean, status: 204}, nil, q, 1<<20)
+	dec, err := g.Inspect(context.Background(), inspect.TransferMeta{Filename: "f"}, strings.NewReader("hello"))
+	if err == nil || !errors.Is(err, errQuarantineDown) {
+		t.Fatalf("a quarantine write failure on an otherwise-clean scan must return a wrapped error, got %v", err)
+	}
+	if dec.Allow {
+		t.Fatal("a quarantine write failure must fail closed: Allow must be false even though the scan itself was clean")
+	}
+	if dec.Verdict != "error" {
+		t.Fatalf("verdict = %q, want error", dec.Verdict)
+	}
+}
+
 func TestGate_SmallBlockedQuarantines(t *testing.T) {
 	q := newMemStore()
 	g := newGate(t, fakeInspector{verdict: inspect.VerdictBlocked, reason: "EICAR", status: 200}, nil, q, 1<<20)
@@ -203,6 +235,29 @@ func TestGate_LargeCleanIsQuarantined(t *testing.T) {
 	// existing blocked-content path already does.
 	if holding.count() != 0 {
 		t.Fatal("holding copy should have been deleted after promotion to quarantine")
+	}
+}
+
+// TestGate_LargeCleanQuarantineWriteFailureFailsClosed is the large-file
+// counterpart to TestGate_SmallCleanQuarantineWriteFailureFailsClosed: the
+// stream tees successfully into a working holding store, the inspector says
+// clean, but promote's final copy into quarantine fails — the gate must fail
+// closed rather than deliver the streamed content.
+func TestGate_LargeCleanQuarantineWriteFailureFailsClosed(t *testing.T) {
+	holding := newMemStore() // succeeds, so the stream/tee completes fine
+	q := newMemStore()
+	q.putErr = errQuarantineDown // fails only at promote's final quarantine.Put
+	g := newGate(t, fakeInspector{verdict: inspect.VerdictClean, status: 204}, holding, q, 8)
+	body := strings.Repeat("z", 500) // > threshold 8 -> large/streaming path
+	dec, err := g.Inspect(context.Background(), inspect.TransferMeta{Filename: "big"}, strings.NewReader(body))
+	if err == nil || !errors.Is(err, errQuarantineDown) {
+		t.Fatalf("a quarantine promotion failure on an otherwise-clean large upload must return a wrapped error, got %v", err)
+	}
+	if dec.Allow {
+		t.Fatal("a quarantine promotion failure must fail closed: Allow must be false even though the scan itself was clean")
+	}
+	if dec.Verdict != "error" {
+		t.Fatalf("verdict = %q, want error", dec.Verdict)
 	}
 }
 
