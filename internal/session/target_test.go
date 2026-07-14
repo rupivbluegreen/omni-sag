@@ -6,12 +6,15 @@ import (
 	"crypto/rand"
 	"errors"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 
 	"github.com/rupivbluegreen/omni-sag/internal/credential"
+	"github.com/rupivbluegreen/omni-sag/internal/dialer"
+	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 )
 
@@ -334,6 +337,88 @@ func TestDialTarget_PromptSucceeds(t *testing.T) {
 		t.Fatalf("dialTarget: %v", err)
 	}
 	defer client.Close()
+}
+
+// TestRunRecordedShell_DialsDecisionResolvedPort proves DecideHost's resolved
+// Port actually reaches the real second-SSH-leg dial address, end to end
+// through the session layer — not just that dialTarget's own unit tests pass
+// a Decision with Port already filled in by hand. It wires a REAL
+// policy.Policy (one rule, one host, one port) through a REAL
+// dialer.Dialer.PeekHost (i.e. the real DecideHost, not a canned test
+// closure), drives a real client shell session through the full server, and
+// asserts the exact addr string dialNet received.
+//
+// This is the regression test for the bug this plan's port-threading fix
+// closed: interactive.go/sftp.go used to hardcode target port 22 regardless
+// of policy, which on a host that also runs a real sshd on 22 would silently
+// "succeed" against the wrong service.
+func TestRunRecordedShell_DialsDecisionResolvedPort(t *testing.T) {
+	const wantPort = 2200
+	const wantHost = "fake-target.lab.local"
+	fakeConn := startFakeTargetShell(t, "targetpw", nil)
+
+	// addrCh (not a plain shared variable) hands the dialed addr back to the
+	// test goroutine: a channel send/receive is what gives this a proper
+	// happens-before edge under the race detector, since the dial itself
+	// happens on a server-side goroutine (handleSession's shell goroutine),
+	// not the test goroutine.
+	addrCh := make(chan string, 1)
+	orig := dialNet
+	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) {
+		addrCh <- addr
+		return fakeConn, nil
+	}
+	t.Cleanup(func() { dialNet = orig })
+
+	prov := credential.NewProvider(credential.Config{
+		Fetcher: fakeFetcher{secret: []byte("targetpw")},
+		Query:   func(credential.Request) credential.Query { return credential.Query{} },
+	})
+
+	pol := policy.Policy{Roles: []policy.Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []policy.Rule{{Host: wantHost, Ports: []int{wantPort}, Credential: "inject"}},
+	}}}
+	d := dialer.New(pol, evidence.NewMemSink())
+
+	sink := evidence.NewMemSink()
+	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink,
+		WithCredentialProvider(prov),
+		WithDialerPeek(d.PeekHost), // the real DecideHost, not a fake
+		WithInsecureTargetHostKey(),
+	)
+	client := sshClient(t, addr, "alice%"+wantHost)
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	// See TestRunRecordedShell_ForwardsWindowChangeToTarget's comment on why
+	// StdinPipe (not a nil Stdin) is needed to keep the channel open.
+	if _, err := sess.StdinPipe(); err != nil {
+		t.Fatal(err)
+	}
+	sess.Stdout = &nopWriter{}
+	if err := sess.RequestPty("xterm", 24, 80, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Shell(); err != nil {
+		t.Fatal(err)
+	}
+
+	var capturedAddr string
+	select {
+	case capturedAddr = <-addrCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dialNet was never called — the target dial never happened")
+	}
+
+	want := wantHost + ":" + strconv.Itoa(wantPort)
+	if capturedAddr != want {
+		t.Fatalf("dialNet addr = %q, want %q (DecideHost's resolved port must reach the actual dial, not a hardcoded fallback)", capturedAddr, want)
+	}
 }
 
 // fakeFetcher implements credential.Fetcher for TestDialTarget_InjectSucceeds.

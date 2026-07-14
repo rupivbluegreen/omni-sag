@@ -57,6 +57,21 @@ func (s *Server) runSFTP(ctx, connCtx context.Context, channel ssh.Channel, pr p
 	if s.dialerPeek != nil {
 		decision = s.dialerPeek(pr, pr.TargetHost)
 	}
+	// Re-check Allow here — see runRecordedShell's identical check for why:
+	// DecideHost fails closed (Allow: false) on an ambiguous host match
+	// instead of guessing, and nothing upstream refuses the session on that.
+	if !decision.Allow {
+		_ = channel.Close()
+		reason := decision.Reason
+		if reason == "" {
+			reason = "no policy decision available for this target"
+		}
+		s.emit(evidence.Event{
+			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
+			User: pr.User, SourceIP: srcIP, Detail: "sftp refused: " + reason,
+		})
+		return
+	}
 	// decision.Port is DecideHost's resolved real-target port (the client's
 	// auth username carries no port at all — see its doc comment); fall back
 	// to 22 if unset (e.g. a test double that doesn't populate it).

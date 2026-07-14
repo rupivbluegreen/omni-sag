@@ -174,6 +174,26 @@ func (s *Server) runRecordedShell(ctx context.Context, channel ssh.Channel, cols
 	if s.dialerPeek != nil {
 		decision = s.dialerPeek(pr, targetHost)
 	}
+	// Re-check Allow here, even though the auth-time peek already consulted
+	// it for prompt-mode chaining: DecideHost fails closed (Allow: false) on
+	// an ambiguous host match (e.g. two rules matching the same host under
+	// different credential/approval postures) rather than guessing, and
+	// nothing upstream of this point refuses the session on that — without
+	// this check, a false Decision would fall through to the port-22
+	// fallback below and dial with an empty CredentialMode/TargetUser
+	// instead of cleanly refusing.
+	if !decision.Allow {
+		reason := decision.Reason
+		if reason == "" {
+			reason = "no policy decision available for this target"
+		}
+		_, _ = channel.Write([]byte(fmt.Sprintf("session refused: %s\r\n", reason)))
+		s.emit(evidence.Event{
+			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
+			User: pr.User, SourceIP: srcIP, Detail: "refused: " + reason,
+		})
+		return
+	}
 	// decision.Port is DecideHost's resolved real-target port (the client's
 	// auth username carries no port at all — see its doc comment); fall back
 	// to 22 if unset (e.g. a test double that doesn't populate it).
