@@ -176,6 +176,64 @@ func (f *memFile) ReadAt(p []byte, off int64) (int, error) {
 
 func cleanPath(p string) string { return path.Clean("/" + p) }
 
+// remoteFS serves the SFTP subsystem by proxying to a real *sftp.Client
+// connected to the target, replacing the in-memory stand-in (memFS) for
+// reads. Uploads (Filewrite) are handled separately — see Task 11 — because
+// they must land in quarantine first, not straight through to client.
+type remoteFS struct {
+	client *sftp.Client
+	gate   *inspectgate.Gate // set when inspection is configured; used by Filewrite (Task 11)
+}
+
+// Fileread (FileGet) proxies directly from the real target file — downloads
+// are not content-inspected or quarantined, matching the existing in-memory
+// stand-in's behavior and the design spec's explicit scope decision.
+func (fs *remoteFS) Fileread(r *sftp.Request) (io.ReaderAt, error) {
+	f, err := fs.client.Open(cleanPath(r.Filepath))
+	if err != nil {
+		return nil, err
+	}
+	return f, nil // *sftp.File implements io.ReaderAt directly
+}
+
+// Filelist proxies List/Stat to the real target.
+func (fs *remoteFS) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	switch r.Method {
+	case "List":
+		infos, err := fs.client.ReadDir(cleanPath(r.Filepath))
+		if err != nil {
+			return nil, err
+		}
+		out := make([]os.FileInfo, len(infos))
+		copy(out, infos)
+		return listerAt(out), nil
+	case "Stat":
+		info, err := fs.client.Stat(cleanPath(r.Filepath))
+		if err != nil {
+			return nil, err
+		}
+		return listerAt{info}, nil
+	}
+	return nil, fmt.Errorf("sftp: unsupported list method %q", r.Method)
+}
+
+// Filecmd proxies Remove/Rename/Mkdir/Rmdir to the real target.
+func (fs *remoteFS) Filecmd(r *sftp.Request) error {
+	switch r.Method {
+	case "Remove":
+		return fs.client.Remove(cleanPath(r.Filepath))
+	case "Rename":
+		return fs.client.Rename(cleanPath(r.Filepath), cleanPath(r.Target))
+	case "Mkdir":
+		return fs.client.Mkdir(cleanPath(r.Filepath))
+	case "Rmdir":
+		return fs.client.RemoveDirectory(cleanPath(r.Filepath))
+	case "Setstat", "Symlink":
+		return nil // no-ops, matching the prior in-memory stand-in's scope
+	}
+	return nil
+}
+
 // Filewrite (FilePut): when inspection is enabled, stream the upload through
 // the inspection gate; otherwise buffer it in memory and record it as an upload.
 func (m *memFS) Filewrite(r *sftp.Request) (io.WriterAt, error) {
