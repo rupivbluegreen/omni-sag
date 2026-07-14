@@ -59,7 +59,27 @@ func run(cfgPath string) error {
 		InsecureTLS:  cfg.LDAP.InsecureTLS,
 	})
 
-	d := dialer.New(cfg.CompilePolicy(), ev.dialerSink)
+	var dopts []dialer.Option
+	if ca := cfg.CyberArk; ca != nil {
+		opt, err := dialer.WithCyberArk(dialer.CyberArkParams{
+			BaseURL:                ca.BaseURL,
+			ClientCert:             ca.ClientCertPath,
+			ClientKey:              ca.ClientKeyPath,
+			CACert:                 ca.CACertPath,
+			AppID:                  ca.AppID,
+			Safe:                   ca.Safe,
+			ObjectTemplate:         ca.ObjectTemplate,
+			TimeoutSeconds:         ca.TimeoutSeconds,
+			BreakerFailures:        ca.BreakerFails,
+			BreakerCooldownSeconds: ca.BreakerCoolSec,
+		})
+		if err != nil {
+			return err
+		}
+		dopts = append(dopts, opt)
+		log.Printf("omni-sag: CyberArk credential injection enabled (CCP %s)", ca.BaseURL)
+	}
+	d := dialer.New(cfg.CompilePolicy(), ev.dialerSink, dopts...)
 
 	var opts []session.Option
 	if cfg.MFA.Enabled {

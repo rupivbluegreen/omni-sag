@@ -49,6 +49,20 @@ while IFS=$'\t' read -r pkg imports; do
   esac
 done < <(go list -f '{{.ImportPath}}{{"\t"}}{{join .Imports ","}}' ./...)
 
+echo "== internal/credential: no string-typed secrets / String() on Secret (ADR-0001) =="
+# Secret material must live in []byte, never a Go string (unwipeable). Flag a
+# String() method on the Secret type, and any struct field that carries a secret
+# VALUE as a string (paths/ids like ClientCertPath/AppID are fine).
+if grep -rnE 'func \([a-zA-Z0-9_ ]*\*?Secret\) String\(\)' internal/credential/ 2>/dev/null; then
+  echo "internal/credential: Secret must not implement String() (ADR-0001)"
+  fail=1
+fi
+if grep -rnE '\b(Password|Passphrase|Passwd|SecretValue|PlainSecret)\b[[:space:]]+string' \
+    --include='*.go' internal/credential/ 2>/dev/null | grep -v '_test\.go:'; then
+  echo "internal/credential: secret value carried in a string field (use credential.Secret / []byte)"
+  fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "import rule violations found"
   exit 1

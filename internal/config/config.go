@@ -20,7 +20,23 @@ type File struct {
 	Evidence   EvidenceConfig    `yaml:"evidence"`
 	Recording  *RecordingConfig  `yaml:"recording"`  // optional session-recording store
 	Inspection *InspectionConfig `yaml:"inspection"` // optional SFTP content inspection (ICAP)
+	CyberArk   *CyberArkConfig   `yaml:"cyberark"`   // optional; required if any rule uses credential "inject"
 	Policy     PolicyConfig      `yaml:"policy"`
+}
+
+// CyberArkConfig configures the CyberArk CCP client used by credential mode
+// "inject". Authentication to CCP is mutual TLS (client cert + verified server).
+type CyberArkConfig struct {
+	BaseURL        string `yaml:"base_url"`         // https://ccp.example/AIMWebService
+	ClientCertPath string `yaml:"client_cert"`      // PEM client cert (mTLS)
+	ClientKeyPath  string `yaml:"client_key"`       // PEM client key
+	CACertPath     string `yaml:"ca_cert"`          // PEM CA verifying the CCP server
+	AppID          string `yaml:"app_id"`           // CyberArk application id
+	Safe           string `yaml:"safe"`             // safe to query
+	ObjectTemplate string `yaml:"object_template"`  // object query; {host} is replaced by the target host
+	TimeoutSeconds int    `yaml:"timeout_seconds"`  //
+	BreakerFails   int    `yaml:"breaker_failures"` // consecutive failures before the circuit opens
+	BreakerCoolSec int    `yaml:"breaker_cooldown_seconds"`
 }
 
 // InspectionConfig configures ICAP content inspection of SFTP transfers. When
@@ -131,9 +147,10 @@ type RoleConfig struct {
 // "none" (default), "metadata-only", or "full". On "full" targets, port
 // forwarding (-L) is refused (PRD FR-10).
 type RuleConfig struct {
-	Host   string `yaml:"host"`
-	Ports  []int  `yaml:"ports"`
-	Record string `yaml:"record"`
+	Host       string `yaml:"host"`
+	Ports      []int  `yaml:"ports"`
+	Record     string `yaml:"record"`
+	Credential string `yaml:"credential"` // inject | prompt | passthrough | deny (empty=passthrough)
 }
 
 // Load reads and parses the configuration file at path.
@@ -219,6 +236,7 @@ func (f *File) validate() error {
 			return fmt.Errorf("config: mfa.radius requires server and secret")
 		}
 	}
+	usesInject := false
 	for _, r := range f.Policy.Roles {
 		if r.Name == "" {
 			return fmt.Errorf("config: role with empty name")
@@ -232,6 +250,21 @@ func (f *File) validate() error {
 			default:
 				return fmt.Errorf("config: role %q rule for %q has invalid record %q (want none|metadata-only|full)", r.Name, rule.Host, rule.Record)
 			}
+			switch rule.Credential {
+			case "", "passthrough", "prompt", "deny":
+			case "inject":
+				usesInject = true
+			default:
+				return fmt.Errorf("config: role %q rule for %q has invalid credential %q (want inject|prompt|passthrough|deny)", r.Name, rule.Host, rule.Credential)
+			}
+		}
+	}
+	if usesInject {
+		if f.CyberArk == nil {
+			return fmt.Errorf("config: a rule uses credential \"inject\" but no cyberark block is configured")
+		}
+		if f.CyberArk.BaseURL == "" || f.CyberArk.ClientCertPath == "" || f.CyberArk.ClientKeyPath == "" {
+			return fmt.Errorf("config: cyberark requires base_url, client_cert, and client_key for inject")
 		}
 	}
 	return nil
@@ -244,9 +277,10 @@ func (f *File) CompilePolicy() policy.Policy {
 		rules := make([]policy.Rule, 0, len(rc.Allow))
 		for _, ru := range rc.Allow {
 			rules = append(rules, policy.Rule{
-				Host:   ru.Host,
-				Ports:  ru.Ports,
-				Record: policy.RecordMode(ru.Record).Normalize(),
+				Host:       ru.Host,
+				Ports:      ru.Ports,
+				Record:     policy.RecordMode(ru.Record).Normalize(),
+				Credential: ru.Credential,
 			})
 		}
 		roles = append(roles, policy.Role{Name: rc.Name, Groups: rc.Groups, Allow: rules})

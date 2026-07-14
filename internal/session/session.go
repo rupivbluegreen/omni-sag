@@ -271,6 +271,8 @@ func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr
 			_ = newCh.Reject(ssh.Prohibited, "forwarding refused: target requires full session recording")
 		case errors.Is(err, dialer.ErrDenied):
 			_ = newCh.Reject(ssh.Prohibited, "administratively prohibited")
+		case errors.Is(err, dialer.ErrCredentialRefused):
+			_ = newCh.Reject(ssh.Prohibited, "credential refused")
 		default:
 			_ = newCh.Reject(ssh.ConnectionFailed, "connection failed")
 		}
