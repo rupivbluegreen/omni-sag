@@ -150,9 +150,14 @@ policy:
           credential: passthrough
         # Real-target demo (this design's shell/SFTP proxy, not the -L tunnel
         # above): alice gets a genuine shell/SFTP on the ssh-target container,
-        # authenticated as svc_db1 via the mock CyberArk CCP below.
+        # authenticated as svc_db1. Uses "prompt" rather than "inject" because
+        # no mock CyberArk CCP service runs in this compose lab (only the CCP
+        # *client* is exercised, against an in-process httptest.Server, in
+        # internal/credential/ccp_test.go) — inject would fail closed here
+        # with no CCP to fetch from. prompt exercises the same target-side
+        # password-auth path as inject would, with no extra infrastructure.
         - host: "127.0.0.1"
           ports: [2200]
           target_user: "svc_db1"
           record: full
-          credential: inject
+          credential: prompt
