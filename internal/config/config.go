@@ -217,6 +217,7 @@ type RuleConfig struct {
 	Record          string `yaml:"record"`
 	Credential      string `yaml:"credential"`       // inject | prompt | passthrough | deny (empty=passthrough)
 	RequireApproval bool   `yaml:"require_approval"` // gate matching targets behind a four-eyes approval
+	TargetUser      string `yaml:"target_user"`      // account on the target; empty => same as gateway login user
 }
 
 // Load reads and parses the configuration file at path.
@@ -412,6 +413,7 @@ func (f *File) CompilePolicy() policy.Policy {
 				Record:          policy.RecordMode(ru.Record).Normalize(),
 				Credential:      ru.Credential,
 				RequireApproval: ru.RequireApproval,
+				TargetUser:      ru.TargetUser,
 			})
 		}
 		roles = append(roles, policy.Role{Name: rc.Name, Groups: rc.Groups, Allow: rules})

@@ -63,6 +63,9 @@ type Rule struct {
 	// RequireApproval gates matching targets behind a four-eyes approval: the
 	// session blocks until a second human approves it (PRD approvals).
 	RequireApproval bool
+	// TargetUser is the account the gateway authenticates as on the target for
+	// this rule's matches. Empty => the same name as the gateway login user.
+	TargetUser string
 }
 
 // Role binds AD group membership to a set of allow rules.
@@ -86,6 +89,7 @@ type Decision struct {
 	RecordMode      RecordMode // recording posture of the matched target (RecordNone on deny)
 	CredentialMode  string     // credential posture of the matched target (empty on deny)
 	RequireApproval bool       // matched target requires a four-eyes approval
+	TargetUser      string     // account to use on the target; empty => same as login user
 }
 
 // ForwardingAllowed reports whether port-forwarding (-L) is permitted for this
@@ -145,6 +149,7 @@ func (p Policy) Decide(pr Principal, t Target) Decision {
 					RecordMode:      rule.Record.Normalize(),
 					CredentialMode:  rule.Credential,
 					RequireApproval: rule.RequireApproval,
+					TargetUser:      rule.TargetUser,
 				}
 			}
 		}
