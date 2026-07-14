@@ -11,11 +11,22 @@ import (
 )
 
 // VerifyReport is the outcome of an offline bundle verification.
+//
+// OK means the bundle passed every INTEGRITY check (hashes, chains, Merkle
+// roots, signatures). It does NOT by itself mean the bundle is authentic:
+// authenticity requires a trust anchor the verifier cannot derive from the
+// bundle. KeyPinned reports whether the signing key was pinned, and HeadPinned
+// whether the latest-checkpoint hash was pinned; only with a pinned key is a
+// forged, attacker-re-signed bundle rejected. Callers must not present an
+// unauthenticated OK result as "authentic".
 type VerifyReport struct {
 	OK                 bool
+	KeyPinned          bool
+	HeadPinned         bool
 	RecordsChecked     int
 	SegmentsChecked    int
 	CheckpointsChecked int
+	ChainHead          string   // hash of the latest checkpoint; pin as the next expectedHead
 	SigningKeys        []string // distinct checkpoint public keys seen
 	Problems           []string // every failure, most useful first
 }
@@ -37,10 +48,16 @@ type segmentFile struct {
 // signature and the checkpoint hash-chain. No gateway is required.
 //
 // If pinnedKey is non-empty, every checkpoint must be signed by that hex public
-// key. Otherwise the embedded keys are trusted but must be internally
-// consistent (all checkpoints share one key).
-func VerifyBundle(dir, pinnedKey string) (*VerifyReport, error) {
-	rep := &VerifyReport{}
+// key (this is the only defense against a fully-forged, attacker-re-signed
+// bundle — the embedded self-signature proves nothing on its own). Otherwise
+// the embedded keys are only checked for internal consistency (one key).
+//
+// If expectedHead is non-empty, the hash of the latest checkpoint (the global
+// chain head) must equal it. This is the out-of-band anchor that detects
+// trailing truncation — deleting the newest segment(s)/epoch, which nothing in
+// the bundle otherwise references.
+func VerifyBundle(dir, pinnedKey, expectedHead string) (*VerifyReport, error) {
+	rep := &VerifyReport{KeyPinned: pinnedKey != "", HeadPinned: expectedHead != ""}
 
 	segs, err := loadSegments(filepath.Join(dir, "segments"))
 	if err != nil {
@@ -59,7 +76,7 @@ func VerifyBundle(dir, pinnedKey string) (*VerifyReport, error) {
 	rep.RecordsChecked = len(all)
 	verifyPerEpochChains(rep, all)
 	verifyPerEmitterSequences(rep, all)
-	verifyCheckpoints(rep, segs, ckpts, pinnedKey)
+	verifyCheckpoints(rep, segs, ckpts, pinnedKey, expectedHead)
 
 	rep.SegmentsChecked = len(segs)
 	rep.CheckpointsChecked = len(ckpts)
@@ -87,9 +104,10 @@ func verifyRecordHashes(rep *VerifyReport, segs []segmentFile) {
 
 // verifyPerEpochChains checks, WITHIN each epoch, that global_seq is contiguous
 // 1..N and that prev_hash links each record to its predecessor (the first
-// record links to genesis). The hash chain and global_seq restart per epoch
-// (each process start is a fresh, independently-signed chain); cross-epoch
-// deletion is instead prevented by writing sealed segments to WORM storage.
+// record links to genesis). The record hash chain and global_seq restart per
+// epoch (each process start is a fresh chain). Cross-epoch and interior
+// deletion are caught by the GLOBAL checkpoint chain (verifyCheckpoints);
+// trailing truncation is caught by the pinned expectedHead anchor and/or WORM.
 func verifyPerEpochChains(rep *VerifyReport, all []Record) {
 	byEpoch := map[uint64][]Record{}
 	for _, r := range all {
@@ -156,10 +174,13 @@ func verifyPerEmitterSequences(rep *VerifyReport, all []Record) {
 	}
 }
 
-// verifyCheckpoints verifies each checkpoint signature, the checkpoint
-// hash-chain, and that each checkpoint's Merkle root / chain head / count match
-// the actual segment records. It also flags segments with no checkpoint.
-func verifyCheckpoints(rep *VerifyReport, segs []segmentFile, ckpts []Checkpoint, pinnedKey string) {
+// verifyCheckpoints verifies each checkpoint signature, the GLOBAL checkpoint
+// hash-chain (one linked list across all epochs, so deleting any interior
+// segment or whole epoch breaks a prev-link), and that each checkpoint's Merkle
+// root / chain head / count match the actual segment records. It flags segments
+// with no checkpoint, and — when expectedHead is pinned — that the latest
+// checkpoint is the expected chain head (detecting trailing truncation).
+func verifyCheckpoints(rep *VerifyReport, segs []segmentFile, ckpts []Checkpoint, pinnedKey, expectedHead string) {
 	byIndex := map[[2]uint64]segmentFile{}
 	covered := map[[2]uint64]bool{}
 	for _, s := range segs {
@@ -174,8 +195,12 @@ func verifyCheckpoints(rep *VerifyReport, segs []segmentFile, ckpts []Checkpoint
 	})
 
 	keySeen := map[string]bool{}
-	// The checkpoint hash-chain restarts per epoch, mirroring the record chain.
-	prevHashByEpoch := map[uint64]string{}
+	// One global chain: each checkpoint links to the immediately preceding one
+	// across all epochs. The first present checkpoint must link to genesis; a
+	// non-genesis first link means earlier checkpoints were deleted (prefix
+	// deletion). chainHead ends as the hash of the latest checkpoint.
+	prevHash := GenesisPrevCheckpoint
+	chainHead := GenesisPrevCheckpoint
 	for ci, c := range ckpts {
 		keySeen[c.PublicKey] = true
 		if pinnedKey != "" && c.PublicKey != pinnedKey {
@@ -184,18 +209,15 @@ func verifyCheckpoints(rep *VerifyReport, segs []segmentFile, ckpts []Checkpoint
 		if !c.VerifySig() {
 			rep.fail("checkpoint %d-%d: INVALID signature", c.Epoch, c.SegmentIndex)
 		}
-		want, ok := prevHashByEpoch[c.Epoch]
-		if !ok {
-			want = GenesisPrevCheckpoint
-		}
-		if c.PrevCheckpointHash != want {
-			rep.fail("checkpoint %d-%d: broken checkpoint chain (prev=%s, want %s)", c.Epoch, c.SegmentIndex, short(c.PrevCheckpointHash), short(want))
+		if c.PrevCheckpointHash != prevHash {
+			rep.fail("checkpoint %d-%d: broken checkpoint chain (prev=%s, want %s) — interior deletion or missing epoch", c.Epoch, c.SegmentIndex, short(c.PrevCheckpointHash), short(prevHash))
 		}
 		h, err := c.HashHex()
 		if err != nil {
 			rep.fail("checkpoint %d-%d: cannot hash: %v", c.Epoch, c.SegmentIndex, err)
 		}
-		prevHashByEpoch[c.Epoch] = h
+		prevHash = h
+		chainHead = h
 
 		seg, ok := byIndex[[2]uint64{c.Epoch, c.SegmentIndex}]
 		if !ok {
@@ -229,6 +251,16 @@ func verifyCheckpoints(rep *VerifyReport, segs []segmentFile, ckpts []Checkpoint
 		if !covered[[2]uint64{s.epoch, s.index}] {
 			rep.fail("segment %s is not covered by any checkpoint (unsealed or missing checkpoint)", s.name)
 		}
+	}
+
+	// Terminus anchor: if the operator pinned the expected latest-checkpoint
+	// hash (delivered out of band, like the pinned key), the global chain must
+	// end exactly there. This is the only offline defense against trailing
+	// truncation — deleting the newest checkpoint(s), which no surviving record
+	// references.
+	rep.ChainHead = chainHead
+	if expectedHead != "" && chainHead != expectedHead {
+		rep.fail("trailing truncation: latest checkpoint hash %s does not match pinned head %s — newest evidence may have been deleted", short(chainHead), short(expectedHead))
 	}
 
 	if pinnedKey == "" && len(keySeen) > 1 {

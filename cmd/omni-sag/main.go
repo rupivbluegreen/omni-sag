@@ -159,11 +159,17 @@ func buildEvidence(ctx context.Context, ec config.EvidenceConfig) (evidenceSyste
 		if err != nil {
 			return evidenceSystem{}, err
 		}
-		log.Printf("omni-sag: evidence pipeline active (data_dir=%s, signing key=%s)", p.DataDir, signer.PublicKeyHex()[:16])
+		log.Printf("omni-sag: evidence pipeline active (data_dir=%s, signing key=%s)", p.DataDir, signer.PublicKeyHex())
 		return evidenceSystem{
 			dialerSink:  bus.Emitter("dialer"),
 			sessionSink: bus.Emitter("session"),
-			closer:      bus.Close,
+			closer: func() error {
+				err := bus.Close()
+				// Publish the chain head out of band so operators can pin it as
+				// `omni-verify -head <hash>` to detect trailing truncation.
+				log.Printf("omni-sag: evidence chain head=%s", bus.Head())
+				return err
+			},
 		}, nil
 	}
 

@@ -41,7 +41,12 @@ recording:
 #   file     : crude JSONL (Slice 1), infra-free dev
 #   s3       : crude per-event objects on MinIO (Slice 1)
 #   pipeline : ordered, hash-chained, signed-checkpoint pipeline (Slice 3)
-#              verified offline with `omni-verify -bundle <data_dir>`
+#              Verify offline with:
+#                omni-verify -bundle <data_dir> -pubkey <signing key> -head <chain head>
+#              -pubkey (the gateway's public key, delivered out of band) is
+#              REQUIRED to assert authenticity; without it omni-verify reports
+#              UNVERIFIED (exit 3). -head (logged by the gateway at shutdown as
+#              "evidence chain head=") detects trailing truncation.
 evidence:
   file: "evidence.jsonl"
   # s3:

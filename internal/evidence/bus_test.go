@@ -48,7 +48,7 @@ func buildBundle(t *testing.T, segmentSize int) (string, *Signer) {
 func TestBus_ProducesVerifiableBundle(t *testing.T) {
 	dir, signer := buildBundle(t, 3)
 
-	rep, err := VerifyBundle(dir, signer.PublicKeyHex())
+	rep, err := VerifyBundle(dir, signer.PublicKeyHex(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestBus_TamperedRecordFailsVerification(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rep, err := VerifyBundle(dir, signer.PublicKeyHex())
+	rep, err := VerifyBundle(dir, signer.PublicKeyHex(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestBus_DeletedRecordDetected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rep, _ := VerifyBundle(dir, signer.PublicKeyHex())
+	rep, _ := VerifyBundle(dir, signer.PublicKeyHex(), "")
 	if rep.OK {
 		t.Fatal("deleting a record must FAIL verification")
 	}
@@ -134,7 +134,7 @@ func TestBus_TamperedCheckpointSignatureFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rep, _ := VerifyBundle(dir, signer.PublicKeyHex())
+	rep, _ := VerifyBundle(dir, signer.PublicKeyHex(), "")
 	if rep.OK {
 		t.Fatal("tampered checkpoint must FAIL verification")
 	}
@@ -164,7 +164,7 @@ func TestBus_EpochAdvancesOnRestart(t *testing.T) {
 
 	// Both runs should verify together, and the second run's records must be in
 	// epoch 2 (per-emitter seq resets to 1 under the new epoch).
-	rep, err := VerifyBundle(dir, signer.PublicKeyHex())
+	rep, err := VerifyBundle(dir, signer.PublicKeyHex(), "")
 	if err != nil {
 		t.Fatal(err)
 	}

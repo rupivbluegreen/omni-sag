@@ -30,8 +30,9 @@ type Bus struct {
 	ch   chan submission
 	done chan struct{}
 
-	mu     sync.Mutex
-	closed bool
+	mu      sync.Mutex
+	closed  bool
+	sealErr error // error from sealing the final segment at shutdown, surfaced by Close
 
 	// writer-goroutine-owned state (no external access):
 	epoch         uint64
@@ -82,6 +83,15 @@ func NewBus(cfg BusConfig) (*Bus, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Continue the checkpoint hash-chain across process restarts by linking this
+	// run's first checkpoint to the previous run's last one. This makes the
+	// checkpoint chain GLOBAL (one linked list across all epochs) rather than
+	// restarting per epoch, so deleting an interior segment or a whole epoch
+	// breaks a prev-link and is detected offline.
+	head, err := lastCheckpointHash(filepath.Join(cfg.DataDir, "checkpoints"))
+	if err != nil {
+		return nil, err
+	}
 
 	b := &Bus{
 		dir:           cfg.DataDir,
@@ -93,6 +103,7 @@ func NewBus(cfg BusConfig) (*Bus, error) {
 		done:          make(chan struct{}),
 		epoch:         epoch,
 		perEmitterSeq: make(map[string]uint64),
+		prevCkptHash:  head,
 	}
 	// Segments are opened lazily on the first record so a run that seals its
 	// last full segment (or emits nothing) leaves no empty, checkpoint-less
@@ -114,10 +125,74 @@ func advanceEpoch(path string) (uint64, error) {
 		return 0, fmt.Errorf("evidence bus: read epoch: %w", err)
 	}
 	next := prev + 1
-	if err := os.WriteFile(path, []byte(strconv.FormatUint(next, 10)), 0o600); err != nil {
+	// Durably persist the epoch BEFORE it is used. If this write's page is lost
+	// on a crash, a restart would reuse the epoch and O_TRUNC-overwrite prior
+	// sealed evidence; fsync (file + parent dir) via atomic rename prevents that.
+	if err := writeFileDurable(path, []byte(strconv.FormatUint(next, 10)), 0o600); err != nil {
 		return 0, fmt.Errorf("evidence bus: write epoch: %w", err)
 	}
 	return next, nil
+}
+
+// writeFileDurable writes data to path atomically and durably: write to a temp
+// file in the same dir, fsync it, rename over path, then fsync the directory so
+// both the file contents and the directory entry survive a crash.
+func writeFileDurable(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	return fsyncDir(dir)
+}
+
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+// lastCheckpointHash returns the HashHex of the highest (epoch, segment) sealed
+// checkpoint present, or GenesisPrevCheckpoint if none. It is how a new run
+// continues the global checkpoint chain.
+func lastCheckpointHash(dir string) (string, error) {
+	ckpts, err := loadCheckpoints(dir)
+	if err != nil {
+		return "", err
+	}
+	if len(ckpts) == 0 {
+		return GenesisPrevCheckpoint, nil
+	}
+	best := ckpts[0]
+	for _, c := range ckpts[1:] {
+		if c.Epoch > best.Epoch || (c.Epoch == best.Epoch && c.SegmentIndex > best.SegmentIndex) {
+			best = c
+		}
+	}
+	return best.HashHex()
 }
 
 // Emitter returns a Sink handle whose events are tagged with emitterID and
@@ -156,9 +231,12 @@ func (b *Bus) run() {
 		sub.reply <- b.process(sub)
 	}
 	// Channel drained and closed: seal whatever remains (sealSegment flushes,
-	// closes, and clears the open segment).
+	// closes, and clears the open segment). The final seal is where the last
+	// segment+checkpoint are written and uploaded to WORM — its error must NOT
+	// be swallowed, or a WORM-upload failure on the last segment would be
+	// reported as a clean shutdown. Close surfaces sealErr.
 	if len(b.segRecords) > 0 {
-		_ = b.sealSegment()
+		b.sealErr = b.sealSegment()
 	}
 }
 
@@ -233,7 +311,11 @@ func (b *Bus) checkpointBaseName() string {
 
 func (b *Bus) openSegment() error {
 	path := filepath.Join(b.dir, "segments", b.segmentBaseName()+".jsonl")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	// O_EXCL: refuse to overwrite an existing segment. In normal operation the
+	// epoch is fresh so the file is new; a collision means an epoch was reused
+	// (durability failure) and we must fail closed rather than O_TRUNC away
+	// prior sealed evidence.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("evidence bus: open segment: %w", err)
 	}
@@ -329,5 +411,10 @@ func (b *Bus) Close() error {
 
 	close(b.ch)
 	<-b.done
-	return nil
+	return b.sealErr
 }
+
+// Head returns the hash of the latest sealed checkpoint (the global chain
+// head). Safe to call after Close (the writer has stopped). Pin it out of band
+// as the next verification's expectedHead to detect trailing truncation.
+func (b *Bus) Head() string { return b.prevCkptHash }
