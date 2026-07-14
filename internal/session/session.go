@@ -74,6 +74,8 @@ type Server struct {
 	pendingSecrets sync.Map                                                        // token(string) -> *credential.Secret; prompt-mode target passwords awaiting first use
 	dialerPeek     func(pr policy.Principal, target policy.Target) policy.Decision // non-dialing decision lookup; nil disables prompt-mode chaining
 
+	targetHostKeyCB ssh.HostKeyCallback // verifies the target's host key on the second SSH leg; nil => InsecureIgnoreHostKey (dev default)
+
 	wg       sync.WaitGroup // tracks active connections for graceful drain
 	active   atomic.Int64   // current active connections
 	draining atomic.Bool    // set once ctx is cancelled; refuses new connections
