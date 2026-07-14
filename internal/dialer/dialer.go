@@ -261,14 +261,24 @@ func (d *Dialer) gateApproval(ctx context.Context, pr policy.Principal, sourceIP
 }
 
 func (d *Dialer) emitApproval(pr policy.Principal, sourceIP string, target policy.Target, reqID, outcome, status string) {
-	allow := outcome == "granted"
+	// Allow is left nil (unset) for "requested": a pending request is neither
+	// an allow nor a deny yet, unlike "granted"/"refused" which are a final
+	// outcome. Mirrors session.go's quarantine-release approval events,
+	// which have always left it unset for the equivalent pending case.
+	var allow *bool
+	switch outcome {
+	case "granted":
+		allow = evidence.BoolPtr(true)
+	case "refused":
+		allow = evidence.BoolPtr(false)
+	}
 	if err := d.sink.Emit(evidence.Event{
 		Time:      time.Now().UTC(),
 		Type:      evidence.TypeApproval,
 		User:      pr.User,
 		SourceIP:  sourceIP,
 		Target:    target.String(),
-		Allow:     evidence.BoolPtr(allow),
+		Allow:     allow,
 		Outcome:   outcome,
 		Reason:    "approval " + status,
 		ObjectKey: reqID,
