@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "omni-sag.fullname" . }}
+  labels: {{- include "omni-sag.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels: {{- include "omni-sag.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "omni-sag.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ .Files.Get "files/config.yaml" | default (.Values.config | toYaml) | sha256sum }}
+    spec:
+      # Must exceed drain_grace_seconds so in-flight SSH sessions finish on a
+      # rolling upgrade before the kubelet SIGKILLs the pod.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: omni-sag
+          image: {{ include "omni-sag.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["-config", "/etc/omni-sag/config.yaml"]
+          securityContext: {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - {name: ssh, containerPort: {{ .Values.ports.ssh }}}
+            - {name: api, containerPort: {{ .Values.ports.api }}}
+            {{- if .Values.metrics.enabled }}
+            - {name: metrics, containerPort: {{ .Values.ports.metrics }}}
+            {{- end }}
+          readinessProbe:
+            httpGet: {path: /readyz, port: api}
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet: {path: /healthz, port: api}
+            initialDelaySeconds: 5
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - {name: config, mountPath: /etc/omni-sag, readOnly: true}
+            - {name: state, mountPath: /var/lib/omni-sag}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: config
+          {{- if .Values.configSecretName }}
+          secret: {secretName: {{ .Values.configSecretName }}}
+          {{- else }}
+          configMap: {name: {{ include "omni-sag.fullname" . }}-config}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+        - name: state
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim: {claimName: {{ include "omni-sag.fullname" . }}-state}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

@@ -1,0 +1,136 @@
+# CustomResourceDefinitions for the Omni-SAG operator. These mirror the objects
+# the gateway already models in-process (internal/policy, internal/approval); the
+# operator (deploy/operator, cmd/omni-operator) watches them and reconciles the
+# gateway's config/policy. Applying and reconciling these REQUIRES a Kubernetes
+# cluster — see deploy/operator/README.md.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: policies.omni-sag.io
+spec:
+  group: omni-sag.io
+  scope: Namespaced
+  names: {kind: Policy, plural: policies, singular: policy, shortNames: [osp]}
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                roles:
+                  type: array
+                  items:
+                    type: object
+                    required: [name]
+                    properties:
+                      name: {type: string}
+                      groups: {type: array, items: {type: string}}
+                      allow:
+                        type: array
+                        items:
+                          type: object
+                          required: [host]
+                          properties:
+                            host: {type: string}
+                            ports: {type: array, items: {type: integer}}
+                            record: {type: string, enum: [none, metadata-only, full]}
+                            credential: {type: string, enum: [inject, prompt, passthrough, deny]}
+                            requireApproval: {type: boolean}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: approvalrequests.omni-sag.io
+spec:
+  group: omni-sag.io
+  scope: Namespaced
+  names: {kind: ApprovalRequest, plural: approvalrequests, singular: approvalrequest, shortNames: [oar]}
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources: {status: {}}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [kind, requester, target]
+              properties:
+                kind: {type: string, enum: [session_access, quarantine_release, staged_policy_change]}
+                requester: {type: string}
+                target: {type: string}
+                reason: {type: string}
+                ttlSeconds: {type: integer}
+            status:
+              type: object
+              properties:
+                phase: {type: string, enum: [pending, approved, denied, expired]}
+                approver: {type: string}   # must differ from spec.requester (four-eyes)
+                decidedAt: {type: string, format: date-time}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: quarantinereleases.omni-sag.io
+spec:
+  group: omni-sag.io
+  scope: Namespaced
+  names: {kind: QuarantineRelease, plural: quarantinereleases, singular: quarantinerelease, shortNames: [oqr]}
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources: {status: {}}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [objectKey, requester]
+              properties:
+                objectKey: {type: string}   # WORM-quarantined object
+                requester: {type: string}
+                reason: {type: string}
+            status:
+              type: object
+              properties:
+                phase: {type: string, enum: [pending, approved, denied]}
+                approver: {type: string}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: stagedpolicychanges.omni-sag.io
+spec:
+  group: omni-sag.io
+  scope: Namespaced
+  names: {kind: StagedPolicyChange, plural: stagedpolicychanges, singular: stagedpolicychange, shortNames: [ospc]}
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources: {status: {}}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [requester, policyRef]
+              properties:
+                requester: {type: string}
+                policyRef: {type: string}   # name of the proposed Policy object
+                reason: {type: string}
+            status:
+              type: object
+              properties:
+                phase: {type: string, enum: [pending, approved, denied, applied]}
+                approver: {type: string}

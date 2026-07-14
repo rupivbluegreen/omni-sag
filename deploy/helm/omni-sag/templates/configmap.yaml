@@ -1,0 +1,27 @@
+{{- if not .Values.configSecretName }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "omni-sag.fullname" . }}-config
+  labels: {{- include "omni-sag.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    # NOTE: this default config is for bootstrap/dev. In production supply a
+    # Secret via .Values.configSecretName so bind passwords / shared secrets /
+    # TLS keys are not stored in a ConfigMap.
+    listen: ":{{ .Values.ports.ssh }}"
+    host_key: "/var/lib/omni-sag/hostkey.pem"
+    drain_grace_seconds: {{ .Values.drainGraceSeconds }}
+    api:
+      listen: ":{{ .Values.ports.api }}"
+    {{- if .Values.metrics.enabled }}
+    metrics:
+      listen: ":{{ .Values.ports.metrics }}"
+    {{- end }}
+    evidence:
+      pipeline:
+        data_dir: "/var/lib/omni-sag/evidence"
+        signing_key: "/var/lib/omni-sag/evidence-key.pem"
+    policy:
+      roles: []
+{{- end }}

@@ -1,0 +1,73 @@
+package metrics
+
+import (
+	"bytes"
+	"errors"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/rupivbluegreen/omni-sag/internal/evidence"
+)
+
+type failSink struct{}
+
+func (failSink) Emit(evidence.Event) error { return errors.New("down") }
+func (failSink) Close() error              { return nil }
+
+func TestCountingSink_CountsByType(t *testing.T) {
+	m := New()
+	s := m.CountingSink(evidence.NewMemSink())
+	emit := func(typ evidence.Type, allow bool, verdict string) {
+		_ = s.Emit(evidence.Event{Type: typ, Allow: evidence.BoolPtr(allow), Verdict: verdict})
+	}
+	emit(evidence.TypeAuth, true, "")
+	emit(evidence.TypeAuth, false, "")
+	emit(evidence.TypeTunnelDecision, true, "")
+	emit(evidence.TypeApproval, false, "")
+	emit(evidence.TypeInspection, false, "blocked")
+	emit(evidence.TypeInspection, true, "clean")
+
+	if m.authSuccess.get() != 1 || m.authFailure.get() != 1 {
+		t.Fatalf("auth counters wrong: %d/%d", m.authSuccess.get(), m.authFailure.get())
+	}
+	if m.tunnelAllow.get() != 1 || m.approvalRefused.get() != 1 {
+		t.Fatal("tunnel/approval counters wrong")
+	}
+	if m.inspectBlocked.get() != 1 || m.inspectClean.get() != 1 {
+		t.Fatalf("inspection counters wrong: %d/%d", m.inspectBlocked.get(), m.inspectClean.get())
+	}
+}
+
+func TestCountingSink_CountsEmitFailures(t *testing.T) {
+	m := New()
+	s := m.CountingSink(failSink{})
+	if err := s.Emit(evidence.Event{Type: evidence.TypeAuth, Allow: evidence.BoolPtr(true)}); err == nil {
+		t.Fatal("expected the inner emit error to propagate")
+	}
+	if m.evidenceEmitFailures.get() != 1 {
+		t.Fatal("an emit failure must be counted")
+	}
+}
+
+func TestHandler_RendersPrometheus(t *testing.T) {
+	m := New()
+	m.SetActiveFn(func() int64 { return 3 })
+	_ = m.CountingSink(evidence.NewMemSink()).Emit(evidence.Event{Type: evidence.TypeAuth, Allow: evidence.BoolPtr(true)})
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, "omnisag_active_sessions 3") {
+		t.Fatalf("missing active gauge:\n%s", body)
+	}
+	if !strings.Contains(body, "omnisag_auth_success_total 1") {
+		t.Fatalf("missing auth counter:\n%s", body)
+	}
+	// Prometheus format sanity: every metric has HELP+TYPE.
+	var b bytes.Buffer
+	m.WriteText(&b)
+	if strings.Count(b.String(), "# TYPE") < 13 {
+		t.Fatal("expected a TYPE line per metric")
+	}
+}

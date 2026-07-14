@@ -24,7 +24,23 @@ type File struct {
 	API        *APIConfig        `yaml:"api"`           // optional control-plane API (out-of-band)
 	Approval   *ApprovalConfig   `yaml:"approval"`      // optional; required if any rule sets require_approval
 	PolicySrc  *PolicySource     `yaml:"policy_source"` // optional; hot-reload policy from a file
+	Metrics    *MetricsConfig    `yaml:"metrics"`       // optional Prometheus /metrics listener (out-of-band)
+	DrainGrace int               `yaml:"drain_grace_seconds"`
 	Policy     PolicyConfig      `yaml:"policy"`
+}
+
+// MetricsConfig configures the Prometheus metrics endpoint, served on its own
+// listener separate from the SSH data path.
+type MetricsConfig struct {
+	Listen string `yaml:"listen"` // e.g. ":9090"
+}
+
+// DrainGraceSeconds returns the rolling-upgrade drain grace period (default 30s).
+func (f *File) DrainGraceSeconds() int {
+	if f.DrainGrace <= 0 {
+		return 30
+	}
+	return f.DrainGrace
 }
 
 // ApprovalConfig configures the durable four-eyes approval store.
