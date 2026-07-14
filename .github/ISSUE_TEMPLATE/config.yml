@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/rupivbluegreen/omni-sag/security/advisories/new
+    about: Please report vulnerabilities privately, not as a public issue. See SECURITY.md.
+  - name: 💬 Questions & ideas (Discussions)
+    url: https://github.com/rupivbluegreen/omni-sag/discussions
+    about: Not a bug? Ask questions, share setups, and float ideas here.
