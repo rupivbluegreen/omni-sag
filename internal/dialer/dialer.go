@@ -227,6 +227,16 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 	return conn, nil
 }
 
+// Peek evaluates policy for pr against target without opening a socket,
+// emitting evidence, or gating on approval. It exists so callers outside the
+// dial path (the SSH auth callback, deciding whether prompt-mode needs a
+// keyboard-interactive round) can inspect a target's credential mode ahead
+// of any channel opening. The real authorization decision — the one that
+// actually gates a connection — is still made by DialTarget.
+func (d *Dialer) Peek(pr policy.Principal, target policy.Target) policy.Decision {
+	return d.currentPolicy().Decide(pr, target)
+}
+
 // gateApproval blocks the session until a four-eyes approval for this target is
 // granted. It fails closed: with no store configured, or on denial, expiry, or
 // cancellation, it returns ErrApprovalRefused and no socket is opened. Both the

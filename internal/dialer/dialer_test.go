@@ -206,3 +206,29 @@ func TestSplice_Bidirectional(t *testing.T) {
 	a1.Close()
 	b2.Close()
 }
+
+func TestPeek_NoEvidenceNoSocket(t *testing.T) {
+	dialed := false
+	swapDial(t, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialed = true
+		return nil, errors.New("must not dial")
+	})
+	sink := &captureSink{}
+	d := New(demoPolicy(), sink)
+
+	dec := d.Peek(policy.Principal{User: "alice", Groups: []string{"dba"}}, policy.Target{Host: "db1.lab.local", Port: 5432})
+	if !dec.Allow {
+		t.Fatalf("Peek: want Allow=true, got %+v", dec)
+	}
+	if dialed {
+		t.Fatal("Peek must never dial a socket")
+	}
+	if len(sink.events) != 0 {
+		t.Fatalf("Peek must never emit evidence, got %d events", len(sink.events))
+	}
+}
+
+type captureSink struct{ events []evidence.Event }
+
+func (s *captureSink) Emit(e evidence.Event) error { s.events = append(s.events, e); return nil }
+func (s *captureSink) Close() error                { return nil }
