@@ -109,8 +109,38 @@ func testHostKey(t *testing.T) ssh.Signer {
 	return signer
 }
 
+func TestDialTarget_NoHostKeyCallbackFailsClosed(t *testing.T) {
+	// s.targetHostKeyCB is unset (the fail-closed default post-security-review:
+	// dialTarget must refuse to dial rather than silently fall back to
+	// ssh.InsecureIgnoreHostKey()). Build a Server whose inject-mode dial would
+	// otherwise succeed (same setup as TestDialTarget_InjectSucceeds) to prove
+	// the host-key gate — not a missing credential or a bad mode — is what
+	// stops it, and that it stops it BEFORE any dial is attempted.
+	dialed := false
+	orig := dialNet
+	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) {
+		dialed = true
+		return nil, errors.New("must not dial: host-key check should fail closed first")
+	}
+	t.Cleanup(func() { dialNet = orig })
+
+	prov := credential.NewProvider(credential.Config{
+		Fetcher: fakeFetcher{secret: []byte("injected-secret")},
+		Query:   func(credential.Request) credential.Query { return credential.Query{} },
+	})
+	s := &Server{cred: prov} // targetHostKeyCB intentionally left nil
+	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
+		policy.Decision{CredentialMode: "inject"}, "db1.lab.local", 22, "")
+	if !errors.Is(err, credential.ErrFailClosed) {
+		t.Fatalf("want ErrFailClosed, got %v", err)
+	}
+	if dialed {
+		t.Fatal("missing target host-key callback must fail closed before any dial is attempted")
+	}
+}
+
 func TestDialTarget_Deny(t *testing.T) {
-	s := &Server{}
+	s := &Server{targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
 	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
 		policy.Decision{CredentialMode: "deny"}, "db1.lab.local", 22, "")
 	if !errors.Is(err, credential.ErrDenied) {
@@ -119,7 +149,7 @@ func TestDialTarget_Deny(t *testing.T) {
 }
 
 func TestDialTarget_InjectNoProviderFailsClosed(t *testing.T) {
-	s := &Server{} // s.cred is nil
+	s := &Server{targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production; s.cred is nil
 	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
 		policy.Decision{CredentialMode: "inject"}, "db1.lab.local", 22, "")
 	if !errors.Is(err, credential.ErrFailClosed) {
@@ -128,7 +158,7 @@ func TestDialTarget_InjectNoProviderFailsClosed(t *testing.T) {
 }
 
 func TestDialTarget_PromptNoStashedSecretFailsClosed(t *testing.T) {
-	s := &Server{}
+	s := &Server{targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
 	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
 		policy.Decision{CredentialMode: "prompt"}, "db1.lab.local", 22, "no-such-token")
 	if !errors.Is(err, credential.ErrFailClosed) {
@@ -142,7 +172,7 @@ func TestDialTarget_PassthroughNoConnFailsClosed(t *testing.T) {
 	// must fail closed, not panic or fall through, when there is no gateway
 	// connection to the client to forward an agent from (e.g. sconn is nil
 	// in every other dialTarget test in this file).
-	s := &Server{}
+	s := &Server{targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
 	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
 		policy.Decision{CredentialMode: "passthrough"}, "db1.lab.local", 22, "")
 	if !errors.Is(err, credential.ErrFailClosed) {
@@ -160,7 +190,7 @@ func TestDialTarget_InjectSucceeds(t *testing.T) {
 		Fetcher: fakeFetcher{secret: []byte("injected-secret")},
 		Query:   func(credential.Request) credential.Query { return credential.Query{} },
 	})
-	s := &Server{cred: prov}
+	s := &Server{cred: prov, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
 	client, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
 		policy.Decision{CredentialMode: "inject"}, "db1.lab.local", 22, "")
 	if err != nil {
@@ -175,7 +205,7 @@ func TestDialTarget_PromptSucceeds(t *testing.T) {
 	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
 	t.Cleanup(func() { dialNet = orig })
 
-	s := &Server{}
+	s := &Server{targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
 	token := s.stashTargetSecret(credential.New([]byte("prompted-secret")))
 	client, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
 		policy.Decision{CredentialMode: "prompt"}, "db1.lab.local", 22, token)

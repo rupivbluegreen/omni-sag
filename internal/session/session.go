@@ -74,7 +74,7 @@ type Server struct {
 	pendingSecrets sync.Map                                                        // token(string) -> *credential.Secret; prompt-mode target passwords awaiting first use
 	dialerPeek     func(pr policy.Principal, target policy.Target) policy.Decision // non-dialing decision lookup; nil disables prompt-mode chaining
 
-	targetHostKeyCB ssh.HostKeyCallback // verifies the target's host key on the second SSH leg; nil => InsecureIgnoreHostKey (dev default)
+	targetHostKeyCB ssh.HostKeyCallback // verifies the target's host key on the second SSH leg; nil => dialTarget fails closed (see WithTargetHostKeyCallback / WithInsecureTargetHostKey)
 
 	wg       sync.WaitGroup // tracks active connections for graceful drain
 	active   atomic.Int64   // current active connections
@@ -127,13 +127,20 @@ func WithDialerPeek(peek func(pr policy.Principal, target policy.Target) policy.
 }
 
 // WithTargetHostKeyCallback verifies the real target's host key on the
-// gateway's second SSH leg (typically built from an OpenSSH known_hosts
-// file via golang.org/x/crypto/ssh/knownhosts). Nil/unset means
-// InsecureIgnoreHostKey — acceptable for the dev lab, loudly logged by
-// main() as insecure, matching the project's existing ldap.insecure_tls
-// precedent.
+// gateway's second SSH leg using cb (typically built from an OpenSSH
+// known_hosts file via golang.org/x/crypto/ssh/knownhosts.New). This is the
+// production path.
 func WithTargetHostKeyCallback(cb ssh.HostKeyCallback) Option {
 	return func(s *Server) { s.targetHostKeyCB = cb }
+}
+
+// WithInsecureTargetHostKey disables target host-key verification entirely
+// (ssh.InsecureIgnoreHostKey()). This is a DELIBERATE, EXPLICIT opt-in for
+// the dev lab only — unlike the rest of this option, it cannot be reached by
+// simply leaving something unconfigured; a caller must name this function.
+// Never call this in a production wiring path.
+func WithInsecureTargetHostKey() Option {
+	return func(s *Server) { s.targetHostKeyCB = ssh.InsecureIgnoreHostKey() }
 }
 
 // WithBruteForceLimiter overrides the default per-source-IP brute-force

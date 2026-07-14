@@ -184,15 +184,22 @@ func run(cfgPath string) error {
 		opts = append(opts, session.WithInspection(gate))
 		log.Printf("omni-sag: SFTP content inspection enabled (ICAP %s/%s)", cfg.Inspection.ICAP.Endpoint, cfg.Inspection.ICAP.Service)
 	}
-	if cfg.TargetKnownHosts != "" {
+	switch {
+	case cfg.TargetKnownHosts != "":
 		cb, err := knownhosts.New(cfg.TargetKnownHosts)
 		if err != nil {
 			return fmt.Errorf("target_known_hosts: %w", err)
 		}
 		opts = append(opts, session.WithTargetHostKeyCallback(cb))
 		log.Printf("omni-sag: real-target host keys verified against %s", cfg.TargetKnownHosts)
-	} else {
-		log.Printf("omni-sag: WARNING real-target host key verification is DISABLED (set target_known_hosts) — dev-lab only")
+		if cfg.TargetInsecureHostKey {
+			log.Printf("omni-sag: WARNING target_known_hosts and target_insecure_host_key are both set — verified mode wins, insecure flag ignored")
+		}
+	case cfg.TargetInsecureHostKey:
+		opts = append(opts, session.WithInsecureTargetHostKey())
+		log.Printf("omni-sag: WARNING real-target host key verification is DISABLED (target_insecure_host_key: true) — dev-lab only, never use in production")
+	default:
+		log.Printf("omni-sag: real-target host key verification is NOT configured — shell/SFTP sessions to real targets will fail closed until target_known_hosts or target_insecure_host_key (dev-lab only) is set")
 	}
 	srv := session.New(hostKey, auth, d, met.CountingSink(ev.sessionSink), opts...)
 	met.SetActiveFn(srv.ActiveSessions)

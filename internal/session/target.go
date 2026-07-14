@@ -52,13 +52,18 @@ func (s *Server) dialTarget(ctx context.Context, sconn ssh.Conn, pr policy.Princ
 	if targetUser == "" {
 		targetUser = pr.User
 	}
-	hostKeyCB := s.targetHostKeyCB
-	if hostKeyCB == nil {
-		hostKeyCB = ssh.InsecureIgnoreHostKey() // dev-lab default; see WithTargetKnownHosts
+	if s.targetHostKeyCB == nil {
+		// Fail closed: no silent insecure default (a security review of this
+		// plan flagged the earlier draft's InsecureIgnoreHostKey()-on-nil
+		// fallback as exactly the silent-downgrade pattern FR-18 exists to
+		// prevent elsewhere in this codebase). An operator who genuinely wants
+		// the dev-lab-insecure posture must opt in explicitly via
+		// WithInsecureTargetHostKey() — see Step 5's config wiring.
+		return nil, fmt.Errorf("%w: no target host-key callback configured (set target_known_hosts, or target_insecure_host_key for dev-lab)", credential.ErrFailClosed)
 	}
 	cfg := &ssh.ClientConfig{
 		User:            targetUser,
-		HostKeyCallback: hostKeyCB,
+		HostKeyCallback: s.targetHostKeyCB,
 		Timeout:         10 * time.Second,
 	}
 

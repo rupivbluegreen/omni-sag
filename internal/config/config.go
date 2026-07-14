@@ -30,7 +30,8 @@ type File struct {
 	DrainGrace int               `yaml:"drain_grace_seconds"`
 	Policy     PolicyConfig      `yaml:"policy"`
 
-	TargetKnownHosts string `yaml:"target_known_hosts"` // OpenSSH known_hosts path verifying real-target host keys; empty => insecure (dev only)
+	TargetKnownHosts      string `yaml:"target_known_hosts"`       // OpenSSH known_hosts path verifying real-target host keys
+	TargetInsecureHostKey bool   `yaml:"target_insecure_host_key"` // dev-lab only: explicitly disable target host-key verification; see WithInsecureTargetHostKey
 }
 
 // MetricsConfig configures the Prometheus metrics endpoint, served on its own
