@@ -75,8 +75,8 @@ type memFS struct {
 	files      map[string]*memFile
 	uploads    map[string]bool
 	downloads  map[string]bool
-	inspectUps map[string]*inspectUpload
-	completed  []transfer // upload manifests captured at write-handle close
+	inspectUps []*inspectUpload // every inspected upload (keyed by handle, not path)
+	completed  []transfer       // upload manifests captured at write-handle close
 }
 
 func (m *memFS) recordUpload(t transfer) {
@@ -87,13 +87,12 @@ func (m *memFS) recordUpload(t transfer) {
 
 func newMemFS(gate *inspectgate.Gate, ctx context.Context, user string) *memFS {
 	return &memFS{
-		gate:       gate,
-		ctx:        ctx,
-		user:       user,
-		files:      map[string]*memFile{},
-		uploads:    map[string]bool{},
-		downloads:  map[string]bool{},
-		inspectUps: map[string]*inspectUpload{},
+		gate:      gate,
+		ctx:       ctx,
+		user:      user,
+		files:     map[string]*memFile{},
+		uploads:   map[string]bool{},
+		downloads: map[string]bool{},
 	}
 }
 
@@ -183,7 +182,9 @@ func (m *memFS) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 
 	if m.gate != nil {
 		iu := newInspectUpload(m.ctx, m.gate, p)
-		m.inspectUps[p] = iu
+		// Keyed by handle (appended), not path: a second put to the same path
+		// must not drop the first upload's inspection evidence.
+		m.inspectUps = append(m.inspectUps, iu)
 		return iu, nil
 	}
 
@@ -223,10 +224,11 @@ func (h *memWriteHandle) Close() error {
 }
 
 // inspectUpload is an io.WriterAt+io.Closer that streams an SFTP upload through
-// the inspection gate. Writes must be sequential (SFTP uploads are); an
-// out-of-order write is refused. Close blocks for the verdict and returns an
-// error when the content is blocked or unscannable, which the SFTP layer
-// surfaces to the client as a failed transfer.
+// the inspection gate. pkg/sftp may deliver writes concurrently and out of
+// order, so WriteAt reassembles them in offset order (bounded) before streaming
+// to inspection. Close blocks for the verdict and returns an error when the
+// content is blocked or unscannable, which the SFTP layer surfaces to the
+// client as a failed transfer.
 type inspectUpload struct {
 	ctx  context.Context
 	gate *inspectgate.Gate
@@ -235,13 +237,25 @@ type inspectUpload struct {
 	once    sync.Once
 	pw      *io.PipeWriter
 	done    chan struct{}
-	expOff  int64
 	dec     inspectgate.Decision
 	inspErr error
+
+	// pkg/sftp dispatches SSH_FXP_WRITE across concurrent workers with no
+	// per-handle ordering, so writes may arrive concurrently and out of order.
+	// Reassemble them in offset order under mu before streaming to inspection.
+	mu           sync.Mutex
+	expOff       int64
+	pending      map[int64][]byte
+	pendingBytes int64
 
 	closeOnce sync.Once
 	closeErr  error
 }
+
+// maxReorderBytes bounds how many out-of-order upload bytes are buffered while
+// waiting for the missing offset, so a malicious client cannot force unbounded
+// memory by writing far-ahead offsets.
+const maxReorderBytes = 32 << 20
 
 func newInspectUpload(ctx context.Context, gate *inspectgate.Gate, p string) *inspectUpload {
 	return &inspectUpload{ctx: ctx, gate: gate, path: p, done: make(chan struct{})}
@@ -262,12 +276,43 @@ func (u *inspectUpload) start() {
 
 func (u *inspectUpload) WriteAt(p []byte, off int64) (int, error) {
 	u.once.Do(u.start)
-	if off != u.expOff {
-		return 0, fmt.Errorf("sftp: non-sequential write to inspected upload (got %d want %d)", off, u.expOff)
+	if off < 0 {
+		return 0, fmt.Errorf("sftp: negative write offset %d", off)
 	}
-	n, err := u.pw.Write(p)
-	u.expOff += int64(n)
-	return n, err
+	// pkg/sftp may reuse p after WriteAt returns and calls it from multiple
+	// workers, so copy the bytes and serialize under the lock.
+	buf := append([]byte(nil), p...)
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if off < u.expOff {
+		return 0, fmt.Errorf("sftp: overlapping/rewind write at %d (stream already at %d)", off, u.expOff)
+	}
+	if u.pending == nil {
+		u.pending = make(map[int64][]byte)
+	}
+	if _, dup := u.pending[off]; !dup {
+		u.pendingBytes += int64(len(buf))
+	}
+	if u.pendingBytes > maxReorderBytes {
+		return 0, fmt.Errorf("sftp: out-of-order write window exceeded (%d bytes buffered)", u.pendingBytes)
+	}
+	u.pending[off] = buf
+
+	// Flush contiguous chunks starting at the expected offset, in order.
+	for {
+		chunk, ok := u.pending[u.expOff]
+		if !ok {
+			break
+		}
+		delete(u.pending, u.expOff)
+		u.pendingBytes -= int64(len(chunk))
+		if _, err := u.pw.Write(chunk); err != nil {
+			return 0, err
+		}
+		u.expOff += int64(len(chunk))
+	}
+	return len(p), nil
 }
 
 func (u *inspectUpload) Close() error {

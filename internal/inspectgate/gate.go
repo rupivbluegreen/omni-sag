@@ -98,14 +98,22 @@ func (g *Gate) Inspect(ctx context.Context, meta inspect.TransferMeta, content i
 	head := make([]byte, g.threshold+1)
 	n, rerr := io.ReadFull(content, head)
 	head = head[:n]
-	small := g.holding == nil || rerr == io.EOF || rerr == io.ErrUnexpectedEOF
-	if !small && rerr != nil {
+	atEOF := rerr == io.EOF || rerr == io.ErrUnexpectedEOF
+	if rerr != nil && !atEOF {
 		return Decision{}, fmt.Errorf("inspectgate: read content: %w", rerr)
 	}
-	if small {
-		return g.inspectSmall(ctx, meta, head)
+	// atEOF means the whole payload fit in the buffer -> small. Otherwise the
+	// buffer filled with more still to come -> the payload exceeds the threshold.
+	if !atEOF {
+		if g.holding == nil {
+			// No large-file support configured: fail closed rather than inspect
+			// only the prefix and record a (false) clean verdict on a partial file.
+			return Decision{Allow: false, Verdict: "error", Bytes: int64(n),
+				Reason: "file exceeds inline inspection limit and no holding store is configured"}, nil
+		}
+		return g.inspectLarge(ctx, meta, io.MultiReader(bytes.NewReader(head), content))
 	}
-	return g.inspectLarge(ctx, meta, io.MultiReader(bytes.NewReader(head), content))
+	return g.inspectSmall(ctx, meta, head)
 }
 
 // inspectSmall inspects a fully-buffered payload.
@@ -128,8 +136,13 @@ func (g *Gate) inspectSmall(ctx context.Context, meta inspect.TransferMeta, data
 		dec.QuarantineKey = key
 		return dec, qerr
 	case res.Verdict == inspect.VerdictModified:
-		dec.Allow, dec.Verdict, dec.Reason = true, "modified", res.Reason
-		return dec, nil
+		// The inspector wants to alter the payload. We do not currently deliver
+		// modified bytes, and delivering the ORIGINAL would defeat the DLP, so
+		// treat Modified as fail-closed: quarantine and refuse.
+		dec.Verdict, dec.Reason = "modified", "content modification required; delivering sanitized content is not supported — refused: "+res.Reason
+		key, qerr := g.quarantineBytes(ctx, meta, data)
+		dec.QuarantineKey = key
+		return dec, qerr
 	default:
 		dec.Allow, dec.Verdict = true, "clean"
 		return dec, nil
@@ -143,7 +156,14 @@ func (g *Gate) inspectLarge(ctx context.Context, meta inspect.TransferMeta, cont
 
 	hpr, hpw := io.Pipe()
 	holdErr := make(chan error, 1)
-	go func() { holdErr <- g.holding.Put(ctx, holdKey, "application/octet-stream", hpr, -1) }()
+	go func() {
+		err := g.holding.Put(ctx, holdKey, "application/octet-stream", hpr, -1)
+		// If Put returned early (e.g. the holding write failed mid-stream), close
+		// the read side with the error so the tee's next write unblocks and the
+		// transfer fails closed instead of deadlocking.
+		_ = hpr.CloseWithError(err)
+		holdErr <- err
+	}()
 
 	ipr, ipw := io.Pipe()
 	type ir struct {
@@ -171,7 +191,9 @@ func (g *Gate) inspectLarge(ctx context.Context, meta inspect.TransferMeta, cont
 	}
 
 	failClosed := copyErr != nil || got.err != nil
-	blocked := got.res.Verdict == inspect.VerdictBlocked
+	// Modified is treated as fail-closed like Blocked: we do not deliver modified
+	// bytes, and delivering the streamed original would defeat the DLP.
+	blocked := got.res.Verdict == inspect.VerdictBlocked || got.res.Verdict == inspect.VerdictModified
 	if failClosed || blocked {
 		if failClosed {
 			dec.Verdict = "error"
@@ -180,6 +202,8 @@ func (g *Gate) inspectLarge(ctx context.Context, meta inspect.TransferMeta, cont
 			} else {
 				dec.Reason = copyErr.Error()
 			}
+		} else if got.res.Verdict == inspect.VerdictModified {
+			dec.Verdict, dec.Reason = "modified", "content modification required; delivering sanitized content is not supported — refused: "+got.res.Reason
 		} else {
 			dec.Verdict, dec.Reason = "blocked", got.res.Reason
 		}
@@ -193,14 +217,11 @@ func (g *Gate) inspectLarge(ctx context.Context, meta inspect.TransferMeta, cont
 		return dec, nil
 	}
 
-	// Clean (or modified): the holding object is the delivered artifact.
+	// Clean: the holding object is the delivered artifact (Modified and Blocked
+	// were both handled fail-closed above).
 	dec.Allow = true
 	dec.HoldingKey = holdKey
-	if got.res.Verdict == inspect.VerdictModified {
-		dec.Verdict, dec.Reason = "modified", got.res.Reason
-	} else {
-		dec.Verdict = "clean"
-	}
+	dec.Verdict = "clean"
 	return dec, nil
 }
 
