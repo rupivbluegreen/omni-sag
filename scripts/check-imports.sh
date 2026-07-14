@@ -22,11 +22,16 @@ if [ -n "$matches" ]; then
   fail=1
 fi
 
-echo "== internal/dialer must not import internal/api =="
-if go list -f '{{join .Imports "\n"}}' ./internal/dialer/... 2>/dev/null | grep -q "${module}/internal/api"; then
-  echo "internal/dialer imports internal/api"
-  fail=1
-fi
+echo "== data path (dialer, session, sessions) must not import internal/api =="
+# The SSH data path must never depend on the control plane, so stopping the API
+# cannot affect live or new SSH sessions. The shared session registry lives in
+# internal/sessions (a leaf) so session/api can both use it without this edge.
+for p in dialer session sessions; do
+  if go list -f '{{join .Imports "\n"}}' ./internal/$p/... 2>/dev/null | grep -q "${module}/internal/api"; then
+    echo "internal/$p imports internal/api (data path must not depend on the control plane)"
+    fail=1
+  fi
+done
 
 echo "== internal/policy must not import internal/session =="
 if go list -f '{{join .Imports "\n"}}' ./internal/policy/... 2>/dev/null | grep -q "${module}/internal/session"; then
