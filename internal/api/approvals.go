@@ -106,6 +106,9 @@ func (s *Server) streamSession(w http.ResponseWriter, r *http.Request) {
 			if flusher != nil {
 				flusher.Flush()
 			}
+			if ev.Kind == "session_end" {
+				return // session ended; close the stream (defer cancel unsubscribes)
+			}
 		case <-r.Context().Done():
 			return
 		}

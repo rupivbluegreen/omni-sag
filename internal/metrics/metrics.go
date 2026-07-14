@@ -78,7 +78,15 @@ func (m *Metrics) record(e evidence.Event) {
 	case evidence.TypeTunnelDecision:
 		pick(allowed(e), &m.tunnelAllow, &m.tunnelDeny)
 	case evidence.TypeApproval:
-		pick(allowed(e), &m.approvalGranted, &m.approvalRefused)
+		// Bucket only TERMINAL outcomes. The dialer emits a non-terminal
+		// "requested" event (Allow=false) per gated session; counting it as a
+		// refusal would double every approval flow into the refused total.
+		switch e.Outcome {
+		case "granted":
+			m.approvalGranted.inc()
+		case "refused":
+			m.approvalRefused.inc()
+		}
 	case evidence.TypeInspection:
 		if e.Verdict == "clean" {
 			m.inspectClean.inc()

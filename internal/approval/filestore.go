@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,8 +67,15 @@ func newFileStore(path string, now func() time.Time) (*FileStore, error) {
 	return s, nil
 }
 
-// persist writes all requests durably. Caller holds s.mu.
+// terminalRetention is how long a decided/expired request is kept before being
+// pruned, so the durable file (rewritten on the data path per new request)
+// cannot grow without bound.
+const terminalRetention = 24 * time.Hour
+
+// persist prunes old terminal requests then writes all requests durably.
+// Caller holds s.mu.
 func (s *FileStore) persist() error {
+	s.pruneLocked()
 	out := make([]Request, 0, len(s.requests))
 	for _, r := range s.requests {
 		out = append(out, *r)
@@ -78,6 +86,25 @@ func (s *FileStore) persist() error {
 	}
 	return writeFileDurable(s.path, data, 0o600)
 }
+
+// pruneLocked drops decided/expired requests whose expiry is older than the
+// retention horizon, bounding file size and per-Create rewrite cost. Caller
+// holds s.mu. A pending request is never pruned.
+func (s *FileStore) pruneLocked() {
+	now := s.now()
+	for id, r := range s.requests {
+		if r.EffectiveStatus(now) == StatusPending {
+			continue
+		}
+		if now.After(r.ExpiresAt.Add(terminalRetention)) {
+			delete(s.requests, id)
+			delete(s.decided, id)
+		}
+	}
+}
+
+// canonicalID normalizes an identity for four-eyes comparison.
+func canonicalID(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
 
 // Create records a new pending request.
 func (s *FileStore) Create(req Request, ttl time.Duration) (Request, error) {
@@ -156,10 +183,13 @@ func (s *FileStore) decide(id, approver string, status Status) (Request, error) 
 	if r.EffectiveStatus(s.now()) != StatusPending {
 		return Request{}, ErrNotPending
 	}
-	// Four-eyes is enforced for approval; a denial by the requester is harmless
-	// (it only refuses their own request) but we require a distinct actor too for
-	// a consistent audit trail.
-	if approver == "" || approver == r.Requester {
+	// Four-eyes: the approver must be a distinct actor from the requester.
+	// Identifiers are canonicalized (trim + lowercase) so case/whitespace
+	// variants cannot smuggle a self-approval. NOTE: this compares the API
+	// subject (token subject / mTLS CN) against the SSH principal that made the
+	// request — the deployment MUST configure API subjects to equal SSH login
+	// names, or four-eyes can be defeated across the two namespaces.
+	if approver == "" || canonicalID(approver) == canonicalID(r.Requester) {
 		return Request{}, ErrFourEyes
 	}
 	r.Status = status

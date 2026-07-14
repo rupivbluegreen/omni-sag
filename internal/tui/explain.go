@@ -36,7 +36,11 @@ func PolicyFromView(pv api.PolicyView) policy.Policy {
 // policy.Decide returns for the reconstructed policy.
 type Explanation struct {
 	Decision policy.Decision
-	Lines    []string
+	// Reachable is the EFFECTIVE outcome: policy may Allow while the gateway
+	// still refuses the connection (e.g. credential mode "deny" is refused by
+	// the dialer before any socket). Reachable reflects what actually happens.
+	Reachable bool
+	Lines     []string
 }
 
 // Explain answers "why can <user in groups> reach host:port?" against pv.
@@ -45,9 +49,19 @@ func Explain(pv api.PolicyView, user string, groups []string, host string, port 
 	pr := policy.Principal{User: user, Groups: groups}
 	d := p.Decide(pr, policy.Target{Host: host, Port: port})
 
+	// A policy Allow with credential mode "deny" is unconditionally refused by
+	// the dialer (credential.Resolve -> ErrDenied) before any socket opens, so
+	// the target is NOT reachable despite the policy match.
+	credDeny := d.Allow && d.CredentialMode == "deny"
+	reachable := d.Allow && !credDeny
+
 	lines := []string{fmt.Sprintf("%s (groups: %s)  →  %s:%d", user, strings.Join(groups, ","), host, port)}
 	if d.Allow {
-		lines = append(lines, "ALLOW — matched role "+d.MatchedRole)
+		if credDeny {
+			lines = append(lines, "ALLOW by policy — but connection REFUSED (credential mode: deny)")
+		} else {
+			lines = append(lines, "ALLOW — matched role "+d.MatchedRole)
+		}
 		lines = append(lines, "  record:     "+orNone(string(d.RecordMode)))
 		lines = append(lines, "  credential: "+orNone(d.CredentialMode))
 		if d.RequireApproval {
@@ -64,7 +78,7 @@ func Explain(pv api.PolicyView, user string, groups []string, host string, port 
 			lines = append(lines, "  roles held: none (no group grants a role)")
 		}
 	}
-	return Explanation{Decision: d, Lines: lines}
+	return Explanation{Decision: d, Reachable: reachable, Lines: lines}
 }
 
 func orNone(s string) string {

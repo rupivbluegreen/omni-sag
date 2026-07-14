@@ -3,7 +3,14 @@ image:
   tag: ""            # defaults to .Chart.AppVersion
   pullPolicy: IfNotPresent
 
-replicaCount: 2      # HA; sessions drain on rolling upgrade
+# Default 1: with >1 replica behind one SSH LoadBalancer, each pod mints its own
+# ephemeral host key (host_key lives on the per-pod writable volume), so a client
+# reconnecting to a different pod hits a host-key mismatch and refuses to connect.
+# For replicaCount > 1 you MUST provision a SHARED SSH host key: put it in the
+# Secret named by configSecretName (mounted read-only at /etc/omni-sag) and set
+# `host_key: /etc/omni-sag/hostkey.pem` in the gateway config so every replica
+# presents one stable identity.
+replicaCount: 1      # sessions drain on rolling upgrade; see note for HA (>1)
 
 # Rolling-upgrade drain. terminationGracePeriodSeconds must exceed the gateway's
 # drain_grace_seconds so in-flight SSH sessions can finish before SIGKILL.

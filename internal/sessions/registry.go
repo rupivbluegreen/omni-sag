@@ -109,6 +109,9 @@ func (r *Registry) Register(info Info, terminate func() error) (id string, dereg
 	r.entries[id] = &entry{info: info, terminate: terminate}
 	r.mu.Unlock()
 	return id, func() {
+		// Signal attached supervisors that the session ended (the SSE handler
+		// returns on this, closing the stream) before removing the entry.
+		r.Publish(id, Event{Kind: "session_end"})
 		r.mu.Lock()
 		delete(r.entries, id)
 		r.mu.Unlock()

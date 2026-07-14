@@ -18,15 +18,15 @@ func (failSink) Close() error              { return nil }
 func TestCountingSink_CountsByType(t *testing.T) {
 	m := New()
 	s := m.CountingSink(evidence.NewMemSink())
-	emit := func(typ evidence.Type, allow bool, verdict string) {
-		_ = s.Emit(evidence.Event{Type: typ, Allow: evidence.BoolPtr(allow), Verdict: verdict})
+	emit := func(typ evidence.Type, allow bool, verdict, outcome string) {
+		_ = s.Emit(evidence.Event{Type: typ, Allow: evidence.BoolPtr(allow), Verdict: verdict, Outcome: outcome})
 	}
-	emit(evidence.TypeAuth, true, "")
-	emit(evidence.TypeAuth, false, "")
-	emit(evidence.TypeTunnelDecision, true, "")
-	emit(evidence.TypeApproval, false, "")
-	emit(evidence.TypeInspection, false, "blocked")
-	emit(evidence.TypeInspection, true, "clean")
+	emit(evidence.TypeAuth, true, "", "")
+	emit(evidence.TypeAuth, false, "", "")
+	emit(evidence.TypeTunnelDecision, true, "", "")
+	emit(evidence.TypeApproval, false, "", "refused") // terminal refusal
+	emit(evidence.TypeInspection, false, "blocked", "")
+	emit(evidence.TypeInspection, true, "clean", "")
 
 	if m.authSuccess.get() != 1 || m.authFailure.get() != 1 {
 		t.Fatalf("auth counters wrong: %d/%d", m.authSuccess.get(), m.authFailure.get())

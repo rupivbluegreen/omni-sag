@@ -34,11 +34,15 @@ spec:
             {{- if .Values.metrics.enabled }}
             - {name: metrics, containerPort: {{ .Values.ports.metrics }}}
             {{- end }}
+          # Probe the SSH listener — the pod's primary job. The control-plane API
+          # is deliberately out-of-band: gating the pod lifecycle on it would let
+          # an API bind/TLS failure crash-loop the pod and take SSH down (the very
+          # coupling the daemon avoids). A dead SSH accept loop still fails these.
           readinessProbe:
-            httpGet: {path: /readyz, port: api}
+            tcpSocket: {port: ssh}
             initialDelaySeconds: 3
           livenessProbe:
-            httpGet: {path: /healthz, port: api}
+            tcpSocket: {port: ssh}
             initialDelaySeconds: 5
           resources: {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:

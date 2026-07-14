@@ -70,6 +70,8 @@ type Model struct {
 	superChan   <-chan sessions.Event
 	superEvents []sessions.Event
 	superOn     bool
+	superCancel context.CancelFunc // stops the current stream's goroutine + HTTP conn
+	superGen    int                // stream generation; drops events from a superseded stream
 
 	// player
 	player  player
@@ -119,8 +121,11 @@ type actionMsg struct {
 	what string
 	err  error
 }
-type superEventMsg struct{ ev sessions.Event }
-type superClosedMsg struct{}
+type superEventMsg struct {
+	gen int
+	ev  sessions.Event
+}
+type superClosedMsg struct{ gen int }
 type tickMsg time.Time
 
 // --- commands ---
@@ -200,9 +205,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(m.loadSessions(), m.loadApprovals())
 	case superEventMsg:
+		if msg.gen != m.superGen {
+			return m, nil // event from a superseded stream; drop, do not re-arm
+		}
 		m.superEvents = append(m.superEvents, msg.ev)
-		return m, m.readSuper()
+		return m, m.readSuper(m.superGen)
 	case superClosedMsg:
+		if msg.gen != m.superGen {
+			return m, nil
+		}
 		m.superOn = false
 		m.status = "supervision stream ended"
 	case tickMsg:
@@ -279,26 +290,35 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) startSupervision(id string) (tea.Model, tea.Cmd) {
-	ch, err := m.client.StreamSession(m.ctx, id)
+	// Stop any previous stream's goroutine + HTTP/SSE connection before opening
+	// a new one, so switching supervised sessions does not leak per switch.
+	if m.superCancel != nil {
+		m.superCancel()
+	}
+	ctx, cancel := context.WithCancel(m.ctx)
+	ch, err := m.client.StreamSession(ctx, id)
 	if err != nil {
+		cancel()
 		m.status = "supervise: " + err.Error()
 		return m, nil
 	}
+	m.superCancel = cancel
 	m.superChan = ch
+	m.superGen++
 	m.superOn = true
 	m.superEvents = nil
 	m.status = "supervising " + id
-	return m, m.readSuper()
+	return m, m.readSuper(m.superGen)
 }
 
-func (m Model) readSuper() tea.Cmd {
+func (m Model) readSuper(gen int) tea.Cmd {
 	ch := m.superChan
 	return func() tea.Msg {
 		ev, ok := <-ch
 		if !ok {
-			return superClosedMsg{}
+			return superClosedMsg{gen}
 		}
-		return superEventMsg{ev}
+		return superEventMsg{gen, ev}
 	}
 }
 
