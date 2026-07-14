@@ -134,22 +134,55 @@ requires no change.
 `runSFTP` (`internal/session/sftp.go`) replaces `memFS` with a real
 `pkg/sftp` client (`sftp.NewClient`) over the target `ssh.Client`.
 
-**Uploads (spool-then-commit).** The existing offset-reassembly and
-inspection-gate machinery (`inspectUpload`) is unchanged; it now streams into
-a temp-file spool (replacing the 64 MiB in-memory buffer with a disk-backed
-one, same size philosophy) instead of directly into the target. Only after
-the inspector returns Allow does the gateway open the real remote file and
-push the spooled bytes. Blocked or unscannable content never reaches the
-target — this preserves the fail-closed guarantee more strongly than a
-stream-with-rollback approach (considered and rejected: it would let blocked
-bytes briefly exist on the real target and adds a rollback-can-fail residual
-risk).
+**Uploads (quarantine-then-release).** Two alternatives were rejected: a
+local-disk temp-file spool (conflicts with the gateway's
+read-only-root-filesystem posture) and a stream-with-rollback delivery
+(leaves a window where blocked content briefly exists on the real target).
+Instead this reuses infrastructure that already exists but is
+under-utilized or entirely dead code:
+
+- `internal/inspectgate.Gate` already has a `Holding` BlobStore (transient,
+  S3/MinIO-backed, used today only for large-file streaming) and a
+  `Quarantine` BlobStore (WORM/Object-Locked, used today only for
+  blocked/fail-closed content). This design extends `Gate` so **every**
+  upload's bytes persist to `Quarantine`, not just blocked ones — today a
+  clean small upload is discarded after hashing and a clean large upload's
+  holding copy is never promoted anywhere, so there is currently no
+  byte-for-byte record of what was actually uploaded. Unconditional
+  quarantine fixes that gap as a side effect.
+- `internal/approval.KindQuarantineRelease` is already declared
+  (`internal/approval/approval.go`) and completely unused anywhere in the
+  codebase. This design wires it up: a clean-verdict upload does not deliver
+  to the target in the same SFTP call. It creates an `approval.Request{Kind:
+  KindQuarantineRelease, ...}` referencing the quarantine key and target
+  path, through the same `Store`/`Create`/`Wait` machinery — and the same
+  TUI/API approval queue — that session-access approvals already use
+  (Slices 8–9), just a different `Kind`.
+- The SFTP write handle's `Close()` blocks on the release decision, mirroring
+  `dialer.gateApproval`'s session-blocking pattern, up to the approval TTL.
+  On approval, the gateway opens the target SFTP connection **at that
+  point** (not held open for the duration of the wait), streams
+  quarantine→target, and `Close()` returns success. On denial/expiry,
+  `Close()` errors and the client's transfer fails — the bytes remain in
+  quarantine permanently as evidence; they are never deleted and never
+  reach the target.
+- This is **always** required when a rule has inspection enabled — not a
+  separate opt-in policy flag. One consistent rule: inspected upload ⇒
+  quarantined ⇒ needs a human release. Blocked/unscannable content was
+  already fail-closed before this design; now clean content is fail-closed
+  too, pending a second human.
+- This approval is independent of and stacks with the dialer's existing
+  session-level `RequireApproval` (which gates whether a session can reach
+  a target at all). A target can require approval to log into, and
+  separately require approval for every file pushed to it.
 
 **Downloads.** `Fileread` proxies directly from the remote file, unchanged
-from today's behavior (downloads are not content-inspected).
+from today's behavior (downloads are not content-inspected, not quarantined).
 
-Transfer manifests and inspection evidence continue to be emitted exactly as
-today.
+Transfer and approval evidence continue to be emitted through the existing
+event types (`evidence.TypeTransfer`, `evidence.TypeApproval`,
+`evidence.TypeInspection`), extended to carry the quarantine key and release
+outcome.
 
 ## Lab / demo wiring
 
@@ -163,6 +196,11 @@ CyberArk CCP plumbing already exists end to end).
 
 - Unit tests for username parsing (`alice%host` splitting) and target-user
   resolution — pure, table-driven, alongside existing `policy` tests.
+- Unit tests for the quarantine-then-release flow: clean upload blocks on
+  `Close()` until a `KindQuarantineRelease` request resolves; approved
+  delivers to a fake target and the quarantine copy persists; denied/expired
+  errors `Close()` and the quarantine copy still persists; blocked-verdict
+  content never creates a release request at all.
 - Auth-mode fork tests using a fake `ssh.Client`/agent substitution, mirroring
   the existing `netDial` package-variable substitution pattern in
   `internal/dialer`'s tests.
