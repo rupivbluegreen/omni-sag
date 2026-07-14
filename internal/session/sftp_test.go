@@ -13,8 +13,10 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/rupivbluegreen/omni-sag/internal/approval"
+	"github.com/rupivbluegreen/omni-sag/internal/credential"
 	"github.com/rupivbluegreen/omni-sag/internal/inspect"
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
+	"github.com/rupivbluegreen/omni-sag/internal/policy"
 )
 
 // startFakeSFTPTarget runs an in-process SSH server that serves the "sftp"
@@ -154,6 +156,35 @@ func startFakeSFTPTarget(t *testing.T, files map[string][]byte) net.Conn {
 	}
 	t.Cleanup(func() { clientConn.Close() })
 	return clientConn
+}
+
+// wireFakeSFTPTarget seeds a fake target's (in-memory, wire-protocol-real)
+// SFTP filesystem via startFakeSFTPTarget, then — like target_test.go's
+// wireFakeTarget, but for an SFTP target instead of a shell one — overrides
+// the package-level dialNet seam so the gateway's real second-leg dial to
+// targetHost hands back that one fake connection, and returns the Options a
+// Server needs to reach it (inject-mode credential with a throwaway fetcher,
+// since the fake target's ssh.ServerConfig{NoClientAuth: true} accepts any
+// credential; and WithInsecureTargetHostKey, since the fake target has no
+// real host key to verify against).
+func wireFakeSFTPTarget(t *testing.T, files map[string][]byte) (targetHost string, opts []Option) {
+	t.Helper()
+	fakeConn := startFakeSFTPTarget(t, files)
+	orig := dialNet
+	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	t.Cleanup(func() { dialNet = orig })
+
+	prov := credential.NewProvider(credential.Config{
+		Fetcher: fakeFetcher{secret: []byte("unused")},
+		Query:   func(credential.Request) credential.Query { return credential.Query{} },
+	})
+	return "fake-sftp-target.lab.local", []Option{
+		WithCredentialProvider(prov),
+		WithDialerPeek(func(policy.Principal, policy.Target) policy.Decision {
+			return policy.Decision{Allow: true, CredentialMode: "inject"}
+		}),
+		WithInsecureTargetHostKey(),
+	}
 }
 
 // sshClientOver completes an ssh.ClientConfig handshake over conn for test

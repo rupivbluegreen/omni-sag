@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/pkg/sftp"
 
+	"github.com/rupivbluegreen/omni-sag/internal/approval"
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/inspect"
@@ -60,17 +62,29 @@ func (m *memQuarantine) Delete(_ context.Context, key string) error {
 }
 func (m *memQuarantine) count() int { m.mu.Lock(); defer m.mu.Unlock(); return len(m.objs) }
 
-func startInspectingServer(t *testing.T, sink evidence.Sink) (string, *memQuarantine) {
+// startInspectingServer wires a server with content inspection AND (Task 11)
+// a real quarantine-release approval store, and a fake real target for
+// runSFTP's remoteFS to proxy to (SFTP is no longer served from an in-memory
+// stand-in). Returns the gateway address, the target host to select via
+// "user%host" (see splitTargetUser), the quarantine store, and the approval
+// store so tests can drive pending release requests to a decision.
+func startInspectingServer(t *testing.T, sink evidence.Sink) (addr, targetHost string, q *memQuarantine, store *approval.FileStore) {
 	t.Helper()
-	q := newMemQuarantine()
+	q = newMemQuarantine()
 	gate, err := inspectgate.New(inspectgate.Config{Inspector: eicarInspector{}, Quarantine: q, Threshold: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
+	store, err = approval.NewFileStore(filepath.Join(t.TempDir(), "approvals.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetHost, targetOpts := wireFakeSFTPTarget(t, nil)
 	hostKey, _ := NewEphemeralHostKey()
 	auth := fakeAuth{users: map[string][]string{"alice": {"dba"}}}
 	d := dialer.New(policy.Policy{}, sink)
-	srv := New(hostKey, auth, d, sink, WithInspection(gate))
+	opts := append([]Option{WithInspection(gate), WithApprovals(store, 5*time.Second)}, targetOpts...)
+	srv := New(hostKey, auth, d, sink, opts...)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +92,33 @@ func startInspectingServer(t *testing.T, sink evidence.Sink) (string, *memQuaran
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go srv.Serve(ctx, ln)
-	return ln.Addr().String(), q
+	return ln.Addr().String(), targetHost, q, store
+}
+
+// approveRelease polls store for a pending KindQuarantineRelease request and
+// approves it as approver (a distinct identity from the uploader — four-eyes
+// is enforced server-side), the way the TUI/API would. Fails the test if no
+// pending request shows up in time.
+func approveRelease(t *testing.T, store *approval.FileStore, approver string) {
+	t.Helper()
+	var reqID string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && reqID == "" {
+		for _, r := range store.List() {
+			if r.Kind == approval.KindQuarantineRelease && r.Status == approval.StatusPending {
+				reqID = r.ID
+			}
+		}
+		if reqID == "" {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if reqID == "" {
+		t.Fatal("no pending KindQuarantineRelease request was created")
+	}
+	if _, err := store.Approve(reqID, approver); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
 }
 
 func sftpPut(t *testing.T, client *sftp.Client, name string, data []byte) error {
@@ -96,19 +136,25 @@ func sftpPut(t *testing.T, client *sftp.Client, name string, data []byte) error 
 
 func TestSFTP_InspectionBlocksAndQuarantines(t *testing.T) {
 	sink := evidence.NewMemSink()
-	addr, q := startInspectingServer(t, sink)
+	addr, targetHost, q, store := startInspectingServer(t, sink)
 
-	ssh := sshClient(t, addr, "alice")
+	ssh := sshClient(t, addr, "alice%"+targetHost)
 	client, err := sftp.NewClient(ssh)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Clean upload succeeds.
-	if err := sftpPut(t, client, "/clean.txt", []byte("totally benign content")); err != nil {
-		t.Fatalf("clean upload must succeed, got %v", err)
+	// Clean upload: Close() now blocks (Task 11) until a distinct human
+	// releases it from quarantine, so drive that concurrently with the put.
+	putErr := make(chan error, 1)
+	go func() { putErr <- sftpPut(t, client, "/clean.txt", []byte("totally benign content")) }()
+	approveRelease(t, store, "bob")
+	if err := <-putErr; err != nil {
+		t.Fatalf("clean upload must succeed once released, got %v", err)
 	}
-	// EICAR upload is refused.
+
+	// EICAR upload is refused outright — blocked content never reaches the
+	// release step, so this stays a plain synchronous call.
 	if err := sftpPut(t, client, "/virus.txt", []byte("prefix X5O!P%@AP EICAR test string")); err == nil {
 		t.Fatal("EICAR upload must be refused")
 	}
@@ -120,7 +166,9 @@ func TestSFTP_InspectionBlocksAndQuarantines(t *testing.T) {
 		t.Fatalf("expected 2 quarantined objects (clean + blocked), got %d", q.count())
 	}
 
-	// End the SFTP session so the gateway emits the batched inspection evidence.
+	// Inspection evidence is now emitted per-upload at write-handle Close()
+	// (quarantineWriteHandle.Close(), Task 11), not batched at session end —
+	// closing here is just normal cleanup.
 	_ = client.Close()
 
 	// Evidence: one clean allow, one blocked deny.
