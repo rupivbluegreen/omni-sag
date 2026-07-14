@@ -50,6 +50,8 @@ func (s *Server) handleSession(ctx context.Context, newCh ssh.NewChannel, pr pol
 			_ = req.Reply(true, nil)
 		case "env":
 			_ = req.Reply(true, nil)
+		case "auth-agent-req@openssh.com":
+			_ = req.Reply(true, nil)
 		case "shell":
 			_ = req.Reply(true, nil)
 			s.runRecordedShell(ctx, channel, cols, rows, pr, srcIP)
