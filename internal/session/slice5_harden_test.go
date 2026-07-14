@@ -98,6 +98,54 @@ func TestInspectUpload_ConcurrentWrites(t *testing.T) {
 	}
 }
 
+// Final audit (HIGH): an upload with a forward offset gap leaves bytes that
+// were never presented to the inspector; Close must fail closed, not grade the
+// contiguous prefix as clean.
+func TestInspectUpload_GappedUploadFailsClosed(t *testing.T) {
+	iu := newInspectUpload(context.Background(), newTestGate(t, &recInspector{}), "/f")
+	if _, err := iu.WriteAt([]byte("AAAA"), 0); err != nil { // flushed
+		t.Fatal(err)
+	}
+	if _, err := iu.WriteAt([]byte("EVILPAYLOAD"), 1000); err != nil { // gap -> buffered, never inspected
+		t.Fatal(err)
+	}
+	if err := iu.Close(); err == nil {
+		t.Fatal("a gapped (never-contiguous) upload must be refused, not accepted")
+	}
+	if iu.dec.Allow {
+		t.Fatal("gapped upload must not be graded Allow")
+	}
+}
+
+// Final audit (LOW): the download manifest is captured at read time, so a later
+// Remove/Rename cannot suppress or falsify the exfiltration record.
+func TestSFTP_DownloadManifestCapturedAtRead(t *testing.T) {
+	m := newMemFS(nil, context.Background(), "alice")
+	wh, _ := m.Filewrite(&sftp.Request{Filepath: "/a"})
+	if _, err := wh.WriteAt([]byte("secret-data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	_ = wh.(io.Closer).Close()
+	if _, err := m.Fileread(&sftp.Request{Filepath: "/a"}); err != nil {
+		t.Fatal(err)
+	}
+	// Remove after the read: the download record must survive.
+	_ = m.Filecmd(&sftp.Request{Method: "Remove", Filepath: "/a"})
+
+	var up, down int
+	for _, tr := range m.manifests() {
+		switch {
+		case tr.direction == "upload":
+			up++
+		case tr.direction == "download" && tr.path == "/a" && tr.size == 11:
+			down++
+		}
+	}
+	if up != 1 || down != 1 {
+		t.Fatalf("want the download manifest to survive Remove (1 upload + 1 download), got %+v", m.manifests())
+	}
+}
+
 // #5: two uploads to the same path in one session must both be inspected and
 // evidenced (not overwritten in a path-keyed map).
 func TestSFTP_RepeatUploadSamePathBothInspected(t *testing.T) {

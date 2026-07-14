@@ -338,6 +338,9 @@ func (f *File) validate() error {
 			return fmt.Errorf("config: approval requires store_path (or use_crd)")
 		}
 	}
+	if err := f.validateFIPS(); err != nil {
+		return err
+	}
 	return nil
 }
 

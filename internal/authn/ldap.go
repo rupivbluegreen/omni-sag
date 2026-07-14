@@ -51,7 +51,7 @@ func (a *LDAPAuthenticator) Authenticate(ctx context.Context, username, password
 	}
 
 	conn, err := ldap.DialURL(a.cfg.URL, ldap.DialWithTLSConfig(&tls.Config{
-		InsecureSkipVerify: a.cfg.InsecureTLS, //nolint:gosec // dev-only, gated by config
+		InsecureSkipVerify: a.cfg.InsecureTLS, //nolint:gosec // dev-only opt-in; rejected under fips.mode=enforce by config validation
 	}))
 	if err != nil {
 		return Identity{}, fmt.Errorf("%w: connect: %v", ErrAuth, err)

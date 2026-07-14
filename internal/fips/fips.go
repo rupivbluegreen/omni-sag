@@ -8,9 +8,12 @@
 // declare an operational FIPS posture (off / warn / enforce), (b) a runtime
 // probe of whether the process is actually running with FIPS-approved crypto
 // (Go 1.24+ native FIPS 140-3 mode via GODEBUG=fips140=on, or a boringcrypto
-// toolchain), and (c) a static self-check that the specific algorithms this
-// codebase relies on (Ed25519 signing, SHA-256 hashing, and the TLS parameters
-// used for LDAPS / CyberArk CCP / the control-plane API) are FIPS-acceptable.
+// toolchain), and (c) a static self-check of the core primitives (Ed25519
+// signing, SHA-256 hashing). TLS-parameter conformance for LDAPS / CyberArk CCP
+// / the control-plane API is NOT part of Check; it is provided by the exported
+// ValidateTLSConfig / ApprovedTLSConfig helpers for callers to apply, and the
+// LDAPS insecure_tls escape hatch is separately rejected under fips.mode=enforce
+// by config validation.
 //
 // Default builds are unaffected: with no GODEBUG the runtime is not in FIPS
 // mode, Mode defaults to Off, and Check is a no-op that always succeeds.

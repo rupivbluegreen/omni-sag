@@ -74,7 +74,6 @@ type memFS struct {
 	mu         sync.Mutex
 	files      map[string]*memFile
 	uploads    map[string]bool
-	downloads  map[string]bool
 	inspectUps []*inspectUpload // every inspected upload (keyed by handle, not path)
 	completed  []transfer       // upload manifests captured at write-handle close
 }
@@ -87,12 +86,11 @@ func (m *memFS) recordUpload(t transfer) {
 
 func newMemFS(gate *inspectgate.Gate, ctx context.Context, user string) *memFS {
 	return &memFS{
-		gate:      gate,
-		ctx:       ctx,
-		user:      user,
-		files:     map[string]*memFile{},
-		uploads:   map[string]bool{},
-		downloads: map[string]bool{},
+		gate:    gate,
+		ctx:     ctx,
+		user:    user,
+		files:   map[string]*memFile{},
+		uploads: map[string]bool{},
 	}
 }
 
@@ -324,6 +322,20 @@ func (u *inspectUpload) Close() error {
 		}
 		_ = u.pw.Close()
 		<-u.done
+		// Fail closed on a non-contiguous upload: bytes the client wrote past an
+		// unfilled offset gap stayed in `pending` and were NEVER presented to the
+		// inspector, so the content was not fully scanned. Grading the contiguous
+		// prefix as clean would bypass the AV/DLP gate — refuse instead.
+		u.mu.Lock()
+		gapped := u.pendingBytes > 0
+		u.mu.Unlock()
+		if gapped {
+			u.dec.Allow = false
+			u.dec.Verdict = "error"
+			u.dec.Reason = "upload not contiguous: content could not be fully inspected"
+			u.closeErr = fmt.Errorf("upload refused: incomplete/gapped stream not fully inspected")
+			return
+		}
 		if u.inspErr != nil {
 			u.closeErr = fmt.Errorf("upload refused: %w", u.inspErr)
 			return
@@ -335,16 +347,27 @@ func (u *inspectUpload) Close() error {
 	return u.closeErr
 }
 
-// Fileread (FileGet): record a download and return a reader over the content.
+// Fileread (FileGet): capture the download manifest at read time (the bytes
+// actually served) and return a reader over the content. Capturing here — not
+// at session end from mutable state — makes the exfiltration record immune to a
+// later Rename/Remove/overwrite, mirroring the hardened upload path.
 func (m *memFS) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	p := cleanPath(r.Filepath)
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	f := m.files[p]
+	m.mu.Unlock()
 	if f == nil {
 		return nil, os.ErrNotExist
 	}
-	m.downloads[p] = true
+	f.mu.Lock()
+	tr := transfer{path: p, direction: "download", size: int64(len(f.data))}
+	sum := sha256.Sum256(f.data)
+	tr.sha256 = hex.EncodeToString(sum[:])
+	f.mu.Unlock()
+
+	m.mu.Lock()
+	m.completed = append(m.completed, tr)
+	m.mu.Unlock()
 	return f, nil
 }
 
@@ -407,27 +430,14 @@ type transfer struct {
 	sha256    string
 }
 
-// manifests returns a transfer record for every upload and download. Uploads
-// come from records captured at handle-close (immune to later rename/remove);
-// downloads are computed at session end from paths still present.
+// manifests returns a transfer record for every upload and download. Both
+// directions are captured at handle time (uploads at write-handle close,
+// downloads at read) into m.completed, so the manifests are immune to a later
+// Rename/Remove/overwrite and a re-fetch is its own distinct record.
 func (m *memFS) manifests() []transfer {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := append([]transfer(nil), m.completed...) // uploads, captured at close
-	for p := range m.downloads {
-		if m.uploads[p] {
-			continue // a file both put and fetched reports once as upload
-		}
-		f := m.files[p]
-		if f == nil {
-			continue
-		}
-		f.mu.Lock()
-		sum := sha256.Sum256(f.data)
-		out = append(out, transfer{path: p, direction: "download", size: int64(len(f.data)), sha256: hex.EncodeToString(sum[:])})
-		f.mu.Unlock()
-	}
-	return out
+	return append([]transfer(nil), m.completed...)
 }
 
 // memFileInfo implements os.FileInfo.
