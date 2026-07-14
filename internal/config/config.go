@@ -13,12 +13,20 @@ import (
 
 // File is the on-disk configuration document.
 type File struct {
-	Listen   string         `yaml:"listen"`   // SSH listen address, e.g. ":2222"
-	HostKey  string         `yaml:"host_key"` // path to the SSH host key (created if absent)
-	LDAP     LDAPConfig     `yaml:"ldap"`
-	MFA      MFAConfig      `yaml:"mfa"`
-	Evidence EvidenceConfig `yaml:"evidence"`
-	Policy   PolicyConfig   `yaml:"policy"`
+	Listen    string           `yaml:"listen"`   // SSH listen address, e.g. ":2222"
+	HostKey   string           `yaml:"host_key"` // path to the SSH host key (created if absent)
+	LDAP      LDAPConfig       `yaml:"ldap"`
+	MFA       MFAConfig        `yaml:"mfa"`
+	Evidence  EvidenceConfig   `yaml:"evidence"`
+	Recording *RecordingConfig `yaml:"recording"` // optional session-recording store
+	Policy    PolicyConfig     `yaml:"policy"`
+}
+
+// RecordingConfig selects where interactive session recordings (asciicast) are
+// stored. Exactly one of LocalDir or S3 may be set. Absent disables recording.
+type RecordingConfig struct {
+	LocalDir string          `yaml:"local_dir"`
+	S3       *EvidenceS3Conf `yaml:"s3"`
 }
 
 // MFAConfig configures the optional second factor. When Enabled, a successful
@@ -99,10 +107,13 @@ type RoleConfig struct {
 }
 
 // RuleConfig allows ports on a host. Host "*" matches any host; empty ports
-// matches any port.
+// matches any port. Record sets the recording posture for matching targets:
+// "none" (default), "metadata-only", or "full". On "full" targets, port
+// forwarding (-L) is refused (PRD FR-10).
 type RuleConfig struct {
-	Host  string `yaml:"host"`
-	Ports []int  `yaml:"ports"`
+	Host   string `yaml:"host"`
+	Ports  []int  `yaml:"ports"`
+	Record string `yaml:"record"`
 }
 
 // Load reads and parses the configuration file at path.
@@ -161,6 +172,14 @@ func (f *File) validate() error {
 			}
 		}
 	}
+	if r := f.Recording; r != nil {
+		if r.LocalDir == "" && r.S3 == nil {
+			return fmt.Errorf("config: recording requires local_dir or s3")
+		}
+		if r.LocalDir != "" && r.S3 != nil {
+			return fmt.Errorf("config: set only one of recording.local_dir or recording.s3")
+		}
+	}
 	if f.MFA.Enabled {
 		if f.MFA.RADIUS == nil {
 			return fmt.Errorf("config: mfa.enabled requires an mfa.radius block")
@@ -177,6 +196,11 @@ func (f *File) validate() error {
 			if rule.Host == "" {
 				return fmt.Errorf("config: role %q has a rule with empty host", r.Name)
 			}
+			switch rule.Record {
+			case "", "none", "metadata-only", "full":
+			default:
+				return fmt.Errorf("config: role %q rule for %q has invalid record %q (want none|metadata-only|full)", r.Name, rule.Host, rule.Record)
+			}
 		}
 	}
 	return nil
@@ -188,7 +212,11 @@ func (f *File) CompilePolicy() policy.Policy {
 	for _, rc := range f.Policy.Roles {
 		rules := make([]policy.Rule, 0, len(rc.Allow))
 		for _, ru := range rc.Allow {
-			rules = append(rules, policy.Rule{Host: ru.Host, Ports: ru.Ports})
+			rules = append(rules, policy.Rule{
+				Host:   ru.Host,
+				Ports:  ru.Ports,
+				Record: policy.RecordMode(ru.Record).Normalize(),
+			})
 		}
 		roles = append(roles, policy.Role{Name: rc.Name, Groups: rc.Groups, Allow: rules})
 	}

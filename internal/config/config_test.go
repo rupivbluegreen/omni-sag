@@ -133,3 +133,71 @@ policy:
 		t.Fatal("expected error for two evidence backends")
 	}
 }
+
+func TestValidate_RecordMode(t *testing.T) {
+	base := func(rec string) string {
+		return `
+listen: ":2222"
+evidence:
+  file: "e.jsonl"
+policy:
+  roles:
+    - name: dba
+      groups: ["dba"]
+      allow:
+        - host: "db1"
+          ports: [5432]
+          record: "` + rec + `"
+`
+	}
+	for _, ok := range []string{"none", "metadata-only", "full"} {
+		if _, err := Load(writeTemp(t, base(ok))); err != nil {
+			t.Fatalf("record %q should be valid: %v", ok, err)
+		}
+	}
+	if _, err := Load(writeTemp(t, base("sometimes"))); err == nil {
+		t.Fatal("invalid record value must be rejected")
+	}
+}
+
+func TestValidate_RecordingBackends(t *testing.T) {
+	both := `
+listen: ":2222"
+evidence:
+  file: "e.jsonl"
+recording:
+  local_dir: "recordings"
+  s3:
+    endpoint: "x:9000"
+    bucket: "b"
+policy:
+  roles: []
+`
+	if _, err := Load(writeTemp(t, both)); err == nil {
+		t.Fatal("two recording backends must be rejected")
+	}
+}
+
+func TestCompilePolicy_RecordMode(t *testing.T) {
+	cfg := `
+listen: ":2222"
+evidence:
+  file: "e.jsonl"
+policy:
+  roles:
+    - name: dba
+      groups: ["dba"]
+      allow:
+        - host: "full.lab"
+          ports: [22]
+          record: full
+`
+	f, err := Load(writeTemp(t, cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := f.CompilePolicy().Decide(policy.Principal{User: "a", Groups: []string{"dba"}}, policy.Target{Host: "full.lab", Port: 22})
+	if d.RecordMode != policy.RecordFull || d.ForwardingAllowed() {
+		t.Fatalf("compiled full record mode not applied: %+v", d)
+	}
+}

@@ -26,6 +26,17 @@ mfa:
     # password path, fails closed because it cannot prompt.
     allow_interactive_challenge: false
 
+# Recording (Slice 4): where interactive session asciicasts are stored. Absent
+# disables recording. Set exactly one of local_dir or s3.
+recording:
+  local_dir: "recordings"
+  # s3:
+  #   endpoint: "127.0.0.1:9000"
+  #   access_key: "omnisag"
+  #   secret_key: "omnisag-dev-secret"
+  #   bucket: "omni-sag-recordings"
+  #   use_ssl: false
+
 # Evidence backend — set exactly one of: file, s3, or pipeline.
 #   file     : crude JSONL (Slice 1), infra-free dev
 #   s3       : crude per-event objects on MinIO (Slice 1)
@@ -59,3 +70,7 @@ policy:
       allow:
         - host: "db1.lab.local"
           ports: [5432]
+          # record (Slice 4): none (default) | metadata-only | full
+          #   full          -> -L forwarding is REFUSED (session must be recorded)
+          #   metadata-only -> -L allowed, evidence marks the session unrecorded
+          record: none

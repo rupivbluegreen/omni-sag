@@ -23,11 +23,39 @@ type Principal struct {
 	Groups []string
 }
 
+// RecordMode is the recording posture required for a target (PRD FR-10).
+//
+//   - RecordFull: interactive sessions must be recorded; port-forwarding (-L)
+//     is refused because forwarded bytes cannot be meaningfully recorded.
+//   - RecordMetadataOnly: forwarding is allowed but the session is not
+//     recorded; evidence must mark it unrecorded.
+//   - RecordNone: no recording constraint.
+type RecordMode string
+
+const (
+	RecordNone         RecordMode = "none"
+	RecordMetadataOnly RecordMode = "metadata-only"
+	RecordFull         RecordMode = "full"
+)
+
+// Normalize maps an empty or unknown mode to RecordNone so a missing policy
+// field is fail-safe (no false claim of recording).
+func (m RecordMode) Normalize() RecordMode {
+	switch m {
+	case RecordFull, RecordMetadataOnly, RecordNone:
+		return m
+	default:
+		return RecordNone
+	}
+}
+
 // Rule allows a set of ports on a host. Host "*" matches any host.
-// An empty Ports slice matches any port.
+// An empty Ports slice matches any port. Record sets the recording posture for
+// targets this rule grants.
 type Rule struct {
-	Host  string
-	Ports []int
+	Host   string
+	Ports  []int
+	Record RecordMode
 }
 
 // Role binds AD group membership to a set of allow rules.
@@ -47,7 +75,14 @@ type Policy struct {
 type Decision struct {
 	Allow       bool
 	Reason      string
-	MatchedRole string // role that granted access, empty on deny
+	MatchedRole string     // role that granted access, empty on deny
+	RecordMode  RecordMode // recording posture of the matched target (RecordNone on deny)
+}
+
+// ForwardingAllowed reports whether port-forwarding (-L) is permitted for this
+// decision. Forwarding is refused on full-recording targets (PRD FR-10).
+func (d Decision) ForwardingAllowed() bool {
+	return d.RecordMode != RecordFull
 }
 
 // Roles returns the names of the roles a principal holds, by group membership.
@@ -94,7 +129,12 @@ func (p Policy) Decide(pr Principal, t Target) Decision {
 	for _, r := range roles {
 		for _, rule := range r.Allow {
 			if rule.matches(t) {
-				return Decision{Allow: true, Reason: "allowed by role " + r.Name, MatchedRole: r.Name}
+				return Decision{
+					Allow:       true,
+					Reason:      "allowed by role " + r.Name,
+					MatchedRole: r.Name,
+					RecordMode:  rule.Record.Normalize(),
+				}
 			}
 		}
 	}

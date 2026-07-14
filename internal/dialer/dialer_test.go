@@ -39,7 +39,7 @@ func TestDialTarget_AllowedDials(t *testing.T) {
 	d := New(demoPolicy(), sink)
 	pr := policy.Principal{User: "alice", Groups: []string{"dba"}}
 
-	conn, err := d.DialTarget(context.Background(), pr, "10.0.0.5", policy.Target{Host: "db1.lab.local", Port: 5432})
+	conn, err := d.DialTarget(context.Background(), pr, "10.0.0.5", policy.Target{Host: "db1.lab.local", Port: 5432}, false)
 	if err != nil {
 		t.Fatalf("expected allow, got %v", err)
 	}
@@ -73,7 +73,7 @@ func TestDialTarget_AllowProceedsWhenEvidenceEmitFails(t *testing.T) {
 	})
 	d := New(demoPolicy(), failSink{})
 	pr := policy.Principal{User: "alice", Groups: []string{"dba"}}
-	conn, err := d.DialTarget(context.Background(), pr, "10.0.0.5", policy.Target{Host: "db1.lab.local", Port: 5432})
+	conn, err := d.DialTarget(context.Background(), pr, "10.0.0.5", policy.Target{Host: "db1.lab.local", Port: 5432}, false)
 	if err != nil {
 		t.Fatalf("allow must still dial despite evidence failure, got %v", err)
 	}
@@ -95,7 +95,7 @@ func TestDialTarget_DeniedDoesNotDial(t *testing.T) {
 	d := New(demoPolicy(), sink)
 	pr := policy.Principal{User: "bob", Groups: []string{"users"}}
 
-	_, err := d.DialTarget(context.Background(), pr, "10.0.0.6", policy.Target{Host: "db1.lab.local", Port: 5432})
+	_, err := d.DialTarget(context.Background(), pr, "10.0.0.6", policy.Target{Host: "db1.lab.local", Port: 5432}, false)
 	if !errors.Is(err, ErrDenied) {
 		t.Fatalf("expected ErrDenied, got %v", err)
 	}
@@ -105,6 +105,69 @@ func TestDialTarget_DeniedDoesNotDial(t *testing.T) {
 	ev := sink.Events()
 	if len(ev) != 1 || ev[0].Allow == nil || *ev[0].Allow {
 		t.Fatalf("expected one deny decision event, got %+v", ev)
+	}
+}
+
+// fullRecPolicy grants db1 with full recording (forwarding must be refused) and
+// db2 with metadata-only (forwarding allowed, unrecorded).
+func recPolicy() policy.Policy {
+	return policy.Policy{Roles: []policy.Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow: []policy.Rule{
+			{Host: "db1.lab.local", Ports: []int{5432}, Record: policy.RecordFull},
+			{Host: "db2.lab.local", Ports: []int{5432}, Record: policy.RecordMetadataOnly},
+		},
+	}}}
+}
+
+func TestDialTarget_ForwardingRefusedOnFullRecordingTarget(t *testing.T) {
+	dialCalled := false
+	swapDial(t, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialCalled = true
+		c, _ := net.Pipe()
+		return c, nil
+	})
+	sink := evidence.NewMemSink()
+	d := New(recPolicy(), sink)
+	pr := policy.Principal{User: "alice", Groups: []string{"dba"}}
+
+	_, err := d.DialTarget(context.Background(), pr, "10.0.0.5", policy.Target{Host: "db1.lab.local", Port: 5432}, true)
+	if !errors.Is(err, ErrForwardingRefused) {
+		t.Fatalf("forwarding to a full-recording target must be refused, got %v", err)
+	}
+	if dialCalled {
+		t.Fatal("forwarding refusal must not open a socket")
+	}
+	ev := sink.Events()
+	if len(ev) != 1 || ev[0].Allow == nil || *ev[0].Allow {
+		t.Fatalf("expected a single deny (forwarding refused) event, got %+v", ev)
+	}
+	if ev[0].RecordMode != string(policy.RecordFull) {
+		t.Fatalf("evidence should record the full mode, got %q", ev[0].RecordMode)
+	}
+}
+
+func TestDialTarget_ForwardingAllowedOnMetadataOnly(t *testing.T) {
+	swapDial(t, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, _ := net.Pipe()
+		return c, nil
+	})
+	sink := evidence.NewMemSink()
+	d := New(recPolicy(), sink)
+	pr := policy.Principal{User: "alice", Groups: []string{"dba"}}
+
+	conn, err := d.DialTarget(context.Background(), pr, "10.0.0.5", policy.Target{Host: "db2.lab.local", Port: 5432}, true)
+	if err != nil {
+		t.Fatalf("forwarding to a metadata-only target must be allowed, got %v", err)
+	}
+	conn.Close()
+	ev := sink.Events()
+	if len(ev) != 1 || ev[0].Allow == nil || !*ev[0].Allow {
+		t.Fatalf("expected one allow event, got %+v", ev)
+	}
+	if ev[0].RecordMode != string(policy.RecordMetadataOnly) {
+		t.Fatalf("evidence must mark the session metadata-only (unrecorded), got %q", ev[0].RecordMode)
 	}
 }
 
