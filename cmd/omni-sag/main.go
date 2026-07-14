@@ -15,6 +15,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/config"
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
+	"github.com/rupivbluegreen/omni-sag/internal/recording"
 	"github.com/rupivbluegreen/omni-sag/internal/session"
 )
 
@@ -71,6 +72,14 @@ func run(cfgPath string) error {
 		})))
 		log.Printf("omni-sag: MFA enabled (RADIUS %s)", rc.Server)
 	}
+	if cfg.Recording != nil {
+		store, err := buildRecordingStore(ctx, cfg.Recording)
+		if err != nil {
+			return err
+		}
+		opts = append(opts, session.WithRecording(store))
+		log.Printf("omni-sag: session recording enabled")
+	}
 	srv := session.New(hostKey, auth, d, ev.sessionSink, opts...)
 
 	ln, err := net.Listen("tcp", cfg.Listen)
@@ -82,6 +91,20 @@ func run(cfgPath string) error {
 	err = srv.Serve(ctx, ln)
 	log.Printf("omni-sag: shutting down")
 	return err
+}
+
+// buildRecordingStore returns the recording store for interactive sessions.
+func buildRecordingStore(ctx context.Context, rc *config.RecordingConfig) (recording.Store, error) {
+	if rc.S3 != nil {
+		return recording.NewS3Store(ctx, recording.S3Config{
+			Endpoint:  rc.S3.Endpoint,
+			AccessKey: rc.S3.AccessKey,
+			SecretKey: rc.S3.SecretKey,
+			Bucket:    rc.S3.Bucket,
+			UseSSL:    rc.S3.UseSSL,
+		})
+	}
+	return recording.NewFileStore(rc.LocalDir)
 }
 
 // evidenceSystem holds the sinks handed to the dialer and session plus a close

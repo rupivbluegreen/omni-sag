@@ -20,8 +20,10 @@ const (
 	TypeAuth           Type = "auth"            // primary authentication attempt
 	TypeMFA            Type = "mfa"             // second-factor (MFA) outcome
 	TypeTunnelDecision Type = "tunnel_decision" // dialer authorization decision
-	TypeSessionStart   Type = "session_start"
-	TypeSessionEnd     Type = "session_end"
+	TypeSessionStart   Type = "session_start"   // interactive session opened
+	TypeSessionEnd     Type = "session_end"     // interactive session closed
+	TypeRecording      Type = "recording"       // a session recording was produced (asciicast)
+	TypeTransfer       Type = "transfer"        // an SFTP file transfer manifest
 )
 
 // Event is a single evidence record. Fields are additive: new event kinds add
@@ -39,6 +41,14 @@ type Event struct {
 	Allow       *bool  `json:"allow,omitempty"`
 	Reason      string `json:"reason,omitempty"`
 	MatchedRole string `json:"matched_role,omitempty"`
+	RecordMode  string `json:"record_mode,omitempty"` // none | metadata-only | full
+
+	// Recording / transfer fields (recording / transfer events).
+	ObjectKey string `json:"object_key,omitempty"` // S3 (or local) key of the artifact
+	SHA256    string `json:"sha256,omitempty"`     // digest of the artifact/file
+	Bytes     int64  `json:"bytes,omitempty"`      // size in bytes
+	Path      string `json:"path,omitempty"`       // SFTP path
+	Direction string `json:"direction,omitempty"`  // upload | download
 
 	// Freeform detail for anything not yet promoted to a field.
 	Detail string `json:"detail,omitempty"`

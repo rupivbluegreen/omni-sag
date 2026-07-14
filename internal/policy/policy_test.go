@@ -71,3 +71,40 @@ func TestRule_WildcardHostAnyPort(t *testing.T) {
 		t.Fatalf("wildcard host/any-port must allow, got: %s", d.Reason)
 	}
 }
+
+func TestDecide_RecordModeAndForwarding(t *testing.T) {
+	p := Policy{Roles: []Role{{
+		Name: "dba", Groups: []string{"dba"},
+		Allow: []Rule{
+			{Host: "full.lab", Ports: []int{22}, Record: RecordFull},
+			{Host: "meta.lab", Ports: []int{22}, Record: RecordMetadataOnly},
+			{Host: "plain.lab", Ports: []int{22}}, // no record -> normalizes to none
+		},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+
+	full := p.Decide(pr, Target{Host: "full.lab", Port: 22})
+	if full.RecordMode != RecordFull || full.ForwardingAllowed() {
+		t.Fatalf("full target must forbid forwarding: %+v", full)
+	}
+	meta := p.Decide(pr, Target{Host: "meta.lab", Port: 22})
+	if meta.RecordMode != RecordMetadataOnly || !meta.ForwardingAllowed() {
+		t.Fatalf("metadata-only must allow forwarding: %+v", meta)
+	}
+	plain := p.Decide(pr, Target{Host: "plain.lab", Port: 22})
+	if plain.RecordMode != RecordNone || !plain.ForwardingAllowed() {
+		t.Fatalf("unset record must be none + forwarding allowed: %+v", plain)
+	}
+}
+
+func TestRecordMode_Normalize(t *testing.T) {
+	if RecordMode("").Normalize() != RecordNone {
+		t.Fatal("empty must normalize to none")
+	}
+	if RecordMode("bogus").Normalize() != RecordNone {
+		t.Fatal("unknown must normalize to none")
+	}
+	if RecordFull.Normalize() != RecordFull {
+		t.Fatal("full must stay full")
+	}
+}

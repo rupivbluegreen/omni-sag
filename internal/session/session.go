@@ -19,6 +19,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
+	"github.com/rupivbluegreen/omni-sag/internal/recording"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -47,6 +48,7 @@ type Server struct {
 	dialer           *dialer.Dialer
 	sink             evidence.Sink
 	mfa              authn.MFAProvider // optional second factor; nil disables MFA
+	recordStore      recording.Store   // optional; when set, interactive sessions are recorded
 	handshakeTimeout time.Duration
 	sem              chan struct{} // bounds concurrent in-flight handshakes
 }
@@ -58,6 +60,13 @@ type Option func(*Server)
 // factor. If Verify fails, the login is refused (fail closed).
 func WithMFA(p authn.MFAProvider) Option {
 	return func(s *Server) { s.mfa = p }
+}
+
+// WithRecording records interactive PTY sessions as asciicast to store and
+// emits a signed recording manifest for each. Nil (the default) disables
+// recording.
+func WithRecording(store recording.Store) Option {
+	return func(s *Server) { s.recordStore = store }
 }
 
 // New builds an SSH server that authenticates with auth and forwards through d.
@@ -191,11 +200,14 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 	srcIP := hostOf(sconn.RemoteAddr())
 
 	for newCh := range chans {
-		if newCh.ChannelType() != "direct-tcpip" {
-			_ = newCh.Reject(ssh.UnknownChannelType, "only port forwarding (direct-tcpip) is supported")
-			continue
+		switch newCh.ChannelType() {
+		case "direct-tcpip":
+			go s.handleDirectTCPIP(ctx, newCh, pr, srcIP)
+		case "session":
+			go s.handleSession(ctx, newCh, pr, srcIP)
+		default:
+			_ = newCh.Reject(ssh.UnknownChannelType, "unsupported channel type")
 		}
-		go s.handleDirectTCPIP(ctx, newCh, pr, srcIP)
 	}
 }
 
@@ -215,13 +227,17 @@ func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr
 	}
 	target := policy.Target{Host: d.HostToConnect, Port: int(d.PortToConnect)}
 
-	conn, err := s.dialer.DialTarget(ctx, pr, srcIP, target)
+	// forwarding=true: refused on full-recording targets (PRD FR-10).
+	conn, err := s.dialer.DialTarget(ctx, pr, srcIP, target, true)
 	if err != nil {
-		if errors.Is(err, dialer.ErrDenied) {
+		switch {
+		case errors.Is(err, dialer.ErrForwardingRefused):
+			_ = newCh.Reject(ssh.Prohibited, "forwarding refused: target requires full session recording")
+		case errors.Is(err, dialer.ErrDenied):
 			_ = newCh.Reject(ssh.Prohibited, "administratively prohibited")
-			return
+		default:
+			_ = newCh.Reject(ssh.ConnectionFailed, "connection failed")
 		}
-		_ = newCh.Reject(ssh.ConnectionFailed, "connection failed")
 		return
 	}
 
