@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/rupivbluegreen/omni-sag/internal/fips"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 	"gopkg.in/yaml.v3"
 )
@@ -25,6 +26,7 @@ type File struct {
 	Approval   *ApprovalConfig   `yaml:"approval"`      // optional; required if any rule sets require_approval
 	PolicySrc  *PolicySource     `yaml:"policy_source"` // optional; hot-reload policy from a file
 	Metrics    *MetricsConfig    `yaml:"metrics"`       // optional Prometheus /metrics listener (out-of-band)
+	FIPS       *FIPSConfig       `yaml:"fips"`          // optional FIPS-readiness posture (off|warn|enforce)
 	DrainGrace int               `yaml:"drain_grace_seconds"`
 	Policy     PolicyConfig      `yaml:"policy"`
 }
@@ -298,6 +300,11 @@ func (f *File) validate() error {
 		}
 		if f.MFA.RADIUS.Server == "" || f.MFA.RADIUS.Secret == "" {
 			return fmt.Errorf("config: mfa.radius requires server and secret")
+		}
+	}
+	if f.FIPS != nil {
+		if _, err := fips.ParseMode(f.FIPS.Mode); err != nil {
+			return err
 		}
 	}
 	if err := validatePolicyRoles(f.Policy.Roles); err != nil {

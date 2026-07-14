@@ -22,6 +22,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/config"
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
+	"github.com/rupivbluegreen/omni-sag/internal/fips"
 	"github.com/rupivbluegreen/omni-sag/internal/inspect"
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
 	"github.com/rupivbluegreen/omni-sag/internal/metrics"
@@ -47,6 +48,19 @@ func run(cfgPath string) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
+	}
+
+	// FIPS-readiness self-check. In enforce mode this refuses to start unless the
+	// runtime is in FIPS-approved crypto mode (GODEBUG=fips140=on or boringcrypto);
+	// in warn/off it only reports. Runs before anything touches crypto so the
+	// posture is decided at the very top of boot.
+	fipsReport, err := fips.Check(cfg.FIPSMode())
+	if err != nil {
+		return err
+	}
+	log.Printf("omni-sag: %s", fipsReport.Summary())
+	for _, w := range fipsReport.Warnings {
+		log.Printf("omni-sag: FIPS warning: %s", w)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
