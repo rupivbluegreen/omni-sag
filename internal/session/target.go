@@ -15,6 +15,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/rupivbluegreen/omni-sag/internal/credential"
+	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 )
 
@@ -38,16 +39,38 @@ var dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error
 	return net.DialTimeout(network, addr, timeout)
 }
 
+// emitTargetCredential emits one evidence.TypeCredential event for a
+// second-leg auth attempt on the gateway's real-target connection —
+// mirroring internal/dialer.Dialer.resolveCredential's field shape exactly
+// (mode, target, outcome, reason, never the secret) so the same event type
+// covers both the -L tunnel path and this real-target shell/SFTP path.
+func (s *Server) emitTargetCredential(pr policy.Principal, srcIP, targetHost string, targetPort int, mode credential.Mode, outcome, reason string, allow bool) {
+	s.emit(evidence.Event{
+		Time:           time.Now().UTC(),
+		Type:           evidence.TypeCredential,
+		User:           pr.User,
+		SourceIP:       srcIP,
+		Target:         net.JoinHostPort(targetHost, strconv.Itoa(targetPort)),
+		Allow:          evidence.BoolPtr(allow),
+		CredentialMode: string(mode),
+		Outcome:        outcome,
+		Reason:         reason,
+	})
+}
+
 // dialTarget opens and authenticates the gateway's second SSH leg to the
 // target, per decision's credential mode. It never returns a client on deny
 // or on any auth failure — no downgrade to another mode (mirrors
-// internal/credential's ErrFailClosed / ErrDenied contract exactly).
+// internal/credential's ErrFailClosed / ErrDenied contract exactly). Every
+// attempt — success or failure, for every mode including deny — emits an
+// evidence.TypeCredential event (see emitTargetCredential); the secret
+// itself is never placed in any field.
 //
 // secretToken is the prompt-mode stash token from Task 5 (ignored for other
 // modes). sconn is the gateway's connection to the CLIENT, needed only for
 // passthrough mode's reverse agent channel (may be nil for the other modes,
-// including in tests).
-func (s *Server) dialTarget(ctx context.Context, sconn ssh.Conn, pr policy.Principal, decision policy.Decision, targetHost string, targetPort int, secretToken string) (*ssh.Client, error) {
+// including in tests). srcIP is recorded in evidence only.
+func (s *Server) dialTarget(ctx context.Context, sconn ssh.Conn, pr policy.Principal, srcIP string, decision policy.Decision, targetHost string, targetPort int, secretToken string) (*ssh.Client, error) {
 	targetUser := decision.TargetUser
 	if targetUser == "" {
 		targetUser = pr.User
@@ -70,18 +93,24 @@ func (s *Server) dialTarget(ctx context.Context, sconn ssh.Conn, pr policy.Princ
 	mode := credential.Mode(decision.CredentialMode).Normalize()
 	switch mode {
 	case credential.ModeDeny:
-		return nil, fmt.Errorf("%w: credential mode deny for target %s", credential.ErrDenied, targetHost)
+		reason := fmt.Sprintf("credential mode deny for target %s", targetHost)
+		s.emitTargetCredential(pr, srcIP, targetHost, targetPort, mode, string(credential.OutcomeDenied), reason, false)
+		return nil, fmt.Errorf("%w: %s", credential.ErrDenied, reason)
 
 	case credential.ModeInject:
 		if s.cred == nil {
-			return nil, fmt.Errorf("%w: inject configured for %s but no credential provider", credential.ErrFailClosed, targetHost)
+			reason := fmt.Sprintf("inject configured for %s but no credential provider", targetHost)
+			s.emitTargetCredential(pr, srcIP, targetHost, targetPort, mode, "fail_closed", reason, false)
+			return nil, fmt.Errorf("%w: %s", credential.ErrFailClosed, reason)
 		}
 		res, err := s.cred.Resolve(ctx, credential.Request{
 			User: pr.User, Target: net.JoinHostPort(targetHost, strconv.Itoa(targetPort)), Mode: credential.ModeInject,
 		})
 		if err != nil {
+			s.emitTargetCredential(pr, srcIP, targetHost, targetPort, mode, "fail_closed", err.Error(), false)
 			return nil, err // already wraps ErrFailClosed
 		}
+		s.emitTargetCredential(pr, srcIP, targetHost, targetPort, mode, string(res.Outcome), res.Reason, true)
 		// Residual risk documented in ADR-0002 and this plan's Global
 		// Constraints: ssh.Password requires a Go string; the conversion
 		// happens only in this expression, never bound to a variable.
@@ -91,27 +120,36 @@ func (s *Server) dialTarget(ctx context.Context, sconn ssh.Conn, pr policy.Princ
 	case credential.ModePrompt:
 		sec := s.takeTargetSecret(secretToken)
 		if sec == nil {
-			return nil, fmt.Errorf("%w: prompt mode for %s but no target password was collected", credential.ErrFailClosed, targetHost)
+			reason := fmt.Sprintf("prompt mode for %s but no target password was collected", targetHost)
+			s.emitTargetCredential(pr, srcIP, targetHost, targetPort, mode, "fail_closed", reason, false)
+			return nil, fmt.Errorf("%w: %s", credential.ErrFailClosed, reason)
 		}
+		s.emitTargetCredential(pr, srcIP, targetHost, targetPort, mode, string(credential.OutcomePrompt), "prompt credential collected", true)
 		cfg.Auth = []ssh.AuthMethod{ssh.Password(string(sec.Bytes()))} // omni-sag:target-auth-string — see ADR-0002 residual risk
 		sec.Destroy()
 
 	case credential.ModePassthrough:
 		if sconn == nil {
-			return nil, fmt.Errorf("%w: passthrough mode for %s but no client connection to forward from", credential.ErrFailClosed, targetHost)
+			reason := fmt.Sprintf("passthrough mode for %s but no client connection to forward from", targetHost)
+			s.emitTargetCredential(pr, srcIP, targetHost, targetPort, mode, "fail_closed", reason, false)
+			return nil, fmt.Errorf("%w: %s", credential.ErrFailClosed, reason)
 		}
 		signers, closer, err := s.forwardedAgentSigners(sconn)
 		if err != nil {
+			s.emitTargetCredential(pr, srcIP, targetHost, targetPort, mode, "fail_closed", err.Error(), false)
 			return nil, fmt.Errorf("%w: %v", credential.ErrFailClosed, err)
 		}
 		// closer stays open until dialTarget returns (this defer runs at
 		// function exit, not end-of-case) — signers only sign lazily, during
 		// ssh.NewClientConn below, over this same forwarded-agent channel.
 		defer closer.Close()
+		s.emitTargetCredential(pr, srcIP, targetHost, targetPort, mode, string(credential.OutcomePassthrough), "forwarded agent signers obtained", true)
 		cfg.Auth = []ssh.AuthMethod{ssh.PublicKeys(signers...)}
 
 	default:
-		return nil, fmt.Errorf("%w: unknown credential mode %q for %s", credential.ErrFailClosed, decision.CredentialMode, targetHost)
+		reason := fmt.Sprintf("unknown credential mode %q for %s", decision.CredentialMode, targetHost)
+		s.emitTargetCredential(pr, srcIP, targetHost, targetPort, mode, "fail_closed", reason, false)
+		return nil, fmt.Errorf("%w: %s", credential.ErrFailClosed, reason)
 	}
 
 	addr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))

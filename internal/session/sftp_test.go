@@ -2,10 +2,13 @@ package session
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net"
 	"path"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +17,7 @@ import (
 
 	"github.com/rupivbluegreen/omni-sag/internal/approval"
 	"github.com/rupivbluegreen/omni-sag/internal/credential"
+	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/inspect"
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
@@ -385,4 +389,249 @@ func TestRemoteFS_FilereadProxiesRealTarget(t *testing.T) {
 	if got := string(buf[:n]); got != "hello from target\n" {
 		t.Fatalf("Fileread content = %q, want %q", got, "hello from target\n")
 	}
+}
+
+// --- Important finding #2: downloads must produce a evidence.TypeTransfer
+// manifest (path, size, SHA256, Direction: "download"), like the old
+// in-memory memFS.Fileread did — the new remoteFS.Fileread must not
+// silently drop that record. ---
+
+func TestRemoteFS_FilereadEmitsDownloadTransferEvidence(t *testing.T) {
+	content := []byte("hello from target, this is the full file content\n")
+	fakeConn := startFakeSFTPTarget(t, map[string][]byte{"/etc/motd": content})
+	client, err := sftp.NewClient(sshClientOver(t, fakeConn))
+	if err != nil {
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+	defer client.Close()
+
+	sink := evidence.NewMemSink()
+	s := &Server{sink: sink}
+	fs := &remoteFS{client: client, srv: s, user: "alice", srcIP: "10.0.0.1"}
+
+	r, err := fs.Fileread(&sftp.Request{Method: "Get", Filepath: "/etc/motd"})
+	if err != nil {
+		t.Fatalf("Fileread: %v", err)
+	}
+	// Read in two small chunks (not one buffer sized to fit the whole file)
+	// so the manifest reflects genuinely-streamed reads, not a single ReadAt
+	// call that happens to slurp everything at once.
+	buf := make([]byte, len(content))
+	total := 0
+	for total < len(content) {
+		chunkLen := 8
+		if total+chunkLen > len(buf) {
+			chunkLen = len(buf) - total
+		}
+		n, rerr := r.ReadAt(buf[total:total+chunkLen], int64(total))
+		total += n
+		if rerr != nil {
+			if rerr == io.EOF && total == len(content) {
+				break
+			}
+			if rerr != io.EOF {
+				t.Fatalf("ReadAt: %v", rerr)
+			}
+		}
+	}
+	if string(buf[:total]) != string(content) {
+		t.Fatalf("read content = %q, want %q", buf[:total], content)
+	}
+	closer, ok := r.(io.Closer)
+	if !ok {
+		t.Fatal("Fileread's returned io.ReaderAt must also implement io.Closer (pkg/sftp's request-server only closes handles that do)")
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	var transfers []evidence.Event
+	for _, e := range sink.Events() {
+		if e.Type == evidence.TypeTransfer {
+			transfers = append(transfers, e)
+		}
+	}
+	if len(transfers) != 1 {
+		t.Fatalf("want exactly 1 evidence.TypeTransfer event, got %d: %+v", len(transfers), transfers)
+	}
+	e := transfers[0]
+	if e.Path != "/etc/motd" || e.Direction != "download" {
+		t.Fatalf("transfer event path/direction = %+v, want /etc/motd/download", e)
+	}
+	if e.Bytes != int64(len(content)) {
+		t.Fatalf("transfer event bytes = %d, want %d", e.Bytes, len(content))
+	}
+	wantSum := sha256.Sum256(content)
+	if e.SHA256 != hex.EncodeToString(wantSum[:]) {
+		t.Fatalf("transfer event sha256 = %s, want %s (must match the actual file content)", e.SHA256, hex.EncodeToString(wantSum[:]))
+	}
+	if e.User != "alice" || e.SourceIP != "10.0.0.1" {
+		t.Fatalf("transfer event user/sourceip = %+v, want alice/10.0.0.1", e)
+	}
+}
+
+// --- Important finding #3: Filecmd (Remove/Rename/Mkdir/Rmdir) now performs
+// real destructive operations on the real target and must leave an evidence
+// trail — the old in-memory memFS only mutated a throwaway map, so it never
+// needed one. ---
+
+func TestRemoteFS_FilecmdEmitsEvidenceForDestructiveOps(t *testing.T) {
+	fakeConn := startFakeSFTPTarget(t, map[string][]byte{"/file.txt": []byte("content")})
+	client, err := sftp.NewClient(sshClientOver(t, fakeConn))
+	if err != nil {
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+	defer client.Close()
+
+	sink := evidence.NewMemSink()
+	s := &Server{sink: sink}
+	fs := &remoteFS{client: client, srv: s, user: "alice", srcIP: "10.0.0.1"}
+
+	if err := fs.Filecmd(&sftp.Request{Method: "Mkdir", Filepath: "/newdir"}); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if err := fs.Filecmd(&sftp.Request{Method: "Rename", Filepath: "/file.txt", Target: "/renamed.txt"}); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if err := fs.Filecmd(&sftp.Request{Method: "Remove", Filepath: "/renamed.txt"}); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if err := fs.Filecmd(&sftp.Request{Method: "Rmdir", Filepath: "/newdir"}); err != nil {
+		t.Fatalf("Rmdir: %v", err)
+	}
+
+	wantPath := map[string]string{
+		"mkdir":  "/newdir",
+		"rename": "/file.txt",
+		"remove": "/renamed.txt",
+		"rmdir":  "/newdir",
+	}
+	gotPath := map[string]string{}
+	var renameDetail string
+	for _, e := range sink.Events() {
+		if e.Type != evidence.TypeTransfer {
+			continue
+		}
+		gotPath[e.Direction] = e.Path
+		if e.Direction == "rename" {
+			renameDetail = e.Detail
+		}
+		if e.User != "alice" || e.SourceIP != "10.0.0.1" {
+			t.Fatalf("filecmd evidence missing user/sourceip: %+v", e)
+		}
+		if e.Allow == nil || !*e.Allow {
+			t.Fatalf("filecmd evidence for a successful op must have Allow=true: %+v", e)
+		}
+	}
+	for op, wantP := range wantPath {
+		if gotPath[op] != wantP {
+			t.Fatalf("filecmd evidence for %q: path = %q, want %q (recorded: %+v)", op, gotPath[op], wantP, gotPath)
+		}
+	}
+	if !strings.Contains(renameDetail, "/renamed.txt") {
+		t.Fatalf("rename evidence detail = %q, want it to mention the destination /renamed.txt", renameDetail)
+	}
+}
+
+// --- Minor finding #5: quarantineWriteHandle.Close() must be idempotent —
+// a second call must not re-emit inspection evidence, create a second
+// KindQuarantineRelease request, or re-deliver to the target. ---
+
+func TestQuarantineWriteHandle_CloseIsIdempotent(t *testing.T) {
+	quar := newFakeBlobStore()
+	g, err := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	if err != nil {
+		t.Fatalf("inspectgate.New: %v", err)
+	}
+	fakeConn := startFakeSFTPTarget(t, nil)
+	targetClient, err := sftp.NewClient(sshClientOver(t, fakeConn))
+	if err != nil {
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+	defer targetClient.Close()
+
+	store, err := approval.NewFileStore(filepath.Join(t.TempDir(), "approvals.json"))
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	s := &Server{sink: noopSink{}, inspect: g, approvals: store, approvalTTL: 5 * time.Second}
+	fs := &remoteFS{client: targetClient, gate: g, srv: s, user: "alice"}
+
+	h, err := fs.Filewrite(&sftp.Request{Method: "Put", Filepath: "/upload.txt"})
+	if err != nil {
+		t.Fatalf("Filewrite: %v", err)
+	}
+	if _, err := h.WriteAt([]byte("clean content"), 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+
+	firstErr := make(chan error, 1)
+	go func() { firstErr <- h.(io.Closer).Close() }()
+	approveRelease(t, store, "bob")
+	first := <-firstErr
+	if first != nil {
+		t.Fatalf("first Close: %v", first)
+	}
+
+	// A second Close() must return immediately — reusing the cached result,
+	// not re-entering the approval-wait machinery (which would otherwise
+	// create a second request and hang this goroutine on an approval that
+	// will never come).
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- h.(io.Closer).Close() }()
+	select {
+	case second := <-secondDone:
+		if second != nil {
+			t.Fatalf("second Close = %v, want nil (same as first)", second)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("second Close() did not return promptly — Close is not idempotent")
+	}
+
+	releaseReqs := 0
+	for _, r := range store.List() {
+		if r.Kind == approval.KindQuarantineRelease {
+			releaseReqs++
+		}
+	}
+	if releaseReqs != 1 {
+		t.Fatalf("want exactly 1 KindQuarantineRelease request created across both Close() calls, got %d", releaseReqs)
+	}
+
+	delivered, err := targetClient.Open("/upload.txt")
+	if err != nil {
+		t.Fatalf("target file was not delivered: %v", err)
+	}
+	got, _ := io.ReadAll(delivered)
+	if string(got) != "clean content" {
+		t.Fatalf("delivered content = %q, want %q (must not be duplicated by a second delivery)", got, "clean content")
+	}
+}
+
+// --- Minor finding #4: a successful SFTP session must emit
+// TypeSessionStart/TypeSessionEnd, not just the refusal branches. ---
+
+func TestRunSFTP_EmitsSessionStartAndEndOnNormalCompletion(t *testing.T) {
+	targetHost, targetOpts := wireFakeSFTPTarget(t, map[string][]byte{"/etc/motd": []byte("hi\n")})
+	sink := evidence.NewMemSink()
+	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, targetOpts...)
+
+	client := sshClient(t, addr, "alice%"+targetHost)
+	sftpClient, err := sftp.NewClient(client)
+	if err != nil {
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+	if _, err := sftpClient.ReadDir("/"); err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if err := sftpClient.Close(); err != nil {
+		t.Fatalf("sftpClient.Close: %v", err)
+	}
+
+	waitEvent(t, sink, func(e evidence.Event) bool {
+		return e.Type == evidence.TypeSessionStart && e.User == "alice" && e.Detail == "sftp"
+	})
+	waitEvent(t, sink, func(e evidence.Event) bool {
+		return e.Type == evidence.TypeSessionEnd && e.User == "alice" && e.Detail == ""
+	})
 }

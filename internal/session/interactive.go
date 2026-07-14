@@ -202,7 +202,7 @@ func (s *Server) runRecordedShell(ctx context.Context, channel ssh.Channel, cols
 		targetPort = 22
 	}
 	targetClient, err := tch.getOrDial(func() (*ssh.Client, error) {
-		return s.dialTarget(ctx, sconn, pr, decision, targetHost, targetPort, pr.TargetSecretToken)
+		return s.dialTarget(ctx, sconn, pr, srcIP, decision, targetHost, targetPort, pr.TargetSecretToken)
 	})
 	if err != nil {
 		_, _ = channel.Write([]byte(fmt.Sprintf("session refused: %s\r\n", err)))

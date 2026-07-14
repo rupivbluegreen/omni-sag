@@ -5,12 +5,15 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 
 	"github.com/rupivbluegreen/omni-sag/internal/credential"
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
@@ -252,8 +255,8 @@ func TestDialTarget_NoHostKeyCallbackFailsClosed(t *testing.T) {
 		Fetcher: fakeFetcher{secret: []byte("injected-secret")},
 		Query:   func(credential.Request) credential.Query { return credential.Query{} },
 	})
-	s := &Server{cred: prov} // targetHostKeyCB intentionally left nil
-	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
+	s := &Server{sink: noopSink{}, cred: prov} // targetHostKeyCB intentionally left nil
+	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
 		policy.Decision{CredentialMode: "inject"}, "db1.lab.local", 22, "")
 	if !errors.Is(err, credential.ErrFailClosed) {
 		t.Fatalf("want ErrFailClosed, got %v", err)
@@ -264,8 +267,8 @@ func TestDialTarget_NoHostKeyCallbackFailsClosed(t *testing.T) {
 }
 
 func TestDialTarget_Deny(t *testing.T) {
-	s := &Server{targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
-	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
+	s := &Server{sink: noopSink{}, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
 		policy.Decision{CredentialMode: "deny"}, "db1.lab.local", 22, "")
 	if !errors.Is(err, credential.ErrDenied) {
 		t.Fatalf("want ErrDenied, got %v", err)
@@ -273,8 +276,8 @@ func TestDialTarget_Deny(t *testing.T) {
 }
 
 func TestDialTarget_InjectNoProviderFailsClosed(t *testing.T) {
-	s := &Server{targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production; s.cred is nil
-	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
+	s := &Server{sink: noopSink{}, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production; s.cred is nil
+	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
 		policy.Decision{CredentialMode: "inject"}, "db1.lab.local", 22, "")
 	if !errors.Is(err, credential.ErrFailClosed) {
 		t.Fatalf("want ErrFailClosed, got %v", err)
@@ -282,8 +285,8 @@ func TestDialTarget_InjectNoProviderFailsClosed(t *testing.T) {
 }
 
 func TestDialTarget_PromptNoStashedSecretFailsClosed(t *testing.T) {
-	s := &Server{targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
-	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
+	s := &Server{sink: noopSink{}, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
 		policy.Decision{CredentialMode: "prompt"}, "db1.lab.local", 22, "no-such-token")
 	if !errors.Is(err, credential.ErrFailClosed) {
 		t.Fatalf("want ErrFailClosed, got %v", err)
@@ -296,8 +299,8 @@ func TestDialTarget_PassthroughNoConnFailsClosed(t *testing.T) {
 	// must fail closed, not panic or fall through, when there is no gateway
 	// connection to the client to forward an agent from (e.g. sconn is nil
 	// in every other dialTarget test in this file).
-	s := &Server{targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
-	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
+	s := &Server{sink: noopSink{}, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
 		policy.Decision{CredentialMode: "passthrough"}, "db1.lab.local", 22, "")
 	if !errors.Is(err, credential.ErrFailClosed) {
 		t.Fatalf("want ErrFailClosed, got %v", err)
@@ -314,8 +317,8 @@ func TestDialTarget_InjectSucceeds(t *testing.T) {
 		Fetcher: fakeFetcher{secret: []byte("injected-secret")},
 		Query:   func(credential.Request) credential.Query { return credential.Query{} },
 	})
-	s := &Server{cred: prov, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
-	client, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
+	s := &Server{sink: noopSink{}, cred: prov, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	client, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
 		policy.Decision{CredentialMode: "inject"}, "db1.lab.local", 22, "")
 	if err != nil {
 		t.Fatalf("dialTarget: %v", err)
@@ -329,9 +332,9 @@ func TestDialTarget_PromptSucceeds(t *testing.T) {
 	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
 	t.Cleanup(func() { dialNet = orig })
 
-	s := &Server{targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	s := &Server{sink: noopSink{}, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
 	token := s.stashTargetSecret(credential.New([]byte("prompted-secret")))
-	client, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
+	client, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
 		policy.Decision{CredentialMode: "prompt"}, "db1.lab.local", 22, token)
 	if err != nil {
 		t.Fatalf("dialTarget: %v", err)
@@ -426,4 +429,223 @@ type fakeFetcher struct{ secret []byte }
 
 func (f fakeFetcher) Fetch(_ context.Context, _ credential.Query) (*credential.Secret, error) {
 	return credential.New(append([]byte(nil), f.secret...)), nil
+}
+
+// --- Important finding #1: dialTarget must emit evidence.TypeCredential for
+// every second-leg auth attempt (all four modes), never the secret. ---
+
+// singleCredentialEvent asserts sink recorded EXACTLY one
+// evidence.TypeCredential event and returns it.
+func singleCredentialEvent(t *testing.T, sink *evidence.MemSink) evidence.Event {
+	t.Helper()
+	var got []evidence.Event
+	for _, e := range sink.Events() {
+		if e.Type == evidence.TypeCredential {
+			got = append(got, e)
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("want exactly 1 evidence.TypeCredential event, got %d: %+v", len(got), got)
+	}
+	return got[0]
+}
+
+// assertNoSecretLeak fails the test if any string field of e contains any of
+// secrets — the credential/password itself must never appear in evidence.
+func assertNoSecretLeak(t *testing.T, e evidence.Event, secrets ...string) {
+	t.Helper()
+	haystack := strings.Join([]string{
+		e.User, e.SourceIP, e.Target, e.Reason, e.MatchedRole, e.RecordMode,
+		e.ObjectKey, e.SHA256, e.Path, e.Direction, e.Verdict,
+		e.CredentialMode, e.Outcome, e.Detail,
+	}, "\x00")
+	for _, secret := range secrets {
+		if secret == "" {
+			continue
+		}
+		if strings.Contains(haystack, secret) {
+			t.Fatalf("credential event leaked the secret %q: %+v", secret, e)
+		}
+	}
+}
+
+func TestDialTarget_InjectEmitsCredentialEvidence(t *testing.T) {
+	fakeConn := startFakeTarget(t, "injected-secret")
+	orig := dialNet
+	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	t.Cleanup(func() { dialNet = orig })
+
+	prov := credential.NewProvider(credential.Config{
+		Fetcher: fakeFetcher{secret: []byte("injected-secret")},
+		Query:   func(credential.Request) credential.Query { return credential.Query{} },
+	})
+	sink := evidence.NewMemSink()
+	s := &Server{sink: sink, cred: prov, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	client, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
+		policy.Decision{CredentialMode: "inject"}, "db1.lab.local", 22, "")
+	if err != nil {
+		t.Fatalf("dialTarget: %v", err)
+	}
+	defer client.Close()
+
+	e := singleCredentialEvent(t, sink)
+	if e.CredentialMode != "inject" || e.Outcome != string(credential.OutcomeInjected) {
+		t.Fatalf("credential event = %+v, want CredentialMode=inject Outcome=%s", e, credential.OutcomeInjected)
+	}
+	if e.Allow == nil || !*e.Allow {
+		t.Fatalf("credential event Allow = %v, want true", e.Allow)
+	}
+	if e.User != "alice" || e.SourceIP != "10.0.0.1" || e.Target != "db1.lab.local:22" {
+		t.Fatalf("credential event user/sourceip/target = %+v, want alice/10.0.0.1/db1.lab.local:22", e)
+	}
+	assertNoSecretLeak(t, e, "injected-secret")
+}
+
+func TestDialTarget_PromptEmitsCredentialEvidence(t *testing.T) {
+	fakeConn := startFakeTarget(t, "prompted-secret")
+	orig := dialNet
+	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	t.Cleanup(func() { dialNet = orig })
+
+	sink := evidence.NewMemSink()
+	s := &Server{sink: sink, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	token := s.stashTargetSecret(credential.New([]byte("prompted-secret")))
+	client, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
+		policy.Decision{CredentialMode: "prompt"}, "db1.lab.local", 22, token)
+	if err != nil {
+		t.Fatalf("dialTarget: %v", err)
+	}
+	defer client.Close()
+
+	e := singleCredentialEvent(t, sink)
+	if e.CredentialMode != "prompt" || e.Outcome != string(credential.OutcomePrompt) {
+		t.Fatalf("credential event = %+v, want CredentialMode=prompt Outcome=%s", e, credential.OutcomePrompt)
+	}
+	if e.Allow == nil || !*e.Allow {
+		t.Fatalf("credential event Allow = %v, want true", e.Allow)
+	}
+	assertNoSecretLeak(t, e, "prompted-secret")
+}
+
+// fakeAgentForwardConn is a minimal ssh.Conn stub whose OpenChannel returns a
+// channel wired to a REAL in-memory SSH agent
+// (golang.org/x/crypto/ssh/agent), so TestDialTarget_PassthroughEmitsCredentialEvidence
+// can exercise dialTarget's passthrough case (and the forwardedAgentSigners
+// call inside it) against a genuine agent-protocol conversation end to end —
+// unlike agentfwd_test.go's fakeConn, which only covers the fail-closed path
+// (see its comment on why a real success case needs a live channel).
+type fakeAgentForwardConn struct {
+	ssh.Conn
+	channel ssh.Channel
+}
+
+func (f *fakeAgentForwardConn) OpenChannel(name string, data []byte) (ssh.Channel, <-chan *ssh.Request, error) {
+	if name != agentForwardChannelType {
+		return nil, nil, fmt.Errorf("unexpected channel type: %s", name)
+	}
+	return f.channel, make(chan *ssh.Request), nil
+}
+
+// startFakeTargetNoAuth is like startFakeTarget but accepts ANY auth (or
+// none), so a test can dial it using whatever ssh.ClientConfig.Auth
+// dialTarget's passthrough case actually built (real signers from a forwarded
+// agent) without also having to configure the fake target to recognize that
+// specific key.
+func startFakeTargetNoAuth(t *testing.T) net.Conn {
+	t.Helper()
+	cfg := &ssh.ServerConfig{NoClientAuth: true}
+	cfg.AddHostKey(testHostKey(t))
+
+	clientConn, serverConn := fakeTargetPipe(t)
+	t.Cleanup(func() { clientConn.Close(); serverConn.Close() })
+	go func() {
+		sconn, chans, reqs, err := ssh.NewServerConn(serverConn, cfg)
+		if err != nil {
+			return
+		}
+		defer sconn.Close()
+		go ssh.DiscardRequests(reqs)
+		for range chans {
+		}
+	}()
+	return clientConn
+}
+
+func TestDialTarget_PassthroughEmitsCredentialEvidence(t *testing.T) {
+	// A real in-memory ssh-agent, seeded with one generated key, standing in
+	// for the client's local `ssh-agent` that `ssh -A` would forward.
+	keyring := agent.NewKeyring()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	if err := keyring.Add(agent.AddedKey{PrivateKey: priv}); err != nil {
+		t.Fatalf("keyring.Add: %v", err)
+	}
+	agentSide, channelSide := net.Pipe()
+	t.Cleanup(func() { agentSide.Close(); channelSide.Close() })
+	go agent.ServeAgent(keyring, agentSide)
+
+	fakeConn := startFakeTargetNoAuth(t)
+	orig := dialNet
+	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	t.Cleanup(func() { dialNet = orig })
+
+	sink := evidence.NewMemSink()
+	s := &Server{sink: sink, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	sconn := &fakeAgentForwardConn{channel: &fakeChannel{Reader: channelSide, Writer: channelSide}}
+
+	client, err := s.dialTarget(context.Background(), sconn, policy.Principal{User: "alice"}, "10.0.0.1",
+		policy.Decision{CredentialMode: "passthrough"}, "db1.lab.local", 22, "")
+	if err != nil {
+		t.Fatalf("dialTarget: %v", err)
+	}
+	defer client.Close()
+
+	e := singleCredentialEvent(t, sink)
+	if e.CredentialMode != "passthrough" || e.Outcome != string(credential.OutcomePassthrough) {
+		t.Fatalf("credential event = %+v, want CredentialMode=passthrough Outcome=%s", e, credential.OutcomePassthrough)
+	}
+	if e.Allow == nil || !*e.Allow {
+		t.Fatalf("credential event Allow = %v, want true", e.Allow)
+	}
+}
+
+func TestDialTarget_DenyEmitsCredentialEvidence(t *testing.T) {
+	sink := evidence.NewMemSink()
+	s := &Server{sink: sink, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
+		policy.Decision{CredentialMode: "deny"}, "db1.lab.local", 22, "")
+	if !errors.Is(err, credential.ErrDenied) {
+		t.Fatalf("want ErrDenied, got %v", err)
+	}
+
+	e := singleCredentialEvent(t, sink)
+	if e.CredentialMode != "deny" || e.Outcome != string(credential.OutcomeDenied) {
+		t.Fatalf("credential event = %+v, want CredentialMode=deny Outcome=%s", e, credential.OutcomeDenied)
+	}
+	if e.Allow == nil || *e.Allow {
+		t.Fatalf("credential event Allow = %v, want false", e.Allow)
+	}
+}
+
+// TestDialTarget_InjectFailClosedEmitsCredentialEvidence proves a fail-closed
+// refusal (not just deny) also produces exactly one TypeCredential event,
+// with Outcome reflecting the refusal.
+func TestDialTarget_InjectFailClosedEmitsCredentialEvidence(t *testing.T) {
+	sink := evidence.NewMemSink()
+	s := &Server{sink: sink, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production; s.cred is nil
+	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
+		policy.Decision{CredentialMode: "inject"}, "db1.lab.local", 22, "")
+	if !errors.Is(err, credential.ErrFailClosed) {
+		t.Fatalf("want ErrFailClosed, got %v", err)
+	}
+
+	e := singleCredentialEvent(t, sink)
+	if e.CredentialMode != "inject" || e.Outcome != "fail_closed" {
+		t.Fatalf("credential event = %+v, want CredentialMode=inject Outcome=fail_closed", e)
+	}
+	if e.Allow == nil || *e.Allow {
+		t.Fatalf("credential event Allow = %v, want false", e.Allow)
+	}
 }
