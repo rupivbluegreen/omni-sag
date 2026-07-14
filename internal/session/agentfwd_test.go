@@ -26,8 +26,11 @@ func (f *fakeConn) OpenChannel(name string, data []byte) (ssh.Channel, <-chan *s
 
 func TestForwardedAgentSigners_NoForwardingFailsClosed(t *testing.T) {
 	s := &Server{}
-	_, err := s.forwardedAgentSigners(&fakeConn{openErr: errors.New("channel open failed")})
+	_, closer, err := s.forwardedAgentSigners(&fakeConn{openErr: errors.New("channel open failed")})
 	if err == nil {
 		t.Fatal("want an error when the client never forwarded an agent, got nil")
+	}
+	if closer != nil {
+		t.Fatal("want a nil closer on failure; a non-nil closer would leak/mislead the caller")
 	}
 }
