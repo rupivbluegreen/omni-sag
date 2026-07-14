@@ -41,7 +41,7 @@ Modified files:
 - `internal/session/interactive.go` — `handleSession`/`runRecordedShell` bridge to a real target PTY
 - `internal/session/sftp.go` — `runSFTP`/`Filewrite`/`Fileread` use a real `*sftp.Client`; upload `Close()` blocks on quarantine-release approval
 - `internal/inspectgate/gate.go` — `inspectSmall`/`inspectLarge` persist to `Quarantine` unconditionally, not only on block
-- `cmd/omni-sag/main.go` — share one CyberArk provider between dialer and session, wire `session.WithApprovals`/`WithCredentialProvider`/`WithTargetKnownHosts`
+- `cmd/omni-sag/main.go` — share one CyberArk provider between dialer and session, wire `session.WithApprovals`/`WithCredentialProvider`/`WithTargetHostKeyCallback`/`WithInsecureTargetHostKey`
 - `deploy/compose/docker-compose.yml` — new `ssh-target` service
 - `deploy/compose/config.example.yaml` — a real `Rule` with `target_user`/`credential: inject` pointing at it
 - `docs/decisions/0002-credential-injection-threat-model.md` — update "the stand-in boundary" section
@@ -1154,13 +1154,18 @@ func (s *Server) dialTarget(ctx context.Context, sconn ssh.Conn, pr policy.Princ
 	if targetUser == "" {
 		targetUser = pr.User
 	}
-	hostKeyCB := s.targetHostKeyCB
-	if hostKeyCB == nil {
-		hostKeyCB = ssh.InsecureIgnoreHostKey() // dev-lab default; see WithTargetKnownHosts
+	if s.targetHostKeyCB == nil {
+		// Fail closed: no silent insecure default (a security review of this
+		// plan flagged the earlier draft's InsecureIgnoreHostKey()-on-nil
+		// fallback as exactly the silent-downgrade pattern FR-18 exists to
+		// prevent elsewhere in this codebase). An operator who genuinely wants
+		// the dev-lab-insecure posture must opt in explicitly via
+		// WithInsecureTargetHostKey() — see Step 5's config wiring.
+		return nil, fmt.Errorf("%w: no target host-key callback configured (set target_known_hosts, or target_insecure_host_key for dev-lab)", credential.ErrFailClosed)
 	}
 	cfg := &ssh.ClientConfig{
 		User:            targetUser,
-		HostKeyCallback: hostKeyCB,
+		HostKeyCallback: s.targetHostKeyCB,
 		Timeout:         10 * time.Second,
 	}
 
@@ -1335,46 +1340,65 @@ with:
 Run: `go test ./internal/session/... -run TestDialTarget -v 2>&1 | tail -60`
 Expected: PASS (all five: Deny, InjectNoProviderFailsClosed, PromptNoStashedSecretFailsClosed, InjectSucceeds, PromptSucceeds)
 
-- [ ] **Step 5: Add `targetHostKeyCB` field, `WithTargetKnownHosts` option, and config plumbing**
+- [ ] **Step 5: Add `targetHostKeyCB` field, two host-key options (verified + explicit-insecure-opt-in), and config plumbing**
+
+**Correction (post-review, security):** the original draft of this step defaulted a nil `targetHostKeyCB` to `ssh.InsecureIgnoreHostKey()` inside `dialTarget` itself. A security review flagged this as a silent-downgrade pattern — exactly what FR-18 exists to prevent elsewhere in this codebase — since an operator who simply forgot to configure host-key verification would get a working-but-insecure gateway with no indication anything was wrong beyond a log line. The corrected design (reflected in Step 3 above and here) fails closed: `dialTarget` refuses to dial when `targetHostKeyCB` is unset, and insecure mode requires a SEPARATE, explicit opt-in call.
 
 In `internal/session/session.go`, add to `Server`:
 
 ```go
-	targetHostKeyCB ssh.HostKeyCallback // verifies the target's host key on the second SSH leg; nil => InsecureIgnoreHostKey (dev default)
+	targetHostKeyCB ssh.HostKeyCallback // verifies the target's host key on the second SSH leg; nil => dialTarget fails closed (see WithTargetHostKeyCallback / WithInsecureTargetHostKey)
 ```
 
-Add an option:
+Add two options — one for the real, verified case, one for an explicit insecure opt-in:
 
 ```go
-// WithTargetKnownHosts verifies the real target's host key against path (an
-// OpenSSH known_hosts file) on the gateway's second SSH leg. Nil/unset means
-// InsecureIgnoreHostKey — acceptable for the dev lab, loudly logged by main()
-// as insecure, matching the project's existing ldap.insecure_tls precedent.
+// WithTargetHostKeyCallback verifies the real target's host key on the
+// gateway's second SSH leg using cb (typically built from an OpenSSH
+// known_hosts file via golang.org/x/crypto/ssh/knownhosts.New). This is the
+// production path.
 func WithTargetHostKeyCallback(cb ssh.HostKeyCallback) Option {
 	return func(s *Server) { s.targetHostKeyCB = cb }
+}
+
+// WithInsecureTargetHostKey disables target host-key verification entirely
+// (ssh.InsecureIgnoreHostKey()). This is a DELIBERATE, EXPLICIT opt-in for
+// the dev lab only — unlike the rest of this option, it cannot be reached by
+// simply leaving something unconfigured; a caller must name this function.
+// Never call this in a production wiring path.
+func WithInsecureTargetHostKey() Option {
+	return func(s *Server) { s.targetHostKeyCB = ssh.InsecureIgnoreHostKey() }
 }
 ```
 
 In `internal/config/config.go`, add to the top-level `File` struct:
 
 ```go
-	TargetKnownHosts string `yaml:"target_known_hosts"` // OpenSSH known_hosts path verifying real-target host keys; empty => insecure (dev only)
+	TargetKnownHosts       string `yaml:"target_known_hosts"`        // OpenSSH known_hosts path verifying real-target host keys
+	TargetInsecureHostKey  bool   `yaml:"target_insecure_host_key"`  // dev-lab only: explicitly disable target host-key verification; see WithInsecureTargetHostKey
 ```
 
 - [ ] **Step 6: Wire it in `cmd/omni-sag/main.go`**
 
-Near the other `session.With...` option construction:
+Near the other `session.With...` option construction. `target_known_hosts` and `target_insecure_host_key` are mutually exclusive — verified wins if both are somehow set, but treat that as a config mistake worth a loud log, not a silent precedence rule:
 
 ```go
-	if cfg.TargetKnownHosts != "" {
+	switch {
+	case cfg.TargetKnownHosts != "":
 		cb, err := knownhosts.New(cfg.TargetKnownHosts)
 		if err != nil {
 			return fmt.Errorf("target_known_hosts: %w", err)
 		}
 		opts = append(opts, session.WithTargetHostKeyCallback(cb))
 		log.Printf("omni-sag: real-target host keys verified against %s", cfg.TargetKnownHosts)
-	} else {
-		log.Printf("omni-sag: WARNING real-target host key verification is DISABLED (set target_known_hosts) — dev-lab only")
+		if cfg.TargetInsecureHostKey {
+			log.Printf("omni-sag: WARNING target_known_hosts and target_insecure_host_key are both set — verified mode wins, insecure flag ignored")
+		}
+	case cfg.TargetInsecureHostKey:
+		opts = append(opts, session.WithInsecureTargetHostKey())
+		log.Printf("omni-sag: WARNING real-target host key verification is DISABLED (target_insecure_host_key: true) — dev-lab only, never use in production")
+	default:
+		log.Printf("omni-sag: real-target host key verification is NOT configured — shell/SFTP sessions to real targets will fail closed until target_known_hosts or target_insecure_host_key (dev-lab only) is set")
 	}
 ```
 
