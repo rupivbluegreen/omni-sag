@@ -33,6 +33,17 @@ for p in dialer session sessions; do
   fi
 done
 
+echo "== internal/approval must be a leaf (no session/api/dialer/sessions) =="
+# The approval store is shared by the data path (dialer gate) and the control
+# plane (api). It must stay a leaf, or the data path would gain a control-plane
+# dependency (and dialer<->approval would cycle).
+for dep in session api dialer sessions; do
+  if go list -f '{{join .Imports "\n"}}' ./internal/approval/... 2>/dev/null | grep -q "${module}/internal/$dep"; then
+    echo "internal/approval imports internal/$dep (approval must stay a leaf)"
+    fail=1
+  fi
+done
+
 echo "== internal/policy must not import internal/session =="
 if go list -f '{{join .Imports "\n"}}' ./internal/policy/... 2>/dev/null | grep -q "${module}/internal/session"; then
   echo "internal/policy imports internal/session"

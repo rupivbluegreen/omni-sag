@@ -29,15 +29,70 @@ type entry struct {
 	terminate func() error
 }
 
-// Registry tracks live sessions. Safe for concurrent use.
+// Event is a live supervision event: a lightweight projection of what a session
+// is doing, streamed to attached supervisors. It carries no secret.
+type Event struct {
+	Time   time.Time `json:"time"`
+	Kind   string    `json:"kind"` // channel_open | channel_close | session_end | ...
+	Target string    `json:"target,omitempty"`
+	Detail string    `json:"detail,omitempty"`
+}
+
+// Registry tracks live sessions and fans out live supervision events. Safe for
+// concurrent use.
 type Registry struct {
 	mu      sync.RWMutex
 	entries map[string]*entry
+
+	submu   sync.Mutex
+	nextSub int
+	subs    map[string]map[int]chan Event // session id -> subscriber channels
 }
 
 // NewRegistry returns an empty registry.
 func NewRegistry() *Registry {
-	return &Registry{entries: map[string]*entry{}}
+	return &Registry{entries: map[string]*entry{}, subs: map[string]map[int]chan Event{}}
+}
+
+// Publish fans a supervision event out to every supervisor attached to id.
+// Non-blocking: a slow subscriber drops events rather than stalling the session.
+func (r *Registry) Publish(id string, ev Event) {
+	if ev.Time.IsZero() {
+		ev.Time = time.Now().UTC()
+	}
+	r.submu.Lock()
+	defer r.submu.Unlock()
+	for _, ch := range r.subs[id] {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// Subscribe attaches a supervisor to session id's live event stream. It returns
+// a channel of events and an unsubscribe func the caller must invoke.
+func (r *Registry) Subscribe(id string) (<-chan Event, func()) {
+	ch := make(chan Event, 64)
+	r.submu.Lock()
+	r.nextSub++
+	sub := r.nextSub
+	if r.subs[id] == nil {
+		r.subs[id] = map[int]chan Event{}
+	}
+	r.subs[id][sub] = ch
+	r.submu.Unlock()
+	return ch, func() {
+		r.submu.Lock()
+		if m := r.subs[id]; m != nil {
+			delete(m, sub)
+			if len(m) == 0 {
+				delete(r.subs, id)
+			}
+		}
+		r.submu.Unlock()
+		close(ch)
+	}
 }
 
 // Register adds a session and returns its id and a deregister func to call when

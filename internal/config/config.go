@@ -22,8 +22,24 @@ type File struct {
 	Inspection *InspectionConfig `yaml:"inspection"`    // optional SFTP content inspection (ICAP)
 	CyberArk   *CyberArkConfig   `yaml:"cyberark"`      // optional; required if any rule uses credential "inject"
 	API        *APIConfig        `yaml:"api"`           // optional control-plane API (out-of-band)
+	Approval   *ApprovalConfig   `yaml:"approval"`      // optional; required if any rule sets require_approval
 	PolicySrc  *PolicySource     `yaml:"policy_source"` // optional; hot-reload policy from a file
 	Policy     PolicyConfig      `yaml:"policy"`
+}
+
+// ApprovalConfig configures the durable four-eyes approval store.
+type ApprovalConfig struct {
+	StorePath  string `yaml:"store_path"`  // durable JSON file for approval requests
+	TTLSeconds int    `yaml:"ttl_seconds"` // pending-request lifetime (default 900)
+	UseCRD     bool   `yaml:"use_crd"`     // use the (stubbed) CRD store instead of the file store
+}
+
+// ApprovalTTL returns the configured TTL or the default.
+func (a *ApprovalConfig) ApprovalTTL() int {
+	if a == nil || a.TTLSeconds <= 0 {
+		return 900
+	}
+	return a.TTLSeconds
 }
 
 // APIConfig configures the control-plane API server. It runs on a listener
@@ -178,10 +194,11 @@ type RoleConfig struct {
 // "none" (default), "metadata-only", or "full". On "full" targets, port
 // forwarding (-L) is refused (PRD FR-10).
 type RuleConfig struct {
-	Host       string `yaml:"host"`
-	Ports      []int  `yaml:"ports"`
-	Record     string `yaml:"record"`
-	Credential string `yaml:"credential"` // inject | prompt | passthrough | deny (empty=passthrough)
+	Host            string `yaml:"host"`
+	Ports           []int  `yaml:"ports"`
+	Record          string `yaml:"record"`
+	Credential      string `yaml:"credential"`       // inject | prompt | passthrough | deny (empty=passthrough)
+	RequireApproval bool   `yaml:"require_approval"` // gate matching targets behind a four-eyes approval
 }
 
 // Load reads and parses the configuration file at path.
@@ -271,10 +288,14 @@ func (f *File) validate() error {
 		return err
 	}
 	usesInject := false
+	usesApproval := false
 	for _, r := range f.Policy.Roles {
 		for _, rule := range r.Allow {
 			if rule.Credential == "inject" {
 				usesInject = true
+			}
+			if rule.RequireApproval {
+				usesApproval = true
 			}
 		}
 	}
@@ -284,6 +305,14 @@ func (f *File) validate() error {
 		}
 		if f.CyberArk.BaseURL == "" || f.CyberArk.ClientCertPath == "" || f.CyberArk.ClientKeyPath == "" {
 			return fmt.Errorf("config: cyberark requires base_url, client_cert, and client_key for inject")
+		}
+	}
+	if usesApproval {
+		if f.Approval == nil {
+			return fmt.Errorf("config: a rule sets require_approval but no approval block is configured")
+		}
+		if !f.Approval.UseCRD && f.Approval.StorePath == "" {
+			return fmt.Errorf("config: approval requires store_path (or use_crd)")
 		}
 	}
 	return nil
@@ -352,10 +381,11 @@ func (f *File) CompilePolicy() policy.Policy {
 		rules := make([]policy.Rule, 0, len(rc.Allow))
 		for _, ru := range rc.Allow {
 			rules = append(rules, policy.Rule{
-				Host:       ru.Host,
-				Ports:      ru.Ports,
-				Record:     policy.RecordMode(ru.Record).Normalize(),
-				Credential: ru.Credential,
+				Host:            ru.Host,
+				Ports:           ru.Ports,
+				Record:          policy.RecordMode(ru.Record).Normalize(),
+				Credential:      ru.Credential,
+				RequireApproval: ru.RequireApproval,
 			})
 		}
 		roles = append(roles, policy.Role{Name: rc.Name, Groups: rc.Groups, Allow: rules})
