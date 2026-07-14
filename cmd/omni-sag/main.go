@@ -144,8 +144,11 @@ func run(cfgPath string) error {
 	// independent of the SSH data path: if it dies, SSH sessions keep running
 	// and new ones still connect.
 	if cfg.API != nil {
+		// Best-effort: the control plane is out-of-band, so a failure to start
+		// it (port in use, bad TLS material during a rotation) must NOT take
+		// down the SSH data path. Log and continue serving SSH.
 		if err := startAPIServer(ctx, cfg.API, reg, holder); err != nil {
-			return err
+			log.Printf("omni-sag: control-plane API did not start (SSH unaffected): %v", err)
 		}
 	}
 

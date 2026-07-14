@@ -267,26 +267,14 @@ func (f *File) validate() error {
 			return fmt.Errorf("config: mfa.radius requires server and secret")
 		}
 	}
+	if err := validatePolicyRoles(f.Policy.Roles); err != nil {
+		return err
+	}
 	usesInject := false
 	for _, r := range f.Policy.Roles {
-		if r.Name == "" {
-			return fmt.Errorf("config: role with empty name")
-		}
 		for _, rule := range r.Allow {
-			if rule.Host == "" {
-				return fmt.Errorf("config: role %q has a rule with empty host", r.Name)
-			}
-			switch rule.Record {
-			case "", "none", "metadata-only", "full":
-			default:
-				return fmt.Errorf("config: role %q rule for %q has invalid record %q (want none|metadata-only|full)", r.Name, rule.Host, rule.Record)
-			}
-			switch rule.Credential {
-			case "", "passthrough", "prompt", "deny":
-			case "inject":
+			if rule.Credential == "inject" {
 				usesInject = true
-			default:
-				return fmt.Errorf("config: role %q rule for %q has invalid credential %q (want inject|prompt|passthrough|deny)", r.Name, rule.Host, rule.Credential)
 			}
 		}
 	}
@@ -301,23 +289,61 @@ func (f *File) validate() error {
 	return nil
 }
 
+// validatePolicyRoles rejects semantically-invalid policy roles (empty name,
+// empty host, unknown record/credential). It is shared by boot-time validate()
+// and the hot-reload path so a parseable-but-invalid policy edit is rejected
+// (keeping the last good policy) rather than silently normalized — e.g. an
+// invalid record value must NOT downgrade to RecordNone and re-enable
+// forwarding on a full-recording target (FR-10).
+func validatePolicyRoles(roles []RoleConfig) error {
+	for _, r := range roles {
+		if r.Name == "" {
+			return fmt.Errorf("config: role with empty name")
+		}
+		for _, rule := range r.Allow {
+			if rule.Host == "" {
+				return fmt.Errorf("config: role %q has a rule with empty host", r.Name)
+			}
+			switch rule.Record {
+			case "", "none", "metadata-only", "full":
+			default:
+				return fmt.Errorf("config: role %q rule for %q has invalid record %q (want none|metadata-only|full)", r.Name, rule.Host, rule.Record)
+			}
+			switch rule.Credential {
+			case "", "passthrough", "prompt", "deny", "inject":
+			default:
+				return fmt.Errorf("config: role %q rule for %q has invalid credential %q (want inject|prompt|passthrough|deny)", r.Name, rule.Host, rule.Credential)
+			}
+		}
+	}
+	return nil
+}
+
+// CompilePolicyBytes parses, validates, and compiles the policy section of a
+// YAML document. The control-plane hot-reload path uses it so a bad edit is
+// rejected (last good policy stays in force) instead of silently applied.
+func CompilePolicyBytes(data []byte) (policy.Policy, error) {
+	var doc struct {
+		Policy PolicyConfig `yaml:"policy"`
+	}
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return policy.Policy{}, fmt.Errorf("parse policy: %w", err)
+	}
+	if err := validatePolicyRoles(doc.Policy.Roles); err != nil {
+		return policy.Policy{}, err
+	}
+	return (&File{Policy: doc.Policy}).CompilePolicy(), nil
+}
+
 // CompilePolicy builds the immutable policy.Policy from the config document.
-// LoadPolicyDoc reads only the policy section of a YAML document and compiles
-// it, without validating the rest of the gateway config. The control-plane
-// policy source uses it to hot-reload the policy from a file.
+// LoadPolicyDoc reads only the policy section of a YAML document, validates it,
+// and compiles it. The control-plane policy source uses it to hot-reload.
 func LoadPolicyDoc(path string) (policy.Policy, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return policy.Policy{}, fmt.Errorf("read policy %s: %w", path, err)
 	}
-	var doc struct {
-		Policy PolicyConfig `yaml:"policy"`
-	}
-	if err := yaml.Unmarshal(raw, &doc); err != nil {
-		return policy.Policy{}, fmt.Errorf("parse policy %s: %w", path, err)
-	}
-	f := &File{Policy: doc.Policy}
-	return f.CompilePolicy(), nil
+	return CompilePolicyBytes(raw)
 }
 
 func (f *File) CompilePolicy() policy.Policy {

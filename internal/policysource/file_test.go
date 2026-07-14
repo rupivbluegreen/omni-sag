@@ -75,6 +75,43 @@ func TestFileSource_LoadAndHotReload(t *testing.T) {
 	}
 }
 
+// A parseable-but-semantically-invalid edit (bad record value) must be rejected
+// on hot-reload, not silently normalized to RecordNone — which would unrecord a
+// full-recording target and re-enable -L forwarding (FR-10 fail-open).
+const polBadRecord = `
+policy:
+  roles:
+    - name: dba
+      groups: ["dba"]
+      allow:
+        - host: "db1.lab.local"
+          ports: [5432]
+          record: "Full"
+`
+
+func TestFileSource_InvalidRecordRejectedKeepsPrevious(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.yaml")
+	write(t, path, polV1, time.Now().Add(-time.Hour))
+
+	s := NewFileSource(path, 20*time.Millisecond)
+	if _, err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	changed := make(chan policy.Policy, 4)
+	go s.Watch(ctx, func(np policy.Policy) { changed <- np })
+
+	write(t, path, polBadRecord, time.Now())
+	select {
+	case <-changed:
+		t.Fatal("an invalid record value must not be applied (would fail-open FR-10)")
+	case <-time.After(500 * time.Millisecond):
+		// good: rejected, last good policy kept
+	}
+}
+
 func TestFileSource_BadEditKeepsPreviousPolicy(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "policy.yaml")
