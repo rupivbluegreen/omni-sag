@@ -31,6 +31,13 @@ func splitTargetUser(raw string) (loginUser, targetHost string, hasTarget bool) 
 	return raw[:i], raw[i+1:], true
 }
 
+// dialNet is the single dial seam for the target's second SSH leg. A package
+// variable solely so tests can substitute a fake transport (mirrors
+// internal/dialer's netDial pattern); production always uses net.DialTimeout.
+var dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) {
+	return net.DialTimeout(network, addr, timeout)
+}
+
 // dialTarget opens and authenticates the gateway's second SSH leg to the
 // target, per decision's credential mode. It never returns a client on deny
 // or on any auth failure — no downgrade to another mode (mirrors
@@ -103,7 +110,7 @@ func (s *Server) dialTarget(ctx context.Context, sconn ssh.Conn, pr policy.Princ
 	}
 
 	addr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
-	rawConn, err := net.DialTimeout("tcp", addr, cfg.Timeout)
+	rawConn, err := dialNet("tcp", addr, cfg.Timeout)
 	if err != nil {
 		return nil, fmt.Errorf("session: dial target %s: %w", addr, err)
 	}

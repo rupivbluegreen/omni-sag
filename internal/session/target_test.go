@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -52,7 +53,7 @@ func startFakeTarget(t *testing.T, wantPassword string) net.Conn {
 	}
 	cfg.AddHostKey(signer)
 
-	clientConn, serverConn := net.Pipe()
+	clientConn, serverConn := fakeTargetPipe(t)
 	t.Cleanup(func() { clientConn.Close(); serverConn.Close() })
 	go func() {
 		sconn, chans, reqs, err := ssh.NewServerConn(serverConn, cfg)
@@ -65,6 +66,34 @@ func startFakeTarget(t *testing.T, wantPassword string) net.Conn {
 		}
 	}()
 	return clientConn
+}
+
+// fakeTargetPipe returns a connected, buffered net.Conn pair over TCP
+// loopback. A raw net.Pipe() cannot be used here: it is fully synchronous
+// with zero internal buffering, and the SSH transport's version exchange has
+// BOTH sides write their identification line before reading the peer's —
+// over net.Pipe that deadlocks every single time (both ends block forever in
+// Write, since neither has called Read yet). This is a documented, known
+// issue: golang.org/x/crypto/ssh's own handshake_test.go has an identical
+// "netPipe" helper with the same comment ("net.Pipe deadlocks if both sides
+// start with a write"), for the exact same reason.
+func fakeTargetPipe(t *testing.T) (net.Conn, net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("fakeTargetPipe: listen: %v", err)
+	}
+	defer ln.Close()
+	c1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("fakeTargetPipe: dial: %v", err)
+	}
+	c2, err := ln.Accept()
+	if err != nil {
+		c1.Close()
+		t.Fatalf("fakeTargetPipe: accept: %v", err)
+	}
+	return c1, c2
 }
 
 func testHostKey(t *testing.T) ssh.Signer {
@@ -105,4 +134,46 @@ func TestDialTarget_PromptNoStashedSecretFailsClosed(t *testing.T) {
 	if !errors.Is(err, credential.ErrFailClosed) {
 		t.Fatalf("want ErrFailClosed, got %v", err)
 	}
+}
+
+func TestDialTarget_InjectSucceeds(t *testing.T) {
+	fakeConn := startFakeTarget(t, "injected-secret")
+	orig := dialNet
+	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	t.Cleanup(func() { dialNet = orig })
+
+	prov := credential.NewProvider(credential.Config{
+		Fetcher: fakeFetcher{secret: []byte("injected-secret")},
+		Query:   func(credential.Request) credential.Query { return credential.Query{} },
+	})
+	s := &Server{cred: prov}
+	client, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
+		policy.Decision{CredentialMode: "inject"}, "db1.lab.local", 22, "")
+	if err != nil {
+		t.Fatalf("dialTarget: %v", err)
+	}
+	defer client.Close()
+}
+
+func TestDialTarget_PromptSucceeds(t *testing.T) {
+	fakeConn := startFakeTarget(t, "prompted-secret")
+	orig := dialNet
+	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	t.Cleanup(func() { dialNet = orig })
+
+	s := &Server{}
+	token := s.stashTargetSecret(credential.New([]byte("prompted-secret")))
+	client, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"},
+		policy.Decision{CredentialMode: "prompt"}, "db1.lab.local", 22, token)
+	if err != nil {
+		t.Fatalf("dialTarget: %v", err)
+	}
+	defer client.Close()
+}
+
+// fakeFetcher implements credential.Fetcher for TestDialTarget_InjectSucceeds.
+type fakeFetcher struct{ secret []byte }
+
+func (f fakeFetcher) Fetch(_ context.Context, _ credential.Query) (*credential.Secret, error) {
+	return credential.New(append([]byte(nil), f.secret...)), nil
 }
