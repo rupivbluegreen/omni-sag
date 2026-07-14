@@ -3,6 +3,13 @@
 listen: ":2222"
 host_key: "hostkey.pem"
 
+# Real-target second SSH leg (shell/SFTP proxy to the ssh-target container
+# below): dev-lab only, no target_known_hosts file exists in this lab, so
+# host-key verification for that second leg is explicitly disabled. Without
+# EITHER this or target_known_hosts, dialTarget fails closed and the
+# Real-target demo rule below can never succeed. Never set this in production.
+target_insecure_host_key: true
+
 ldap:
   url: "ldaps://127.0.0.1:636"
   base_dn: "DC=lab,DC=local"

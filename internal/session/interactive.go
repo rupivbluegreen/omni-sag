@@ -172,10 +172,17 @@ func (s *Server) runRecordedShell(ctx context.Context, channel ssh.Channel, cols
 
 	decision := policy.Decision{}
 	if s.dialerPeek != nil {
-		decision = s.dialerPeek(pr, policy.Target{Host: targetHost})
+		decision = s.dialerPeek(pr, targetHost)
+	}
+	// decision.Port is DecideHost's resolved real-target port (the client's
+	// auth username carries no port at all — see its doc comment); fall back
+	// to 22 if unset (e.g. a test double that doesn't populate it).
+	targetPort := decision.Port
+	if targetPort <= 0 {
+		targetPort = 22
 	}
 	targetClient, err := tch.getOrDial(func() (*ssh.Client, error) {
-		return s.dialTarget(ctx, sconn, pr, decision, targetHost, 22, pr.TargetSecretToken)
+		return s.dialTarget(ctx, sconn, pr, decision, targetHost, targetPort, pr.TargetSecretToken)
 	})
 	if err != nil {
 		_, _ = channel.Write([]byte(fmt.Sprintf("session refused: %s\r\n", err)))

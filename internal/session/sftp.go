@@ -55,10 +55,17 @@ func (s *Server) runSFTP(ctx, connCtx context.Context, channel ssh.Channel, pr p
 	}
 	decision := policy.Decision{}
 	if s.dialerPeek != nil {
-		decision = s.dialerPeek(pr, policy.Target{Host: pr.TargetHost})
+		decision = s.dialerPeek(pr, pr.TargetHost)
+	}
+	// decision.Port is DecideHost's resolved real-target port (the client's
+	// auth username carries no port at all — see its doc comment); fall back
+	// to 22 if unset (e.g. a test double that doesn't populate it).
+	targetPort := decision.Port
+	if targetPort <= 0 {
+		targetPort = 22
 	}
 	targetClient, err := tch.getOrDial(func() (*ssh.Client, error) {
-		return s.dialTarget(ctx, sconn, pr, decision, pr.TargetHost, 22, pr.TargetSecretToken)
+		return s.dialTarget(ctx, sconn, pr, decision, pr.TargetHost, targetPort, pr.TargetSecretToken)
 	})
 	if err != nil {
 		_ = channel.Close()

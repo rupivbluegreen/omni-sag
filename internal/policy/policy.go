@@ -99,6 +99,12 @@ type Decision struct {
 	CredentialMode  string     // credential posture of the matched target (empty on deny)
 	RequireApproval bool       // matched target requires a four-eyes approval
 	TargetUser      string     // account to use on the target; empty => same as login user
+	// Port is the real second-SSH-leg port to dial for the gateway's
+	// shell/SFTP proxy to a real target (see DecideHost's doc comment for why
+	// this can only be resolved AFTER matching, unlike the -L forwarding
+	// path's Target.Port, which the client always supplies up front). Zero on
+	// deny or when Decide (not DecideHost) produced this Decision.
+	Port int
 }
 
 // ForwardingAllowed reports whether port-forwarding (-L) is permitted for this
@@ -164,6 +170,57 @@ func (p Policy) Decide(pr Principal, t Target) Decision {
 		}
 	}
 	return Decision{Allow: false, RecordMode: RecordNone, Reason: fmt.Sprintf("no rule in roles %s permits %s", roleNames(roles), t)}
+}
+
+// matchesHost reports whether r's host pattern matches host, ignoring ports
+// entirely. Used by DecideHost, never by Decide/matches (the -L forwarding
+// path must still enforce ports exactly).
+func (r Rule) matchesHost(host string) bool {
+	return r.Host == "*" || strings.EqualFold(r.Host, host)
+}
+
+// DecideHost is Decide's host-only counterpart for the gateway's real-target
+// second SSH leg (interactive shell / SFTP over a "session" channel). Unlike
+// -L forwarding — where the client's direct-tcpip request always carries a
+// real destination port, so Decide/Target.Port/Rule.matches can enforce it
+// exactly — the real-target flow's client auth username encodes only
+// "user%host" (splitTargetUser), never a port. There is therefore no port to
+// match against until AFTER a rule is chosen, which is exactly what this
+// method resolves: it matches by host alone, then reports the matched rule's
+// intended real-target port via Decision.Port.
+//
+// A rule for this flow is expected to name exactly one port (its real
+// target's actual SSH port); Decision.Port is set from that single entry. A
+// rule with zero or more than one configured port is a known ambiguity for
+// this call (mirrors the pre-existing limitation noted where this is called
+// from) — Decision.Port falls back to 22 in that case rather than guessing.
+func (p Policy) DecideHost(pr Principal, host string) Decision {
+	roles := p.rolesFor(pr)
+	if len(roles) == 0 {
+		return Decision{Allow: false, RecordMode: RecordNone, Reason: "no role: principal holds no role granting any access"}
+	}
+	for _, r := range roles {
+		for _, rule := range r.Allow {
+			if !rule.matchesHost(host) {
+				continue
+			}
+			port := 22
+			if len(rule.Ports) == 1 {
+				port = rule.Ports[0]
+			}
+			return Decision{
+				Allow:           true,
+				Reason:          "allowed by role " + r.Name,
+				MatchedRole:     r.Name,
+				RecordMode:      rule.Record.Normalize(),
+				CredentialMode:  rule.Credential,
+				RequireApproval: rule.RequireApproval,
+				TargetUser:      rule.TargetUser,
+				Port:            port,
+			}
+		}
+	}
+	return Decision{Allow: false, RecordMode: RecordNone, Reason: fmt.Sprintf("no rule in roles %s permits host %s", roleNames(roles), host)}
 }
 
 func roleNames(roles []Role) string {

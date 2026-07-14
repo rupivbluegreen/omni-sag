@@ -180,7 +180,7 @@ func wireFakeSFTPTarget(t *testing.T, files map[string][]byte) (targetHost strin
 	})
 	return "fake-sftp-target.lab.local", []Option{
 		WithCredentialProvider(prov),
-		WithDialerPeek(func(policy.Principal, policy.Target) policy.Decision {
+		WithDialerPeek(func(policy.Principal, string) policy.Decision {
 			return policy.Decision{Allow: true, CredentialMode: "inject"}
 		}),
 		WithInsecureTargetHostKey(),

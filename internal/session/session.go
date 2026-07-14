@@ -74,8 +74,8 @@ type Server struct {
 	handshakeTimeout time.Duration
 	sem              chan struct{} // bounds concurrent in-flight handshakes
 
-	pendingSecrets sync.Map                                                        // token(string) -> *credential.Secret; prompt-mode target passwords awaiting first use
-	dialerPeek     func(pr policy.Principal, target policy.Target) policy.Decision // non-dialing decision lookup; nil disables prompt-mode chaining
+	pendingSecrets sync.Map                                               // token(string) -> *credential.Secret; prompt-mode target passwords awaiting first use
+	dialerPeek     func(pr policy.Principal, host string) policy.Decision // non-dialing, host-only decision lookup (typically (*dialer.Dialer).PeekHost); nil disables prompt-mode chaining
 
 	targetHostKeyCB ssh.HostKeyCallback // verifies the target's host key on the second SSH leg; nil => dialTarget fails closed (see WithTargetHostKeyCallback / WithInsecureTargetHostKey)
 
@@ -128,12 +128,16 @@ func WithCredentialProvider(p *credential.Provider) Option {
 	return func(s *Server) { s.cred = p }
 }
 
-// WithDialerPeek supplies a non-dialing policy-decision lookup (typically
-// (*dialer.Dialer).Peek), used at auth time to decide whether a prompt-mode
-// target needs a keyboard-interactive round before the connection is fully
-// authenticated. Nil (the default) disables prompt-mode entirely — such a
-// target's channels later fail closed in dialTarget (Task 7).
-func WithDialerPeek(peek func(pr policy.Principal, target policy.Target) policy.Decision) Option {
+// WithDialerPeek supplies a non-dialing, host-only policy-decision lookup
+// (typically (*dialer.Dialer).PeekHost), used at auth time to decide whether
+// a prompt-mode target needs a keyboard-interactive round before the
+// connection is fully authenticated, and later (interactive.go/sftp.go) to
+// resolve the real target's port for the gateway's second SSH leg. It is
+// host-only, not Target-based, because the client's auth username
+// ("user%host") never carries a port — see policy.Policy.DecideHost's doc
+// comment. Nil (the default) disables prompt-mode entirely — such a target's
+// channels later fail closed in dialTarget (Task 7).
+func WithDialerPeek(peek func(pr policy.Principal, host string) policy.Decision) Option {
 	return func(s *Server) { s.dialerPeek = peek }
 }
 
@@ -294,14 +298,12 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		s.bfLimiter.RecordSuccess(srcIP)
 
 		if hasTarget && s.dialerPeek != nil {
-			// Port is intentionally omitted: Peek here only inspects
-			// CredentialMode, which today's Rule.matches distinguishes only by
-			// Host in the demo config. A deployment with multiple rules for the
-			// same host differing only by port is a known limitation; a
-			// follow-up could carry the target port from the client's first
-			// channel-open request instead of guessing it here (out of scope
-			// for this plan).
-			decision := s.dialerPeek(policy.Principal{User: id.User, Groups: id.Groups}, policy.Target{Host: targetHost})
+			// Host-only lookup: the client's auth username ("user%host") never
+			// carries a port, so this uses DecideHost (via dialerPeek), not
+			// Decide — see policy.Policy.DecideHost's doc comment. Only
+			// CredentialMode is consulted here; the resolved Decision.Port is
+			// used later, by interactive.go/sftp.go, to dial the real target.
+			decision := s.dialerPeek(policy.Principal{User: id.User, Groups: id.Groups}, targetHost)
 			if credential.Mode(decision.CredentialMode).Normalize() == credential.ModePrompt {
 				groups := strings.Join(id.Groups, groupSep)
 				return nil, &ssh.PartialSuccessError{Next: ssh.ServerAuthCallbacks{

@@ -210,7 +210,7 @@ func wireFakeTarget(t *testing.T, wantPassword string, resizeObserved chan<- [2]
 	})
 	return "fake-target.lab.local", []Option{
 		WithCredentialProvider(prov),
-		WithDialerPeek(func(policy.Principal, policy.Target) policy.Decision {
+		WithDialerPeek(func(policy.Principal, string) policy.Decision {
 			return policy.Decision{Allow: true, CredentialMode: "inject"}
 		}),
 		WithInsecureTargetHostKey(),

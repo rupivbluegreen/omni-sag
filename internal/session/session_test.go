@@ -283,7 +283,7 @@ func TestPasswordCallback_PromptModeChainsKeyboardInteractive(t *testing.T) {
 	s := &Server{
 		bfLimiter: ratelimit.New(ratelimit.DefaultConfig()),
 		sink:      noopSink{},
-		dialerPeek: func(pr policy.Principal, target policy.Target) policy.Decision {
+		dialerPeek: func(pr policy.Principal, host string) policy.Decision {
 			return policy.Decision{Allow: true, CredentialMode: "prompt", MatchedRole: "dba"}
 		},
 	}

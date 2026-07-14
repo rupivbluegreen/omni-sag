@@ -181,7 +181,7 @@ func TestHandleSession_PtyReqAfterShellDoesNotRace(t *testing.T) {
 // connection.
 func TestHandleSession_ShellPanicIsContained(t *testing.T) {
 	var calls int32
-	peek := func(policy.Principal, policy.Target) policy.Decision {
+	peek := func(policy.Principal, string) policy.Decision {
 		if atomic.AddInt32(&calls, 1) >= 2 {
 			panic("boom: injected panic for TestHandleSession_ShellPanicIsContained")
 		}

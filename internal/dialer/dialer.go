@@ -220,6 +220,13 @@ func (d *Dialer) Peek(pr policy.Principal, target policy.Target) policy.Decision
 	return d.currentPolicy().Decide(pr, target)
 }
 
+// PeekHost is Peek's host-only counterpart, used by the gateway's real-target
+// shell/SFTP flow — see policy.Policy.DecideHost's doc comment for why no
+// port is available at these call sites.
+func (d *Dialer) PeekHost(pr policy.Principal, host string) policy.Decision {
+	return d.currentPolicy().DecideHost(pr, host)
+}
+
 // gateApproval blocks the session until a four-eyes approval for this target is
 // granted. It fails closed: with no store configured, or on denial, expiry, or
 // cancellation, it returns ErrApprovalRefused and no socket is opened. Both the
