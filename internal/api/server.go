@@ -141,10 +141,11 @@ func (s *Server) getPolicy(w http.ResponseWriter, _ *http.Request) {
 // --- policy view DTOs (match openapi.yaml) ---
 
 type RuleView struct {
-	Host       string `json:"host"`
-	Ports      []int  `json:"ports,omitempty"`
-	Record     string `json:"record,omitempty"`
-	Credential string `json:"credential,omitempty"`
+	Host            string `json:"host"`
+	Ports           []int  `json:"ports,omitempty"`
+	Record          string `json:"record,omitempty"`
+	Credential      string `json:"credential,omitempty"`
+	RequireApproval bool   `json:"require_approval,omitempty"`
 }
 
 type RoleView struct {
@@ -157,7 +158,12 @@ type PolicyView struct {
 	Roles []RoleView `json:"roles"`
 }
 
-func policyView(p policy.Policy) PolicyView {
+func policyView(p policy.Policy) PolicyView { return PolicyToView(p) }
+
+// PolicyToView converts a compiled policy to its API view. Exported so the
+// omnictl rule-trace can round-trip the view back to a policy and evaluate it
+// with policy.Decide, keeping the explanation consistent with real decisions.
+func PolicyToView(p policy.Policy) PolicyView {
 	pv := PolicyView{Roles: make([]RoleView, 0, len(p.Roles))}
 	for _, r := range p.Roles {
 		rv := RoleView{Name: r.Name, Groups: r.Groups}
@@ -165,6 +171,7 @@ func policyView(p policy.Policy) PolicyView {
 			rv.Allow = append(rv.Allow, RuleView{
 				Host: rule.Host, Ports: rule.Ports,
 				Record: string(rule.Record), Credential: rule.Credential,
+				RequireApproval: rule.RequireApproval,
 			})
 		}
 		pv.Roles = append(pv.Roles, rv)

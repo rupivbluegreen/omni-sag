@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -111,4 +112,51 @@ func (c *Client) DenyApproval(ctx context.Context, id string) (approval.Request,
 	var req approval.Request
 	err := c.do(ctx, http.MethodPost, "/api/v1/approvals/"+id+"/deny", &req)
 	return req, err
+}
+
+// StreamSession opens the live supervision SSE stream for a session and pushes
+// each event to the returned channel until ctx is cancelled or the stream ends.
+// The channel is closed when the stream terminates.
+func (c *Client) StreamSession(ctx context.Context, id string) (<-chan sessions.Event, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/sessions/"+id+"/stream", nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("api stream %s: %s: %s", id, resp.Status, strings.TrimSpace(string(body)))
+	}
+	out := make(chan sessions.Event)
+	go func() {
+		defer close(out)
+		defer resp.Body.Close()
+		sc := bufio.NewScanner(resp.Body)
+		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+		for sc.Scan() {
+			line := sc.Text()
+			data, ok := strings.CutPrefix(line, "data: ")
+			if !ok {
+				continue // comment/keepalive line
+			}
+			var ev sessions.Event
+			if json.Unmarshal([]byte(data), &ev) != nil {
+				continue
+			}
+			select {
+			case out <- ev:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out, nil
 }

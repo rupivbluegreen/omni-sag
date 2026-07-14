@@ -9,8 +9,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/rupivbluegreen/omni-sag/internal/api"
+	"github.com/rupivbluegreen/omni-sag/internal/tui"
 )
 
 func main() {
@@ -86,10 +89,52 @@ func dispatch(ctx context.Context, c *api.Client, args []string) error {
 		}
 		fmt.Println("ok")
 		return nil
+	case "trace":
+		// omnictl trace <user> <group,group,...> <host> <port>
+		if len(args) < 5 {
+			return fmt.Errorf("usage: omnictl trace <user> <group,group> <host> <port>")
+		}
+		pv, err := c.GetPolicy(ctx)
+		if err != nil {
+			return err
+		}
+		port, err := strconv.Atoi(args[4])
+		if err != nil {
+			return fmt.Errorf("bad port %q", args[4])
+		}
+		groups := strings.Split(args[2], ",")
+		ex := tui.Explain(pv, args[1], groups, args[3], port)
+		for _, l := range ex.Lines {
+			fmt.Println(l)
+		}
+		return nil
+	case "tui":
+		var opts tui.Options
+		if len(args) >= 3 && args[1] == "-play" {
+			cast, err := loadCast(args[2])
+			if err != nil {
+				return err
+			}
+			opts.Cast = cast
+		}
+		return tui.Run(ctx, c, opts)
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func loadCast(path string) (*tui.Cast, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	c, err := tui.ParseCast(f)
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
 }
 
 func printJSON(v any) error {
@@ -109,6 +154,8 @@ func usage() {
   approve <id>        approve a request (operator; four-eyes enforced)
   deny <id>           deny a request (operator)
   policy              show the compiled policy
+  trace <u> <g,..> <host> <port>  explain why a user can/can't reach a target
+  tui [-play <cast>]  interactive terminal UI (sessions/policy/approvals/replay)
   health              check the API`)
 }
 
