@@ -4,10 +4,10 @@ import "testing"
 
 func TestSplitTargetUser(t *testing.T) {
 	cases := []struct {
-		raw            string
-		wantUser       string
-		wantTarget     string
-		wantHasTarget  bool
+		raw           string
+		wantUser      string
+		wantTarget    string
+		wantHasTarget bool
 	}{
 		{"alice", "alice", "", false},
 		{"alice%db1.lab.local", "alice", "db1.lab.local", true},
