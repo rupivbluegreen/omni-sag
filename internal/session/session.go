@@ -23,6 +23,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
+	"github.com/rupivbluegreen/omni-sag/internal/ratelimit"
 	"github.com/rupivbluegreen/omni-sag/internal/recording"
 	"github.com/rupivbluegreen/omni-sag/internal/sessions"
 	"golang.org/x/crypto/ssh"
@@ -62,6 +63,7 @@ type Server struct {
 	recordStore      recording.Store    // optional; when set, interactive sessions are recorded
 	inspect          *inspectgate.Gate  // optional; when set, SFTP uploads are content-inspected
 	reg              *sessions.Registry // optional; when set, live sessions are registered for the API
+	bfLimiter        *ratelimit.Limiter // per-source-IP brute-force throttle (always set)
 	handshakeTimeout time.Duration
 	sem              chan struct{} // bounds concurrent in-flight handshakes
 
@@ -99,11 +101,23 @@ func WithInspection(g *inspectgate.Gate) Option {
 	return func(s *Server) { s.inspect = g }
 }
 
+// WithBruteForceLimiter overrides the default per-source-IP brute-force
+// throttle. Passing nil is ignored (the defense cannot be disabled); use this
+// only to tune the Config.
+func WithBruteForceLimiter(l *ratelimit.Limiter) Option {
+	return func(s *Server) {
+		if l != nil {
+			s.bfLimiter = l
+		}
+	}
+}
+
 // New builds an SSH server that authenticates with auth and forwards through d.
 func New(hostKey ssh.Signer, auth authn.Authenticator, d *dialer.Dialer, sink evidence.Sink, opts ...Option) *Server {
 	s := &Server{
 		dialer:           d,
 		sink:             sink,
+		bfLimiter:        ratelimit.New(ratelimit.DefaultConfig()),
 		handshakeTimeout: defaultHandshakeTimeout,
 		sem:              make(chan struct{}, maxInflightHandshakes),
 	}
@@ -131,14 +145,31 @@ func (s *Server) emit(e evidence.Event) {
 // connection's permissions for later authorization.
 func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error) {
 	return func(meta ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+		srcIP := hostOf(meta.RemoteAddr())
+
+		// Brute-force defense: if this source has already tripped the failure
+		// threshold, refuse before touching the authenticator (fail closed and
+		// avoid loading the DC with guesses). The lockout is per-source-IP and
+		// bounded, so it slows the guessing source without letting anyone lock a
+		// victim out permanently.
+		if ok, retry := s.bfLimiter.Allow(srcIP); !ok {
+			s.emit(evidence.Event{
+				Time: time.Now().UTC(), Type: evidence.TypeAuth,
+				User: meta.User(), SourceIP: srcIP,
+				Allow: evidence.BoolPtr(false), Reason: "rate limited: too many failed attempts",
+				Detail: fmt.Sprintf("locked out, retry after %s", retry.Round(time.Second)),
+			})
+			return nil, errors.New("authentication failed")
+		}
+
 		// Bound the authenticator so a stalled DC/RADIUS cannot park this
 		// handshake goroutine indefinitely.
 		ctx, cancel := context.WithTimeout(context.Background(), authTimeout)
 		defer cancel()
 
 		id, err := auth.Authenticate(ctx, meta.User(), string(password))
-		srcIP := hostOf(meta.RemoteAddr())
 		if err != nil {
+			s.bfLimiter.RecordFailure(srcIP)
 			s.emit(evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeAuth,
 				User: meta.User(), SourceIP: srcIP,
@@ -173,10 +204,16 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 				Allow: evidence.BoolPtr(allowed), Reason: reason,
 			})
 			if !allowed {
+				// A rejected second factor is still a failed login attempt from
+				// this source and counts toward the brute-force threshold.
+				s.bfLimiter.RecordFailure(srcIP)
 				return nil, errors.New("authentication failed")
 			}
 		}
 
+		// Fully authenticated: clear any accumulated failure/lockout state so a
+		// legitimate user who mistyped is not penalized after a real success.
+		s.bfLimiter.RecordSuccess(srcIP)
 		return &ssh.Permissions{Extensions: map[string]string{
 			"user":   id.User,
 			"groups": strings.Join(id.Groups, groupSep),
