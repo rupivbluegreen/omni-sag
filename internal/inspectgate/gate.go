@@ -258,6 +258,13 @@ func (g *Gate) inspectLarge(ctx context.Context, meta inspect.TransferMeta, cont
 	return dec, nil
 }
 
+// QuarantineReader opens the quarantined object at key for reading — used to
+// deliver a released (approved) upload to its real target. Callers must
+// Close the returned reader.
+func (g *Gate) QuarantineReader(ctx context.Context, key string) (io.ReadCloser, error) {
+	return g.quarantine.Get(ctx, key)
+}
+
 // quarantineBytes writes buffered content to the WORM store and returns its key.
 func (g *Gate) quarantineBytes(ctx context.Context, meta inspect.TransferMeta, data []byte) (string, error) {
 	key := g.key("quarantine", meta)

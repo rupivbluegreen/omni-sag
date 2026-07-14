@@ -1,12 +1,20 @@
 package session
 
 import (
+	"context"
+	"io"
 	"net"
 	"path"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/rupivbluegreen/omni-sag/internal/approval"
+	"github.com/rupivbluegreen/omni-sag/internal/inspect"
+	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
 )
 
 // startFakeSFTPTarget runs an in-process SSH server that serves the "sftp"
@@ -160,6 +168,172 @@ func sshClientOver(t *testing.T, conn net.Conn) *ssh.Client {
 		t.Fatalf("ssh.NewClientConn: %v", err)
 	}
 	return ssh.NewClient(clientConn, chans, reqs)
+}
+
+// cleanInspector always returns a clean verdict, consuming the whole body —
+// used by the quarantine-release tests below, where the inspection verdict
+// itself is not what's under test (only what happens after a clean verdict).
+type cleanInspector struct{}
+
+func (cleanInspector) Inspect(_ context.Context, _ inspect.TransferMeta, body io.Reader) (inspect.Result, error) {
+	_, _ = io.Copy(io.Discard, body)
+	return inspect.Result{Verdict: inspect.VerdictClean, ICAPStatus: 204}, nil
+}
+
+// newFakeBlobStore is a small alias so the tests below read the way the task
+// brief describes them; memQuarantine (sftp_inspect_test.go, same package)
+// already implements inspectgate.BlobStore.
+func newFakeBlobStore() *memQuarantine { return newMemQuarantine() }
+
+// TestQuarantineWriteHandle_AutoDeniedWithNoApprovalStoreFailsClosed: even a
+// clean-verdict upload must never reach the target when there is no approval
+// store to release it from quarantine — fail closed, not fail open.
+func TestQuarantineWriteHandle_AutoDeniedWithNoApprovalStoreFailsClosed(t *testing.T) {
+	quar := newFakeBlobStore()
+	g, err := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	if err != nil {
+		t.Fatalf("inspectgate.New: %v", err)
+	}
+	fakeConn := startFakeSFTPTarget(t, nil)
+	targetClient, err := sftp.NewClient(sshClientOver(t, fakeConn))
+	if err != nil {
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+	defer targetClient.Close()
+
+	s := &Server{sink: noopSink{}, inspect: g} // s.approvals is nil
+	fs := &remoteFS{client: targetClient, gate: g, srv: s}
+	h, err := fs.Filewrite(&sftp.Request{Method: "Put", Filepath: "/upload.txt"})
+	if err != nil {
+		t.Fatalf("Filewrite: %v", err)
+	}
+	if _, err := h.WriteAt([]byte("clean content"), 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+	if err := h.(io.Closer).Close(); err == nil {
+		t.Fatal("Close must fail closed when inspection is enabled but no approval store is configured")
+	}
+	if _, err := targetClient.Open("/upload.txt"); err == nil {
+		t.Fatal("content must never reach the target when there is no approval store")
+	}
+}
+
+// TestQuarantineWriteHandle_ApprovedDeliversToTarget: a clean upload blocks on
+// Close() until a distinct human approves the KindQuarantineRelease request,
+// then (and only then) the quarantined bytes reach the real target file.
+func TestQuarantineWriteHandle_ApprovedDeliversToTarget(t *testing.T) {
+	quar := newFakeBlobStore()
+	g, err := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	if err != nil {
+		t.Fatalf("inspectgate.New: %v", err)
+	}
+	fakeConn := startFakeSFTPTarget(t, nil)
+	targetClient, err := sftp.NewClient(sshClientOver(t, fakeConn))
+	if err != nil {
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+	defer targetClient.Close()
+
+	store, err := approval.NewFileStore(filepath.Join(t.TempDir(), "approvals.json"))
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	s := &Server{sink: noopSink{}, inspect: g, approvals: store, approvalTTL: 5 * time.Second}
+	fs := &remoteFS{client: targetClient, gate: g, srv: s, user: "alice"}
+
+	h, err := fs.Filewrite(&sftp.Request{Method: "Put", Filepath: "/upload.txt"})
+	if err != nil {
+		t.Fatalf("Filewrite: %v", err)
+	}
+	if _, err := h.WriteAt([]byte("clean content"), 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- h.(io.Closer).Close() }()
+
+	// Poll for the pending request the way the TUI/API would, then approve it
+	// as a different user (four-eyes).
+	var reqID string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, r := range store.List() {
+			if r.Kind == approval.KindQuarantineRelease && r.Status == approval.StatusPending {
+				reqID = r.ID
+			}
+		}
+		if reqID != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if reqID == "" {
+		t.Fatal("no pending KindQuarantineRelease request was created")
+	}
+	if _, err := store.Approve(reqID, "bob"); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+
+	if err := <-closeErr; err != nil {
+		t.Fatalf("Close after approval: %v", err)
+	}
+	delivered, err := targetClient.Open("/upload.txt")
+	if err != nil {
+		t.Fatalf("target file was not delivered: %v", err)
+	}
+	got, _ := io.ReadAll(delivered)
+	if string(got) != "clean content" {
+		t.Fatalf("delivered content = %q, want %q", got, "clean content")
+	}
+}
+
+// TestQuarantineWriteHandle_DeniedNeverReachesTarget: a denied release must
+// error Close() and the content must never land on the target.
+func TestQuarantineWriteHandle_DeniedNeverReachesTarget(t *testing.T) {
+	quar := newFakeBlobStore()
+	g, err := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	if err != nil {
+		t.Fatalf("inspectgate.New: %v", err)
+	}
+	fakeConn := startFakeSFTPTarget(t, nil)
+	targetClient, err := sftp.NewClient(sshClientOver(t, fakeConn))
+	if err != nil {
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+	defer targetClient.Close()
+
+	store, _ := approval.NewFileStore(filepath.Join(t.TempDir(), "approvals.json"))
+	s := &Server{sink: noopSink{}, inspect: g, approvals: store, approvalTTL: 5 * time.Second}
+	fs := &remoteFS{client: targetClient, gate: g, srv: s, user: "alice"}
+
+	h, _ := fs.Filewrite(&sftp.Request{Method: "Put", Filepath: "/upload.txt"})
+	_, _ = h.WriteAt([]byte("clean content"), 0)
+
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- h.(io.Closer).Close() }()
+
+	var reqID string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && reqID == "" {
+		for _, r := range store.List() {
+			if r.Kind == approval.KindQuarantineRelease && r.Status == approval.StatusPending {
+				reqID = r.ID
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if reqID == "" {
+		t.Fatal("no pending request")
+	}
+	if _, err := store.Deny(reqID, "bob"); err != nil {
+		t.Fatalf("Deny: %v", err)
+	}
+	if err := <-closeErr; err == nil {
+		t.Fatal("Close must error when the release was denied")
+	}
+	if _, err := targetClient.Open("/upload.txt"); err == nil {
+		t.Fatal("denied content must never reach the target")
+	}
 }
 
 func TestRemoteFS_FilereadProxiesRealTarget(t *testing.T) {

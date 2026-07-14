@@ -13,6 +13,7 @@ import (
 
 	"github.com/pkg/sftp"
 
+	"github.com/rupivbluegreen/omni-sag/internal/approval"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/inspect"
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
@@ -178,11 +179,24 @@ func cleanPath(p string) string { return path.Clean("/" + p) }
 
 // remoteFS serves the SFTP subsystem by proxying to a real *sftp.Client
 // connected to the target, replacing the in-memory stand-in (memFS) for
-// reads. Uploads (Filewrite) are handled separately — see Task 11 — because
-// they must land in quarantine first, not straight through to client.
+// reads and (as of Task 11) writes. A clean-verdict upload does not deliver
+// to the target immediately — Filewrite's returned handle blocks on Close()
+// until a human approves its release from quarantine.
 type remoteFS struct {
 	client *sftp.Client
-	gate   *inspectgate.Gate // set when inspection is configured; used by Filewrite (Task 11)
+	gate   *inspectgate.Gate // set when inspection is configured; used by Filewrite
+	srv    *Server           // for approvals/evidence; nil only in Task 9's read-only tests
+	user   string
+	ctx    context.Context
+}
+
+// ctxOrBackground returns fs.ctx, falling back to context.Background() for
+// tests that construct a remoteFS directly without one.
+func (fs *remoteFS) ctxOrBackground() context.Context {
+	if fs.ctx != nil {
+		return fs.ctx
+	}
+	return context.Background()
 }
 
 // Fileread (FileGet) proxies directly from the real target file — downloads
@@ -231,6 +245,110 @@ func (fs *remoteFS) Filecmd(r *sftp.Request) error {
 	case "Setstat", "Symlink":
 		return nil // no-ops, matching the prior in-memory stand-in's scope
 	}
+	return nil
+}
+
+// Filewrite (FilePut): every upload streams through inspection exactly as
+// memFS's inspectUpload already did (that machinery is unchanged — see
+// newInspectUpload in this file), but Close no longer decides delivery by
+// verdict alone. A clean upload is quarantined (Task 10 made that
+// unconditional) and then requires a KindQuarantineRelease approval before
+// the gateway delivers it to the real target file. Blocked/unscannable
+// content was already fail-closed before this task and still never creates
+// a release request.
+func (fs *remoteFS) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+	if fs.gate == nil {
+		// No inspection configured: deliver straight through, no quarantine
+		// step — matches the project's existing "inspection is opt-in"
+		// posture (session.WithInspection's doc comment).
+		f, err := fs.client.Create(cleanPath(r.Filepath))
+		if err != nil {
+			return nil, err
+		}
+		return f, nil
+	}
+	p := cleanPath(r.Filepath)
+	iu := newInspectUpload(fs.ctxOrBackground(), fs.gate, p)
+	return &quarantineWriteHandle{iu: iu, fs: fs, path: p}, nil
+}
+
+// quarantineWriteHandle wraps an inspectUpload (Task 10's now-unconditional
+// quarantine) and, on Close, blocks for a KindQuarantineRelease approval
+// before delivering the quarantined bytes to the real target file.
+type quarantineWriteHandle struct {
+	iu   *inspectUpload
+	fs   *remoteFS
+	path string
+}
+
+func (h *quarantineWriteHandle) WriteAt(p []byte, off int64) (int, error) {
+	return h.iu.WriteAt(p, off)
+}
+
+// Close blocks (potentially for a long time — up to the configured approval
+// TTL) waiting for a human to release the quarantined upload. It uses
+// fs.ctxOrBackground(), which in production is the SFTP session's context —
+// derived in runSFTP from a context that is cancelled both on gateway
+// shutdown AND when the client's underlying SSH connection goes away (see
+// runSFTP's sessCtx), so a client that disconnects mid-wait does not pin
+// this goroutine (and the approval request it is waiting on) for the full
+// TTL. See runSFTP for the derivation and why that matters.
+func (h *quarantineWriteHandle) Close() error {
+	if err := h.iu.Close(); err != nil {
+		return err // blocked/unscannable — already refused, no release request
+	}
+	dec := h.iu.dec
+	if h.fs.srv == nil || h.fs.srv.approvals == nil {
+		return fmt.Errorf("sftp: upload quarantined (key=%s) but no approval store is configured to release it", dec.QuarantineKey)
+	}
+	req, err := h.fs.srv.approvals.Create(approval.Request{
+		Kind:      approval.KindQuarantineRelease,
+		Requester: h.fs.user,
+		Subject:   dec.QuarantineKey,
+		Reason:    fmt.Sprintf("release %s to %s", dec.QuarantineKey, h.path),
+	}, h.fs.srv.approvalTTL)
+	if err != nil {
+		return fmt.Errorf("sftp: create release request: %w", err)
+	}
+	h.fs.srv.emit(evidence.Event{
+		Time: time.Now().UTC(), Type: evidence.TypeApproval,
+		User: h.fs.user, Target: h.path, ObjectKey: req.ID,
+		Outcome: "requested", Reason: "quarantine release pending",
+	})
+
+	final, werr := h.fs.srv.approvals.Wait(h.fs.ctxOrBackground(), req.ID)
+	approved := werr == nil && final.Approved(time.Now())
+	h.fs.srv.emit(evidence.Event{
+		Time: time.Now().UTC(), Type: evidence.TypeApproval,
+		User: h.fs.user, Target: h.path, ObjectKey: req.ID,
+		Allow:   evidence.BoolPtr(approved),
+		Outcome: map[bool]string{true: "granted", false: "refused"}[approved],
+		Reason:  "quarantine release " + string(final.EffectiveStatus(time.Now())),
+	})
+	if !approved {
+		return fmt.Errorf("sftp: upload to %s denied: quarantine release %s", h.path, final.EffectiveStatus(time.Now()))
+	}
+
+	src, err := h.fs.srv.inspect.QuarantineReader(h.fs.ctxOrBackground(), dec.QuarantineKey)
+	if err != nil {
+		return fmt.Errorf("sftp: read quarantined content %s: %w", dec.QuarantineKey, err)
+	}
+	defer src.Close()
+	dst, err := h.fs.client.Create(h.path)
+	if err != nil {
+		return fmt.Errorf("sftp: open target %s: %w", h.path, err)
+	}
+	defer dst.Close()
+	if _, err := io.Copy(dst, src); err != nil {
+		return fmt.Errorf("sftp: deliver %s to target: %w", h.path, err)
+	}
+
+	h.fs.srv.emit(evidence.Event{
+		Time: time.Now().UTC(), Type: evidence.TypeTransfer,
+		User: h.fs.user, Path: h.path, Direction: "upload",
+		Bytes: dec.Bytes, SHA256: dec.SHA256, ObjectKey: dec.QuarantineKey,
+		Detail: "sftp transfer (released from quarantine)",
+	})
 	return nil
 }
 

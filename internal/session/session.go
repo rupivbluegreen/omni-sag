@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rupivbluegreen/omni-sag/internal/approval"
 	"github.com/rupivbluegreen/omni-sag/internal/authn"
 	"github.com/rupivbluegreen/omni-sag/internal/credential"
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
@@ -68,6 +69,8 @@ type Server struct {
 	cred             *credential.Provider // optional; used to resolve inject-mode target credentials for real shell/SFTP sessions
 	reg              *sessions.Registry   // optional; when set, live sessions are registered for the API
 	bfLimiter        *ratelimit.Limiter   // per-source-IP brute-force throttle (always set)
+	approvals        approval.Store       // optional; required for SFTP uploads when inspection is enabled (quarantine-release gate)
+	approvalTTL      time.Duration
 	handshakeTimeout time.Duration
 	sem              chan struct{} // bounds concurrent in-flight handshakes
 
@@ -108,6 +111,14 @@ func WithRecording(store recording.Store) Option {
 // Nil (the default) disables inspection.
 func WithInspection(g *inspectgate.Gate) Option {
 	return func(s *Server) { s.inspect = g }
+}
+
+// WithApprovals gates SFTP uploads (when content inspection is enabled)
+// behind a KindQuarantineRelease four-eyes approval: the upload blocks on
+// Close() until a second human approves it, up to ttl. Mirrors
+// dialer.WithApprovals — same Store, same TUI/API queue, different Kind.
+func WithApprovals(store approval.Store, ttl time.Duration) Option {
+	return func(s *Server) { s.approvals = store; s.approvalTTL = ttl }
 }
 
 // WithCredentialProvider resolves inject-mode target credentials for the
