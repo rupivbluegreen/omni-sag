@@ -357,3 +357,14 @@ policy:
 		t.Fatal("require_approval flag should compile into the policy rule")
 	}
 }
+
+func TestCompilePolicy_TargetUser(t *testing.T) {
+	f := &File{Policy: PolicyConfig{Roles: []RoleConfig{{
+		Name: "dba", Groups: []string{"dba"},
+		Allow: []RuleConfig{{Host: "db1.lab.local", TargetUser: "svc_db1"}},
+	}}}}
+	p := f.CompilePolicy()
+	if got := p.Roles[0].Allow[0].TargetUser; got != "svc_db1" {
+		t.Fatalf("TargetUser = %q, want svc_db1", got)
+	}
+}

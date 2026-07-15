@@ -9,6 +9,8 @@ package session
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -18,7 +20,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rupivbluegreen/omni-sag/internal/approval"
 	"github.com/rupivbluegreen/omni-sag/internal/authn"
+	"github.com/rupivbluegreen/omni-sag/internal/credential"
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
@@ -59,13 +63,21 @@ type Server struct {
 	sshCfg           *ssh.ServerConfig
 	dialer           *dialer.Dialer
 	sink             evidence.Sink
-	mfa              authn.MFAProvider  // optional second factor; nil disables MFA
-	recordStore      recording.Store    // optional; when set, interactive sessions are recorded
-	inspect          *inspectgate.Gate  // optional; when set, SFTP uploads are content-inspected
-	reg              *sessions.Registry // optional; when set, live sessions are registered for the API
-	bfLimiter        *ratelimit.Limiter // per-source-IP brute-force throttle (always set)
+	mfa              authn.MFAProvider    // optional second factor; nil disables MFA
+	recordStore      recording.Store      // optional; when set, interactive sessions are recorded
+	inspect          *inspectgate.Gate    // optional; when set, SFTP uploads are content-inspected
+	cred             *credential.Provider // optional; used to resolve inject-mode target credentials for real shell/SFTP sessions
+	reg              *sessions.Registry   // optional; when set, live sessions are registered for the API
+	bfLimiter        *ratelimit.Limiter   // per-source-IP brute-force throttle (always set)
+	approvals        approval.Store       // optional; required for SFTP uploads when inspection is enabled (quarantine-release gate)
+	approvalTTL      time.Duration
 	handshakeTimeout time.Duration
 	sem              chan struct{} // bounds concurrent in-flight handshakes
+
+	pendingSecrets sync.Map                                               // token(string) -> *credential.Secret; prompt-mode target passwords awaiting first use
+	dialerPeek     func(pr policy.Principal, host string) policy.Decision // non-dialing, host-only decision lookup (typically (*dialer.Dialer).PeekHost); nil disables prompt-mode chaining
+
+	targetHostKeyCB ssh.HostKeyCallback // verifies the target's host key on the second SSH leg; nil => dialTarget fails closed (see WithTargetHostKeyCallback / WithInsecureTargetHostKey)
 
 	wg       sync.WaitGroup // tracks active connections for graceful drain
 	active   atomic.Int64   // current active connections
@@ -99,6 +111,51 @@ func WithRecording(store recording.Store) Option {
 // Nil (the default) disables inspection.
 func WithInspection(g *inspectgate.Gate) Option {
 	return func(s *Server) { s.inspect = g }
+}
+
+// WithApprovals gates SFTP uploads (when content inspection is enabled)
+// behind a KindQuarantineRelease four-eyes approval: the upload blocks on
+// Close() until a second human approves it, up to ttl. Mirrors
+// dialer.WithApprovals — same Store, same TUI/API queue, different Kind.
+func WithApprovals(store approval.Store, ttl time.Duration) Option {
+	return func(s *Server) { s.approvals = store; s.approvalTTL = ttl }
+}
+
+// WithCredentialProvider resolves inject-mode target credentials for the
+// gateway's second SSH leg to a real target (shell/SFTP). Nil (the default)
+// means inject-mode targets fail closed (see Task 7's dialTarget).
+func WithCredentialProvider(p *credential.Provider) Option {
+	return func(s *Server) { s.cred = p }
+}
+
+// WithDialerPeek supplies a non-dialing, host-only policy-decision lookup
+// (typically (*dialer.Dialer).PeekHost), used at auth time to decide whether
+// a prompt-mode target needs a keyboard-interactive round before the
+// connection is fully authenticated, and later (interactive.go/sftp.go) to
+// resolve the real target's port for the gateway's second SSH leg. It is
+// host-only, not Target-based, because the client's auth username
+// ("user%host") never carries a port — see policy.Policy.DecideHost's doc
+// comment. Nil (the default) disables prompt-mode entirely — such a target's
+// channels later fail closed in dialTarget (Task 7).
+func WithDialerPeek(peek func(pr policy.Principal, host string) policy.Decision) Option {
+	return func(s *Server) { s.dialerPeek = peek }
+}
+
+// WithTargetHostKeyCallback verifies the real target's host key on the
+// gateway's second SSH leg using cb (typically built from an OpenSSH
+// known_hosts file via golang.org/x/crypto/ssh/knownhosts.New). This is the
+// production path.
+func WithTargetHostKeyCallback(cb ssh.HostKeyCallback) Option {
+	return func(s *Server) { s.targetHostKeyCB = cb }
+}
+
+// WithInsecureTargetHostKey disables target host-key verification entirely
+// (ssh.InsecureIgnoreHostKey()). This is a DELIBERATE, EXPLICIT opt-in for
+// the dev lab only — unlike the rest of this option, it cannot be reached by
+// simply leaving something unconfigured; a caller must name this function.
+// Never call this in a production wiring path.
+func WithInsecureTargetHostKey() Option {
+	return func(s *Server) { s.targetHostKeyCB = ssh.InsecureIgnoreHostKey() }
 }
 
 // WithBruteForceLimiter overrides the default per-source-IP brute-force
@@ -140,6 +197,29 @@ func (s *Server) emit(e evidence.Event) {
 	}
 }
 
+// stashTargetSecret holds sec under a random single-use token until the
+// target dial consumes it (Task 7) or the connection closes without ever
+// opening a channel (handleConn's cleanup) — either path zeroizes it. Never
+// logged, never placed in evidence.
+func (s *Server) stashTargetSecret(sec *credential.Secret) string {
+	buf := make([]byte, 16)
+	_, _ = rand.Read(buf)
+	token := hex.EncodeToString(buf)
+	s.pendingSecrets.Store(token, sec)
+	return token
+}
+
+// takeTargetSecret retrieves and removes the secret for token. Single-use:
+// a second call for the same token returns nil. Returns nil for an unknown
+// or already-consumed token.
+func (s *Server) takeTargetSecret(token string) *credential.Secret {
+	v, ok := s.pendingSecrets.LoadAndDelete(token)
+	if !ok {
+		return nil
+	}
+	return v.(*credential.Secret)
+}
+
 // passwordCallback verifies the password via the authenticator, emits an auth
 // evidence event either way, and packs the resolved identity into the
 // connection's permissions for later authorization.
@@ -153,9 +233,10 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		// bounded, so it slows the guessing source without letting anyone lock a
 		// victim out permanently.
 		if ok, retry := s.bfLimiter.Allow(srcIP); !ok {
+			loginUser, _, _ := splitTargetUser(meta.User())
 			s.emit(evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeAuth,
-				User: meta.User(), SourceIP: srcIP,
+				User: loginUser, SourceIP: srcIP,
 				Allow: evidence.BoolPtr(false), Reason: "rate limited: too many failed attempts",
 				Detail: fmt.Sprintf("locked out, retry after %s", retry.Round(time.Second)),
 			})
@@ -167,12 +248,13 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		ctx, cancel := context.WithTimeout(context.Background(), authTimeout)
 		defer cancel()
 
-		id, err := auth.Authenticate(ctx, meta.User(), string(password))
+		loginUser, targetHost, hasTarget := splitTargetUser(meta.User())
+		id, err := auth.Authenticate(ctx, loginUser, string(password))
 		if err != nil {
 			s.bfLimiter.RecordFailure(srcIP)
 			s.emit(evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeAuth,
-				User: meta.User(), SourceIP: srcIP,
+				User: loginUser, SourceIP: srcIP,
 				Allow: evidence.BoolPtr(false), Reason: "authentication failed",
 			})
 			return nil, errors.New("authentication failed")
@@ -214,10 +296,45 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		// Fully authenticated: clear any accumulated failure/lockout state so a
 		// legitimate user who mistyped is not penalized after a real success.
 		s.bfLimiter.RecordSuccess(srcIP)
-		return &ssh.Permissions{Extensions: map[string]string{
+
+		if hasTarget && s.dialerPeek != nil {
+			// Host-only lookup: the client's auth username ("user%host") never
+			// carries a port, so this uses DecideHost (via dialerPeek), not
+			// Decide — see policy.Policy.DecideHost's doc comment. Only
+			// CredentialMode is consulted here; the resolved Decision.Port is
+			// used later, by interactive.go/sftp.go, to dial the real target.
+			decision := s.dialerPeek(policy.Principal{User: id.User, Groups: id.Groups}, targetHost)
+			if credential.Mode(decision.CredentialMode).Normalize() == credential.ModePrompt {
+				groups := strings.Join(id.Groups, groupSep)
+				return nil, &ssh.PartialSuccessError{Next: ssh.ServerAuthCallbacks{
+					KeyboardInteractiveCallback: func(_ ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+						answers, err := challenge("", "", []string{"Target password: "}, []bool{false})
+						if err != nil {
+							return nil, errors.New("authentication failed")
+						}
+						if len(answers) != 1 || answers[0] == "" {
+							return nil, errors.New("authentication failed")
+						}
+						token := s.stashTargetSecret(credential.New([]byte(answers[0])))
+						return &ssh.Permissions{Extensions: map[string]string{
+							"user":                id.User,
+							"groups":              groups,
+							"target_host":         targetHost,
+							"target_secret_token": token,
+						}}, nil
+					},
+				}}
+			}
+		}
+
+		perms := &ssh.Permissions{Extensions: map[string]string{
 			"user":   id.User,
 			"groups": strings.Join(id.Groups, groupSep),
-		}}, nil
+		}}
+		if hasTarget {
+			perms.Extensions["target_host"] = targetHost
+		}
+		return perms, nil
 	}
 }
 
@@ -301,6 +418,14 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 	defer sconn.Close()
 	go ssh.DiscardRequests(reqs)
 
+	if tok := sconn.Permissions.Extensions["target_secret_token"]; tok != "" {
+		defer func() {
+			if sec := s.takeTargetSecret(tok); sec != nil {
+				sec.Destroy() // connection closed without ever opening a channel that consumed it
+			}
+		}()
+	}
+
 	pr := principalFrom(sconn.Permissions)
 	srcIP := hostOf(sconn.RemoteAddr())
 
@@ -315,6 +440,31 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 		})
 		defer dereg()
 	}
+
+	// tch lazily dials and caches one target *ssh.Client per connection,
+	// shared across every channel (shell, sftp) opened on it, and closed once
+	// here when the connection ends.
+	tch := &targetConnCache{}
+	defer tch.close()
+
+	// connCtx is cancelled either when the caller's ctx is (gateway
+	// shutdown/drain) or when this specific client connection goes away
+	// (sconn.Wait returns), whichever comes first. It exists for SFTP's
+	// quarantine-release approval wait (runSFTP/quarantineWriteHandle.Close,
+	// sftp.go): that wait can otherwise block for the full approval TTL even
+	// after the client that requested the upload has vanished. One goroutine
+	// here, shared by every channel on this connection (however many SFTP
+	// subsystems get opened sequentially on it), rather than one per
+	// runSFTP invocation — sconn.Wait() blocks until the whole connection
+	// shuts down, so a per-invocation version would accumulate one
+	// live-until-teardown goroutine per sequential SFTP open on a
+	// long-lived connection.
+	connCtx, cancelConnCtx := context.WithCancel(ctx)
+	defer cancelConnCtx()
+	go func() {
+		_ = sconn.Wait()
+		cancelConnCtx()
+	}()
 
 	// Bound concurrent channels per connection; reject beyond the cap.
 	chSem := make(chan struct{}, maxChannelsPerConn)
@@ -353,7 +503,7 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 			case "direct-tcpip":
 				s.handleDirectTCPIP(ctx, newCh, pr, srcIP)
 			case "session":
-				s.handleSession(ctx, newCh, pr, srcIP)
+				s.handleSession(ctx, connCtx, newCh, pr, srcIP, sconn, tch)
 			}
 		}(newCh, ct)
 	}
@@ -408,7 +558,12 @@ func principalFrom(perms *ssh.Permissions) policy.Principal {
 	if g := perms.Extensions["groups"]; g != "" {
 		groups = strings.Split(g, groupSep)
 	}
-	return policy.Principal{User: perms.Extensions["user"], Groups: groups}
+	return policy.Principal{
+		User:              perms.Extensions["user"],
+		Groups:            groups,
+		TargetHost:        perms.Extensions["target_host"],
+		TargetSecretToken: perms.Extensions["target_secret_token"],
+	}
 }
 
 func hostOf(addr net.Addr) string {

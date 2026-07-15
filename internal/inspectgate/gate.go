@@ -5,11 +5,13 @@
 //   - Small files (<= threshold) are inspected inline from a bounded memory
 //     buffer.
 //   - Large files (> threshold) are streamed through inspection while being
-//     tee'd to a transient HOLDING blob store, so a large clean file is never
+//     tee'd to a transient HOLDING blob store, so a large file is never
 //     buffered whole in memory (no OOM).
-//   - Blocked content — and, fail-closed, content the inspector could not scan
-//     (server down/timeout/garbage) — is QUARANTINED to an Object-Locked (WORM)
-//     blob store and the transfer is refused.
+//   - Every upload — clean, blocked, and, fail-closed, content the inspector
+//     could not scan (server down/timeout/garbage) — is QUARANTINED to an
+//     Object-Locked (WORM) blob store, giving every transfer a permanent,
+//     byte-level evidentiary copy. Blocked/unscannable/modified content is
+//     additionally refused; clean content is quarantined and still delivered.
 //
 // The gate does not emit evidence itself; it returns a Decision the caller
 // records through the evidence bus, keeping evidence emission in one place.
@@ -43,8 +45,7 @@ type Decision struct {
 	SHA256        string
 	Bytes         int64
 	ICAPStatus    int
-	QuarantineKey string // set when content was quarantined (blocked or fail-closed)
-	HoldingKey    string // set when a large clean file was streamed to holding (delivered)
+	QuarantineKey string // set for every verdict: a permanent, byte-level copy in WORM quarantine
 }
 
 // Gate inspects transfers and routes them by verdict and size.
@@ -144,7 +145,17 @@ func (g *Gate) inspectSmall(ctx context.Context, meta inspect.TransferMeta, data
 		dec.QuarantineKey = key
 		return dec, qerr
 	case res.Verdict == inspect.VerdictClean:
-		dec.Allow, dec.Verdict = true, "clean"
+		key, qerr := g.quarantineBytes(ctx, meta, data)
+		if qerr != nil {
+			// The scan says clean, but persisting the evidentiary copy failed —
+			// this is an infrastructure failure, not a content verdict; fail
+			// closed rather than deliver content with no byte-level record.
+			// dec.Allow stays false (its zero value): the clean verdict never
+			// leaks through when the quarantine write itself fails.
+			dec.Verdict, dec.Reason = "error", "quarantine write failed: "+qerr.Error()
+			return dec, qerr
+		}
+		dec.Allow, dec.Verdict, dec.QuarantineKey = true, "clean", key
 		return dec, nil
 	default:
 		// Defense in depth: an unrecognized verdict is NOT a pass. A buggy or
@@ -230,12 +241,28 @@ func (g *Gate) inspectLarge(ctx context.Context, meta inspect.TransferMeta, cont
 		return dec, nil
 	}
 
-	// Clean: the holding object is the delivered artifact (Modified and Blocked
-	// were both handled fail-closed above).
-	dec.Allow = true
-	dec.HoldingKey = holdKey
-	dec.Verdict = "clean"
+	// Clean: promote the held content into quarantine too, same as the
+	// blocked path above — every upload gets a permanent, byte-level
+	// evidentiary copy, not only blocked ones. The holding copy is deleted
+	// once promoted (g.promote already does this).
+	qkey := g.key("quarantine", meta)
+	if perr := g.promote(ctx, holdKey, qkey); perr != nil {
+		// As in inspectSmall: a clean scan verdict does not matter if we
+		// cannot persist the evidentiary copy — fail closed (dec.Allow stays
+		// false, its zero value) rather than deliver content with no
+		// byte-level record.
+		dec.Verdict, dec.Reason = "error", "quarantine write failed: "+perr.Error()
+		return dec, fmt.Errorf("inspectgate: quarantine: %w", perr)
+	}
+	dec.Allow, dec.Verdict, dec.QuarantineKey = true, "clean", qkey
 	return dec, nil
+}
+
+// QuarantineReader opens the quarantined object at key for reading — used to
+// deliver a released (approved) upload to its real target. Callers must
+// Close the returned reader.
+func (g *Gate) QuarantineReader(ctx context.Context, key string) (io.ReadCloser, error) {
+	return g.quarantine.Get(ctx, key)
 }
 
 // quarantineBytes writes buffered content to the WORM store and returns its key.

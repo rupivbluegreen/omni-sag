@@ -78,9 +78,13 @@ func (m *Metrics) record(e evidence.Event) {
 	case evidence.TypeTunnelDecision:
 		pick(allowed(e), &m.tunnelAllow, &m.tunnelDeny)
 	case evidence.TypeApproval:
-		// Bucket only TERMINAL outcomes. The dialer emits a non-terminal
-		// "requested" event (Allow=false) per gated session; counting it as a
-		// refusal would double every approval flow into the refused total.
+		// Bucket only TERMINAL outcomes. Both the dialer and the SFTP
+		// quarantine-release path emit a non-terminal "requested" event
+		// (Allow left nil/unset — a pending request is neither an allow nor
+		// a deny) per gated session; switching on Outcome rather than Allow
+		// means "requested" simply falls through here without a bucket,
+		// so counting it as a refusal never double-counts an approval flow
+		// into the refused total.
 		switch e.Outcome {
 		case "granted":
 			m.approvalGranted.inc()

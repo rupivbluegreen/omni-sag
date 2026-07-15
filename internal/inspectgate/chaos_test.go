@@ -37,9 +37,6 @@ func assertRefusedAndQuarantined(t *testing.T, dec Decision, err error, q *memSt
 	if dec.Allow {
 		t.Fatalf("inspector failure must NOT allow the transfer: %+v", dec)
 	}
-	if dec.HoldingKey != "" {
-		t.Fatalf("refused content must not be delivered via a holding key: %+v", dec)
-	}
 	if dec.QuarantineKey == "" {
 		t.Fatal("refused content must be quarantined (QuarantineKey set)")
 	}

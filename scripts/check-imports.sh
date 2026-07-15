@@ -80,8 +80,16 @@ if grep -rnE '\b(Password|Passphrase|Passwd|SecretValue|PlainSecret|Secret|Token
 fi
 # Converting secret bytes to a Go string defeats zeroization; flag string(x.Bytes())
 # in every package that handles secrets (credential + its two allowed importers).
+# One narrow, marked exception: ssh.Password(...) (the target-auth second SSH
+# leg) requires a Go string argument — there is no []byte-based auth method in
+# golang.org/x/crypto/ssh. This is a documented, accepted residual risk (see
+# ADR-0002 and the real-target-proxy plan's Global Constraints): the
+# conversion happens only inline in the ssh.Password(...) call expression,
+# never bound to a variable, and the Secret is Destroy()d immediately after.
+# Each sanctioned call site carries the omni-sag:target-auth-string marker.
 if grep -rnE 'string\([a-zA-Z0-9_.]*\.Bytes\(\)\)' --include='*.go' \
-    internal/credential/ internal/session/ internal/dialer/ 2>/dev/null | grep -v '_test\.go:'; then
+    internal/credential/ internal/session/ internal/dialer/ 2>/dev/null \
+    | grep -v '_test\.go:' | grep -v 'omni-sag:target-auth-string'; then
   echo "secret bytes converted to string (string(...Bytes())) — defeats zeroization (ADR-0001)"
   fail=1
 fi
