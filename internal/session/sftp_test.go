@@ -269,15 +269,14 @@ func TestQuarantineWriteHandle_AutoDeniedWithNoApprovalStoreFailsClosed(t *testi
 	}
 }
 
-// TestQuarantineWriteHandle_ApprovedDeliversToTarget: a clean upload blocks on
-// Close() until a distinct human approves the KindQuarantineRelease request,
-// then (and only then) the quarantined bytes reach the real target file.
-func TestQuarantineWriteHandle_ApprovedDeliversToTarget(t *testing.T) {
+// TestQuarantineWriteHandle_ApprovedRecordsReleaseNotPush: a clean upload
+// blocks on Close() until a distinct human approves the
+// KindQuarantineRelease request, then (and only then) a release is recorded
+// — the bytes are never pushed to the target (supersedes the old
+// ApprovedDeliversToTarget behavior from before this task).
+func TestQuarantineWriteHandle_ApprovedRecordsReleaseNotPush(t *testing.T) {
 	quar := newFakeBlobStore()
-	g, err := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
-	if err != nil {
-		t.Fatalf("inspectgate.New: %v", err)
-	}
+	g, _ := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
 	fakeConn := startFakeSFTPTarget(t, nil)
 	targetClient, err := sftp.NewClient(sshClientOver(t, fakeConn))
 	if err != nil {
@@ -285,17 +284,18 @@ func TestQuarantineWriteHandle_ApprovedDeliversToTarget(t *testing.T) {
 	}
 	defer targetClient.Close()
 
-	store, err := approval.NewFileStore(filepath.Join(t.TempDir(), "approvals.json"))
+	approvals, err := approval.NewFileStore(filepath.Join(t.TempDir(), "approvals.json"))
 	if err != nil {
-		t.Fatalf("NewFileStore: %v", err)
+		t.Fatalf("approval.NewFileStore: %v", err)
 	}
-	s := &Server{sink: noopSink{}, inspect: g, approvals: store, approvalTTL: 5 * time.Second}
-	fs := &remoteFS{client: targetClient, gate: g, srv: s, user: "alice"}
+	releases, err := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	s := &Server{sink: noopSink{}, inspect: g, approvals: approvals, approvalTTL: 5 * time.Second, releases: releases, releaseTTL: 6 * time.Hour}
+	fs := &remoteFS{client: targetClient, gate: g, srv: s, user: "alice", matchedGroups: []string{"dba"}, releases: releases, releaseTTL: 6 * time.Hour}
 
-	h, err := fs.Filewrite(&sftp.Request{Method: "Put", Filepath: "/upload.txt"})
-	if err != nil {
-		t.Fatalf("Filewrite: %v", err)
-	}
+	h, _ := fs.Filewrite(&sftp.Request{Method: "Put", Filepath: "/upload.txt"})
 	if _, err := h.WriteAt([]byte("clean content"), 0); err != nil {
 		t.Fatalf("WriteAt: %v", err)
 	}
@@ -303,38 +303,83 @@ func TestQuarantineWriteHandle_ApprovedDeliversToTarget(t *testing.T) {
 	closeErr := make(chan error, 1)
 	go func() { closeErr <- h.(io.Closer).Close() }()
 
-	// Poll for the pending request the way the TUI/API would, then approve it
-	// as a different user (four-eyes).
 	var reqID string
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		for _, r := range store.List() {
+	for time.Now().Before(deadline) && reqID == "" {
+		for _, r := range approvals.List() {
 			if r.Kind == approval.KindQuarantineRelease && r.Status == approval.StatusPending {
 				reqID = r.ID
 			}
 		}
-		if reqID != "" {
-			break
+		time.Sleep(10 * time.Millisecond)
+	}
+	if reqID == "" {
+		t.Fatal("no pending release request")
+	}
+	if _, err := approvals.Approve(reqID, "bob"); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := <-closeErr; err != nil {
+		t.Fatalf("Close after approval: %v", err)
+	}
+
+	// The target must NEVER have received the file — this is the core
+	// behavior change: pull, not push.
+	if _, err := targetClient.Open("/upload.txt"); err == nil {
+		t.Fatal("approved upload must NOT be delivered to the target — pull-download model, not push")
+	}
+	// A release must exist for alice, listing the original filename.
+	list := releases.ListFor("alice", time.Now())
+	if len(list) != 1 {
+		t.Fatalf("releases.ListFor(alice) = %v, want exactly one release", list)
+	}
+	if list[0].OriginalFilename != "/upload.txt" {
+		t.Fatalf("release.OriginalFilename = %q, want /upload.txt", list[0].OriginalFilename)
+	}
+}
+
+func TestQuarantineWriteHandle_ApprovedButNoReleaseStoreConfiguredFailsClosed(t *testing.T) {
+	quar := newFakeBlobStore()
+	g, _ := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	fakeConn := startFakeSFTPTarget(t, nil)
+	targetClient, err := sftp.NewClient(sshClientOver(t, fakeConn))
+	if err != nil {
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+	defer targetClient.Close()
+
+	approvals, err := approval.NewFileStore(filepath.Join(t.TempDir(), "approvals.json"))
+	if err != nil {
+		t.Fatalf("approval.NewFileStore: %v", err)
+	}
+	// No releases store configured — s.releases is nil.
+	s := &Server{sink: noopSink{}, inspect: g, approvals: approvals, approvalTTL: 5 * time.Second}
+	fs := &remoteFS{client: targetClient, gate: g, srv: s, user: "alice"}
+
+	h, _ := fs.Filewrite(&sftp.Request{Method: "Put", Filepath: "/upload.txt"})
+	_, _ = h.WriteAt([]byte("clean content"), 0)
+
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- h.(io.Closer).Close() }()
+
+	var reqID string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && reqID == "" {
+		for _, r := range approvals.List() {
+			if r.Kind == approval.KindQuarantineRelease && r.Status == approval.StatusPending {
+				reqID = r.ID
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	if reqID == "" {
-		t.Fatal("no pending KindQuarantineRelease request was created")
+		t.Fatal("no pending release request")
 	}
-	if _, err := store.Approve(reqID, "bob"); err != nil {
+	if _, err := approvals.Approve(reqID, "bob"); err != nil {
 		t.Fatalf("Approve: %v", err)
 	}
-
-	if err := <-closeErr; err != nil {
-		t.Fatalf("Close after approval: %v", err)
-	}
-	delivered, err := targetClient.Open("/upload.txt")
-	if err != nil {
-		t.Fatalf("target file was not delivered: %v", err)
-	}
-	got, _ := io.ReadAll(delivered)
-	if string(got) != "clean content" {
-		t.Fatalf("delivered content = %q, want %q", got, "clean content")
+	if err := <-closeErr; err == nil {
+		t.Fatal("Close must fail closed when approved but no release store is configured to record it")
 	}
 }
 
@@ -551,7 +596,7 @@ func TestRemoteFS_FilecmdEmitsEvidenceForDestructiveOps(t *testing.T) {
 
 // --- Minor finding #5: quarantineWriteHandle.Close() must be idempotent —
 // a second call must not re-emit inspection evidence, create a second
-// KindQuarantineRelease request, or re-deliver to the target. ---
+// KindQuarantineRelease request, or record a second release. ---
 
 func TestQuarantineWriteHandle_CloseIsIdempotent(t *testing.T) {
 	quar := newFakeBlobStore()
@@ -570,8 +615,12 @@ func TestQuarantineWriteHandle_CloseIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFileStore: %v", err)
 	}
-	s := &Server{sink: noopSink{}, inspect: g, approvals: store, approvalTTL: 5 * time.Second}
-	fs := &remoteFS{client: targetClient, gate: g, srv: s, user: "alice"}
+	releases, err := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	s := &Server{sink: noopSink{}, inspect: g, approvals: store, approvalTTL: 5 * time.Second, releases: releases, releaseTTL: 6 * time.Hour}
+	fs := &remoteFS{client: targetClient, gate: g, srv: s, user: "alice", releases: releases, releaseTTL: 6 * time.Hour}
 
 	h, err := fs.Filewrite(&sftp.Request{Method: "Put", Filepath: "/upload.txt"})
 	if err != nil {
@@ -614,13 +663,12 @@ func TestQuarantineWriteHandle_CloseIsIdempotent(t *testing.T) {
 		t.Fatalf("want exactly 1 KindQuarantineRelease request created across both Close() calls, got %d", releaseReqs)
 	}
 
-	delivered, err := targetClient.Open("/upload.txt")
-	if err != nil {
-		t.Fatalf("target file was not delivered: %v", err)
+	if _, err := targetClient.Open("/upload.txt"); err == nil {
+		t.Fatal("approved upload must NOT be delivered to the target — pull-download model, not push")
 	}
-	got, _ := io.ReadAll(delivered)
-	if string(got) != "clean content" {
-		t.Fatalf("delivered content = %q, want %q (must not be duplicated by a second delivery)", got, "clean content")
+	list := releases.ListFor("alice", time.Now())
+	if len(list) != 1 {
+		t.Fatalf("releases.ListFor(alice) = %v, want exactly one release (not duplicated by a second Close)", list)
 	}
 }
 

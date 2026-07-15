@@ -132,9 +132,10 @@ func cleanPath(p string) string { return path.Clean("/" + p) }
 
 // remoteFS serves the SFTP subsystem by proxying to a real *sftp.Client
 // connected to the target, replacing the in-memory stand-in (memFS) for
-// reads and (as of Task 11) writes. A clean-verdict upload does not deliver
-// to the target immediately — Filewrite's returned handle blocks on Close()
-// until a human approves its release from quarantine.
+// reads and (as of Task 11) writes. A clean-verdict upload is never pushed to
+// the target — Filewrite's returned handle blocks on Close() until a human
+// approves its release from quarantine, then records a release for the
+// uploader to pull down themselves (Task 6).
 type remoteFS struct {
 	client        *sftp.Client
 	gate          *inspectgate.Gate // set when inspection is configured; used by Filewrite
@@ -368,9 +369,9 @@ func (fs *remoteFS) emitFilecmd(op, p, detail string, err error) {
 // newInspectUpload in this file), but Close no longer decides delivery by
 // verdict alone. A clean upload is quarantined (Task 10 made that
 // unconditional) and then requires a KindQuarantineRelease approval before
-// the gateway delivers it to the real target file. Blocked/unscannable
-// content was already fail-closed before this task and still never creates
-// a release request.
+// the gateway records a release for pull-download (Task 6) — it is never
+// pushed to the target. Blocked/unscannable content was already fail-closed
+// before this task and still never creates a release request.
 func (fs *remoteFS) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if fs.gate == nil {
 		// No inspection configured: deliver straight through, no quarantine
@@ -389,7 +390,8 @@ func (fs *remoteFS) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 
 // quarantineWriteHandle wraps an inspectUpload (Task 10's now-unconditional
 // quarantine) and, on Close, blocks for a KindQuarantineRelease approval
-// before delivering the quarantined bytes to the real target file.
+// before recording a release for the quarantined content (Task 6) — the
+// target file is never touched.
 type quarantineWriteHandle struct {
 	iu   *inspectUpload
 	fs   *remoteFS
@@ -400,7 +402,7 @@ type quarantineWriteHandle struct {
 	// guaranteed to call Close exactly once per handle in every code path)
 	// would re-emit inspection evidence, create a second
 	// KindQuarantineRelease approval request, and — on a second approval —
-	// re-deliver the file to the target a second time.
+	// record a second, duplicate release.
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -451,10 +453,11 @@ func (h *quarantineWriteHandle) doClose() error {
 		return fmt.Errorf("sftp: upload quarantined (key=%s) but no approval store is configured to release it", dec.QuarantineKey)
 	}
 	req, err := h.fs.srv.approvals.Create(approval.Request{
-		Kind:      approval.KindQuarantineRelease,
-		Requester: h.fs.user,
-		Subject:   dec.QuarantineKey,
-		Reason:    fmt.Sprintf("release %s to %s", dec.QuarantineKey, h.path),
+		Kind:            approval.KindQuarantineRelease,
+		Requester:       h.fs.user,
+		RequesterGroups: h.fs.matchedGroups,
+		Subject:         dec.QuarantineKey,
+		Reason:          fmt.Sprintf("release %s to %s", dec.QuarantineKey, h.path),
 	}, h.fs.srv.approvalTTL)
 	if err != nil {
 		return fmt.Errorf("sftp: create release request: %w", err)
@@ -478,25 +481,23 @@ func (h *quarantineWriteHandle) doClose() error {
 		return fmt.Errorf("sftp: upload to %s denied: quarantine release %s", h.path, final.EffectiveStatus(time.Now()))
 	}
 
-	src, err := h.fs.srv.inspect.QuarantineReader(h.fs.ctxOrBackground(), dec.QuarantineKey)
-	if err != nil {
-		return fmt.Errorf("sftp: read quarantined content %s: %w", dec.QuarantineKey, err)
+	if h.fs.releases == nil {
+		return fmt.Errorf("sftp: upload %s approved for release (key=%s) but no release store is configured", h.path, dec.QuarantineKey)
 	}
-	defer src.Close()
-	dst, err := h.fs.client.Create(h.path)
+	rel, err := h.fs.releases.Create(release.Release{
+		QuarantineKey:    dec.QuarantineKey,
+		Requester:        h.fs.user,
+		OriginalFilename: h.path,
+	}, h.fs.releaseTTL)
 	if err != nil {
-		return fmt.Errorf("sftp: open target %s: %w", h.path, err)
-	}
-	defer dst.Close()
-	if _, err := io.Copy(dst, src); err != nil {
-		return fmt.Errorf("sftp: deliver %s to target: %w", h.path, err)
+		return fmt.Errorf("sftp: record release for %s: %w", h.path, err)
 	}
 
 	h.fs.srv.emit(evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeTransfer,
-		User: h.fs.user, SourceIP: h.fs.srcIP, Path: h.path, Direction: "upload",
+		User: h.fs.user, SourceIP: h.fs.srcIP, Path: h.path, Direction: "released",
 		Bytes: dec.Bytes, SHA256: dec.SHA256, ObjectKey: dec.QuarantineKey,
-		Detail: "sftp transfer (released from quarantine)",
+		Detail: fmt.Sprintf("released to /releases (id=%s, expires=%s) — pull-download by %s, not pushed to target", rel.ID, rel.ExpiresAt.Format(time.RFC3339), h.fs.user),
 	})
 	return nil
 }
