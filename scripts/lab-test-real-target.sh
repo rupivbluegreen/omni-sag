@@ -28,11 +28,9 @@ BASE_CONFIG="${CONFIG:-deploy/compose/config.example.yaml}"
 GW_PORT="${GW_PORT:-2222}"
 API_PORT="${API_PORT:-8443}"
 ICAP_PORT="${ICAP_PORT:-1344}"
-TARGET_SSH_PORT="${TARGET_SSH_PORT:-2200}" # ssh-target container, host-mapped
 
 GW_USER="alice"
 BOB_USER="bob"                   # not in dba: refused both on approval and on target access
-CAROL_USER="carol"               # in dba, same as alice: the peer approver
 GW_PASSWORD="Passw0rd!"          # lab-seed.sh's LAB_USER_PW default, shared by all seeded users
 TARGET_HOST="127.0.0.1"          # must match the demo Rule's `host:` exactly
 TARGET_USER="svc_db1"
