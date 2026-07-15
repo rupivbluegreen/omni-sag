@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/pkg/sftp"
 
+	"github.com/rupivbluegreen/omni-sag/internal/approval"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/inspect"
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
@@ -20,15 +22,93 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// runSFTP serves the SFTP subsystem over channel using an in-memory filesystem.
-// Terminating SFTP at the gateway (rather than proxying) is deliberate: it is
-// the point at which content inspection (ICAP) is interposed. When an inspection
-// gate is configured, each upload is streamed through inspection before it is
-// accepted — blocked/unscannable content is quarantined and the transfer is
-// refused. It then emits an inspection verdict (when inspecting) and a transfer
-// manifest for every file put or fetched.
-func (s *Server) runSFTP(ctx context.Context, channel ssh.Channel, pr policy.Principal, srcIP string) {
-	fs := newMemFS(s.inspect, ctx, pr.User)
+// runSFTP serves the SFTP subsystem over channel by proxying to a real
+// *sftp.Client connected to pr's target (dialed via tch, the same
+// per-connection cache the interactive shell uses). Terminating SFTP at the
+// gateway (rather than blind-proxying the wire protocol) is deliberate: it is
+// the point at which content inspection (ICAP) is interposed. When an
+// inspection gate is configured, each upload is streamed through inspection
+// before it is accepted, quarantined unconditionally, and then held for a
+// human release decision (remoteFS.Filewrite/quarantineWriteHandle) —
+// blocked/unscannable content is refused outright and never reaches that
+// release step.
+//
+// connCtx (handleConn's connection-scoped context — see its doc comment) is
+// what remoteFS uses for the quarantine-release approval wait, not ctx: a
+// quarantine-release approval can block a write handle's Close() for as long
+// as the configured approval TTL, and connCtx (unlike ctx, which is only
+// cancelled on whole-gateway shutdown) is ALSO cancelled the moment this
+// specific client connection goes away (sconn.Wait, in handleConn) — e.g.
+// the client vanishes mid-upload after the final write+close but before a
+// human acts on the release request. Without that, a stuck Close() would
+// hold its pkg/sftp packetWorker goroutine (and the pending release request)
+// open for the full TTL even though nobody is listening anymore:
+// pkg/sftp's own Serve() cannot return (and so cannot run its own
+// per-request cleanup) until every packetWorker, including the one blocked
+// in Close(), returns — the two are circular, so external cancellation is
+// the only way out short of the TTL.
+func (s *Server) runSFTP(ctx, connCtx context.Context, channel ssh.Channel, pr policy.Principal, srcIP string, sconn ssh.Conn, tch *targetConnCache) {
+	s.emit(evidence.Event{
+		Time: time.Now().UTC(), Type: evidence.TypeSessionStart,
+		User: pr.User, SourceIP: srcIP, Detail: "sftp",
+	})
+	if pr.TargetHost == "" {
+		_ = channel.Close()
+		s.emit(evidence.Event{
+			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
+			User: pr.User, SourceIP: srcIP, Detail: "sftp refused: no target selected",
+		})
+		return
+	}
+	decision := policy.Decision{}
+	if s.dialerPeek != nil {
+		decision = s.dialerPeek(pr, pr.TargetHost)
+	}
+	// Re-check Allow here — see runRecordedShell's identical check for why:
+	// DecideHost fails closed (Allow: false) on an ambiguous host match
+	// instead of guessing, and nothing upstream refuses the session on that.
+	if !decision.Allow {
+		_ = channel.Close()
+		reason := decision.Reason
+		if reason == "" {
+			reason = "no policy decision available for this target"
+		}
+		s.emit(evidence.Event{
+			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
+			User: pr.User, SourceIP: srcIP, Detail: "sftp refused: " + reason,
+		})
+		return
+	}
+	// decision.Port is DecideHost's resolved real-target port (the client's
+	// auth username carries no port at all — see its doc comment); fall back
+	// to 22 if unset (e.g. a test double that doesn't populate it).
+	targetPort := decision.Port
+	if targetPort <= 0 {
+		targetPort = 22
+	}
+	targetClient, err := tch.getOrDial(func() (*ssh.Client, error) {
+		return s.dialTarget(ctx, sconn, pr, srcIP, decision, pr.TargetHost, targetPort, pr.TargetSecretToken)
+	})
+	if err != nil {
+		_ = channel.Close()
+		s.emit(evidence.Event{
+			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
+			User: pr.User, SourceIP: srcIP, Detail: "sftp refused: " + err.Error(),
+		})
+		return
+	}
+	sftpClient, err := sftp.NewClient(targetClient)
+	if err != nil {
+		_ = channel.Close()
+		s.emit(evidence.Event{
+			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
+			User: pr.User, SourceIP: srcIP, Detail: "sftp refused: target sftp client: " + err.Error(),
+		})
+		return
+	}
+	defer sftpClient.Close()
+
+	fs := &remoteFS{client: sftpClient, gate: s.inspect, srv: s, user: pr.User, srcIP: srcIP, ctx: connCtx}
 	server := sftp.NewRequestServer(channel, sftp.Handlers{
 		FileGet:  fs,
 		FilePut:  fs,
@@ -38,186 +118,379 @@ func (s *Server) runSFTP(ctx context.Context, channel ssh.Channel, pr policy.Pri
 	_ = server.Serve()
 	_ = server.Close()
 	_ = channel.Close()
-	fs.finalizePending() // backstop: finalize any upload whose handle was not closed
-
-	for _, iu := range fs.inspections() {
-		allow := iu.dec.Allow
-		s.emit(evidence.Event{
-			Time: time.Now().UTC(), Type: evidence.TypeInspection,
-			User: pr.User, SourceIP: srcIP,
-			Path: iu.path, Direction: "upload",
-			Bytes: iu.dec.Bytes, SHA256: iu.dec.SHA256,
-			Verdict: iu.dec.Verdict, ICAPStatus: iu.dec.ICAPStatus,
-			ObjectKey: iu.dec.QuarantineKey, Allow: evidence.BoolPtr(allow),
-			Reason: iu.dec.Reason, Detail: "sftp content inspection",
-		})
-	}
-	for _, m := range fs.manifests() {
-		s.emit(evidence.Event{
-			Time: time.Now().UTC(), Type: evidence.TypeTransfer,
-			User: pr.User, SourceIP: srcIP,
-			Path: m.path, Direction: m.direction, Bytes: m.size, SHA256: m.sha256,
-			Detail: "sftp transfer",
-		})
-	}
-}
-
-// memFS is a minimal in-memory filesystem for the SFTP subsystem. It records
-// which paths were written (uploads) and read (downloads) so transfer
-// manifests can be emitted when the session ends. When gate is set, uploads are
-// streamed through content inspection instead of being buffered.
-type memFS struct {
-	gate *inspectgate.Gate
-	ctx  context.Context
-	user string
-
-	mu         sync.Mutex
-	files      map[string]*memFile
-	uploads    map[string]bool
-	inspectUps []*inspectUpload // every inspected upload (keyed by handle, not path)
-	completed  []transfer       // upload manifests captured at write-handle close
-}
-
-func (m *memFS) recordUpload(t transfer) {
-	m.mu.Lock()
-	m.completed = append(m.completed, t)
-	m.mu.Unlock()
-}
-
-func newMemFS(gate *inspectgate.Gate, ctx context.Context, user string) *memFS {
-	return &memFS{
-		gate:    gate,
-		ctx:     ctx,
-		user:    user,
-		files:   map[string]*memFile{},
-		uploads: map[string]bool{},
-	}
-}
-
-// inspections returns the completed inspect uploads for evidence emission.
-func (m *memFS) inspections() []*inspectUpload {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	out := make([]*inspectUpload, 0, len(m.inspectUps))
-	for _, iu := range m.inspectUps {
-		out = append(out, iu)
-	}
-	return out
-}
-
-// finalizePending closes any inspect upload whose SFTP handle was never closed,
-// so its inspection completes and is evidenced.
-func (m *memFS) finalizePending() {
-	m.mu.Lock()
-	ups := make([]*inspectUpload, 0, len(m.inspectUps))
-	for _, iu := range m.inspectUps {
-		ups = append(ups, iu)
-	}
-	m.mu.Unlock()
-	for _, iu := range ups {
-		_ = iu.Close()
-	}
-}
-
-// maxMemFileSize caps the in-memory SFTP stand-in file size. The write offset
-// comes straight from the client's SSH_FXP_WRITE packet, so it must never be
-// used to size an allocation unchecked: a huge or negative offset would
-// otherwise panic (makeslice / slice bounds) — crashing the whole gateway,
-// since pkg/sftp's packet workers have no recover — or OOM the process.
-const maxMemFileSize = 64 << 20 // 64 MiB
-
-type memFile struct {
-	name    string
-	mu      sync.Mutex
-	data    []byte
-	modTime time.Time
-}
-
-func (f *memFile) WriteAt(p []byte, off int64) (int, error) {
-	if off < 0 {
-		return 0, fmt.Errorf("sftp: negative write offset %d", off)
-	}
-	end := off + int64(len(p))
-	if end < 0 || end > maxMemFileSize { // end<0 catches int64 overflow
-		return 0, fmt.Errorf("sftp: write exceeds %d-byte limit (offset=%d len=%d)", maxMemFileSize, off, len(p))
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if int64(len(f.data)) < end {
-		grown := make([]byte, end)
-		copy(grown, f.data)
-		f.data = grown
-	}
-	copy(f.data[off:end], p)
-	f.modTime = time.Now()
-	return len(p), nil
-}
-
-func (f *memFile) ReadAt(p []byte, off int64) (int, error) {
-	if off < 0 {
-		return 0, fmt.Errorf("sftp: negative read offset %d", off)
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if off >= int64(len(f.data)) {
-		return 0, io.EOF
-	}
-	n := copy(p, f.data[off:])
-	if n < len(p) {
-		return n, io.EOF
-	}
-	return n, nil
+	s.emit(evidence.Event{
+		Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
+		User: pr.User, SourceIP: srcIP,
+	})
 }
 
 func cleanPath(p string) string { return path.Clean("/" + p) }
 
-// Filewrite (FilePut): when inspection is enabled, stream the upload through
-// the inspection gate; otherwise buffer it in memory and record it as an upload.
-func (m *memFS) Filewrite(r *sftp.Request) (io.WriterAt, error) {
-	p := cleanPath(r.Filepath)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.gate != nil {
-		iu := newInspectUpload(m.ctx, m.gate, p)
-		// Keyed by handle (appended), not path: a second put to the same path
-		// must not drop the first upload's inspection evidence.
-		m.inspectUps = append(m.inspectUps, iu)
-		return iu, nil
-	}
-
-	f := m.files[p]
-	if f == nil {
-		f = &memFile{name: p, modTime: time.Now()}
-		m.files[p] = f
-	} else {
-		f.mu.Lock()
-		f.data = nil
-		f.mu.Unlock()
-	}
-	m.uploads[p] = true
-	// Return a write handle whose Close captures the transfer manifest at the
-	// path used for the upload, so a later Rename/Remove cannot erase the
-	// evidence that these bytes passed through the gateway.
-	return &memWriteHandle{fs: m, f: f, path: p}, nil
+// remoteFS serves the SFTP subsystem by proxying to a real *sftp.Client
+// connected to the target, replacing the in-memory stand-in (memFS) for
+// reads and (as of Task 11) writes. A clean-verdict upload does not deliver
+// to the target immediately — Filewrite's returned handle blocks on Close()
+// until a human approves its release from quarantine.
+type remoteFS struct {
+	client *sftp.Client
+	gate   *inspectgate.Gate // set when inspection is configured; used by Filewrite
+	srv    *Server           // for approvals/evidence; nil only in Task 9's read-only tests
+	user   string
+	srcIP  string // source IP of the client connection; threaded into every evidence event Close() emits
+	ctx    context.Context
 }
 
-// memWriteHandle wraps a memFile for a single SFTP upload. pkg/sftp closes the
-// WriterAt when the transfer completes; Close records the manifest then.
-type memWriteHandle struct {
-	fs   *memFS
-	f    *memFile
+// ctxOrBackground returns fs.ctx, falling back to context.Background() for
+// tests that construct a remoteFS directly without one.
+func (fs *remoteFS) ctxOrBackground() context.Context {
+	if fs.ctx != nil {
+		return fs.ctx
+	}
+	return context.Background()
+}
+
+// Fileread (FileGet) proxies directly from the real target file — downloads
+// are not content-inspected or quarantined, matching the existing in-memory
+// stand-in's behavior and the design spec's explicit scope decision. The
+// returned handle is wrapped in a downloadTap so the transfer still produces
+// a evidence.TypeTransfer manifest (path, size, SHA256, Direction:
+// "download") once pkg/sftp is done with it — the old in-memory memFS made
+// exactly this record (see downloadTap's doc comment for why it is
+// immune to a later Rename/Remove/overwrite of the source file).
+func (fs *remoteFS) Fileread(r *sftp.Request) (io.ReaderAt, error) {
+	f, err := fs.client.Open(cleanPath(r.Filepath))
+	if err != nil {
+		return nil, err
+	}
+	return newDownloadTap(f, cleanPath(r.Filepath), fs), nil
+}
+
+// downloadTap wraps a real target file's io.ReaderAt (from Fileread) so a
+// download still produces an evidence.TypeTransfer manifest — the old
+// in-memory memFS.Fileread computed one (path, size, SHA256, Direction:
+// "download") from its fully-buffered content, explicitly commented as
+// making the record "immune to a later Rename/Remove/overwrite" of the
+// file; remoteFS proxies a real streaming file instead, so there is no
+// buffered copy to hash after the fact. Bytes are hashed here as they
+// actually pass through, and the manifest is emitted once pkg/sftp closes
+// the handle (request.go's r.close() calls Close() on the readerAt if it
+// implements io.Closer — the same mechanism Filewrite's quarantineWriteHandle
+// already relies on for uploads).
+//
+// pkg/sftp's request server dispatches SSH_FXP_READ across several worker
+// goroutines with no per-handle ordering guarantee (the same is true of
+// SSH_FXP_WRITE — see inspectUpload's WriteAt above), so reads are
+// reassembled in offset order under a lock before being hashed, bounded by
+// maxReorderBytes exactly like the upload path. Unlike uploads, a gap that
+// is never filled is not a security concern here — this is a download
+// record, not a content-inspection gate — so the manifest simply reflects
+// however much of the file was actually observed contiguously from offset 0,
+// rather than refusing the transfer.
+type downloadTap struct {
+	r    io.ReaderAt
 	path string
+	fs   *remoteFS
+
+	mu           sync.Mutex
+	h            hash.Hash
+	expOff       int64
+	pending      map[int64][]byte
+	pendingBytes int64
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
-func (h *memWriteHandle) WriteAt(p []byte, off int64) (int, error) { return h.f.WriteAt(p, off) }
+func newDownloadTap(r io.ReaderAt, p string, fs *remoteFS) *downloadTap {
+	return &downloadTap{r: r, path: p, fs: fs, h: sha256.New()}
+}
 
-func (h *memWriteHandle) Close() error {
-	h.f.mu.Lock()
-	sum := sha256.Sum256(h.f.data)
-	tr := transfer{path: h.path, direction: "upload", size: int64(len(h.f.data)), sha256: hex.EncodeToString(sum[:])}
-	h.f.mu.Unlock()
-	h.fs.recordUpload(tr)
+// ReadAt proxies straight through to the real target file (the delivered
+// bytes to the client are never affected by the tap's bookkeeping below) and
+// observes what came back for later hashing.
+func (d *downloadTap) ReadAt(p []byte, off int64) (int, error) {
+	n, err := d.r.ReadAt(p, off)
+	if n > 0 {
+		d.observe(p[:n], off)
+	}
+	return n, err
+}
+
+// observe folds a chunk read at off into the running hash once it (and every
+// byte before it) has been seen, mirroring inspectUpload.WriteAt's
+// reassembly. Out-of-order bytes are buffered, bounded by maxReorderBytes;
+// beyond that bound they are simply dropped from the manifest — best-effort,
+// not fail-closed (see the type doc comment).
+func (d *downloadTap) observe(b []byte, off int64) {
+	buf := append([]byte(nil), b...)
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if off < d.expOff {
+		return // already-hashed region re-read (e.g. a retry) — nothing new
+	}
+	if d.pending == nil {
+		d.pending = make(map[int64][]byte)
+	}
+	if _, dup := d.pending[off]; !dup {
+		d.pendingBytes += int64(len(buf))
+	}
+	if d.pendingBytes > maxReorderBytes {
+		return
+	}
+	d.pending[off] = buf
+
+	for {
+		chunk, ok := d.pending[d.expOff]
+		if !ok {
+			break
+		}
+		delete(d.pending, d.expOff)
+		d.pendingBytes -= int64(len(chunk))
+		d.h.Write(chunk)
+		d.expOff += int64(len(chunk))
+	}
+}
+
+// Close closes the underlying target file and — once, via closeOnce, so a
+// second Close() from the SFTP layer never double-emits — records the
+// download's evidence.TypeTransfer manifest for whatever was actually
+// observed via ReadAt.
+func (d *downloadTap) Close() error {
+	d.closeOnce.Do(func() {
+		if c, ok := d.r.(io.Closer); ok {
+			d.closeErr = c.Close()
+		}
+		d.mu.Lock()
+		bytesSeen := d.expOff
+		sum := hex.EncodeToString(d.h.Sum(nil))
+		d.mu.Unlock()
+		if d.fs.srv != nil {
+			d.fs.srv.emit(evidence.Event{
+				Time: time.Now().UTC(), Type: evidence.TypeTransfer,
+				User: d.fs.user, SourceIP: d.fs.srcIP, Path: d.path, Direction: "download",
+				Bytes: bytesSeen, SHA256: sum, Detail: "sftp transfer",
+			})
+		}
+	})
+	return d.closeErr
+}
+
+// Filelist proxies List/Stat to the real target.
+func (fs *remoteFS) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	switch r.Method {
+	case "List":
+		infos, err := fs.client.ReadDir(cleanPath(r.Filepath))
+		if err != nil {
+			return nil, err
+		}
+		out := make([]os.FileInfo, len(infos))
+		copy(out, infos)
+		return listerAt(out), nil
+	case "Stat":
+		info, err := fs.client.Stat(cleanPath(r.Filepath))
+		if err != nil {
+			return nil, err
+		}
+		return listerAt{info}, nil
+	}
+	return nil, fmt.Errorf("sftp: unsupported list method %q", r.Method)
+}
+
+// Filecmd proxies Remove/Rename/Mkdir/Rmdir to the real target. Unlike the
+// old in-memory memFS (where these only mutated a throwaway map), these are
+// now real, destructive operations on the real target file system, so each
+// one that actually mutates the target gets an evidence.TypeTransfer record
+// — path(s), operation, user — the same way Filewrite/Fileread already do.
+// This is evidence only: no approval-gating for these operations, which is
+// a bigger design decision out of scope here.
+func (fs *remoteFS) Filecmd(r *sftp.Request) error {
+	switch r.Method {
+	case "Remove":
+		p := cleanPath(r.Filepath)
+		err := fs.client.Remove(p)
+		fs.emitFilecmd("remove", p, "sftp filecmd: remove", err)
+		return err
+	case "Rename":
+		p, target := cleanPath(r.Filepath), cleanPath(r.Target)
+		err := fs.client.Rename(p, target)
+		fs.emitFilecmd("rename", p, fmt.Sprintf("sftp filecmd: rename to %s", target), err)
+		return err
+	case "Mkdir":
+		p := cleanPath(r.Filepath)
+		err := fs.client.Mkdir(p)
+		fs.emitFilecmd("mkdir", p, "sftp filecmd: mkdir", err)
+		return err
+	case "Rmdir":
+		p := cleanPath(r.Filepath)
+		err := fs.client.RemoveDirectory(p)
+		fs.emitFilecmd("rmdir", p, "sftp filecmd: rmdir", err)
+		return err
+	case "Setstat", "Symlink":
+		return nil // no-ops, matching the prior in-memory stand-in's scope
+	}
+	return nil
+}
+
+// emitFilecmd records a destructive Filecmd operation (Remove/Rename/Mkdir/
+// Rmdir) as an evidence.TypeTransfer event, reusing Direction for the
+// operation name (remove | rename | mkdir | rmdir) since these are as much a
+// "transfer" of the target's file-system state as an upload/download is.
+// detail carries anything beyond the single path (e.g. a rename's
+// destination) — evidence.Event has no second path field, and Detail is
+// exactly the "freeform detail for anything not yet promoted to a field"
+// escape hatch the type already documents.
+func (fs *remoteFS) emitFilecmd(op, p, detail string, err error) {
+	if fs.srv == nil {
+		return
+	}
+	reason := ""
+	if err != nil {
+		reason = err.Error()
+	}
+	fs.srv.emit(evidence.Event{
+		Time: time.Now().UTC(), Type: evidence.TypeTransfer,
+		User: fs.user, SourceIP: fs.srcIP, Path: p,
+		Direction: op, Allow: evidence.BoolPtr(err == nil), Reason: reason,
+		Detail: detail,
+	})
+}
+
+// Filewrite (FilePut): every upload streams through inspection exactly as
+// memFS's inspectUpload already did (that machinery is unchanged — see
+// newInspectUpload in this file), but Close no longer decides delivery by
+// verdict alone. A clean upload is quarantined (Task 10 made that
+// unconditional) and then requires a KindQuarantineRelease approval before
+// the gateway delivers it to the real target file. Blocked/unscannable
+// content was already fail-closed before this task and still never creates
+// a release request.
+func (fs *remoteFS) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+	if fs.gate == nil {
+		// No inspection configured: deliver straight through, no quarantine
+		// step — matches the project's existing "inspection is opt-in"
+		// posture (session.WithInspection's doc comment).
+		f, err := fs.client.Create(cleanPath(r.Filepath))
+		if err != nil {
+			return nil, err
+		}
+		return f, nil
+	}
+	p := cleanPath(r.Filepath)
+	iu := newInspectUpload(fs.ctxOrBackground(), fs.gate, p)
+	return &quarantineWriteHandle{iu: iu, fs: fs, path: p}, nil
+}
+
+// quarantineWriteHandle wraps an inspectUpload (Task 10's now-unconditional
+// quarantine) and, on Close, blocks for a KindQuarantineRelease approval
+// before delivering the quarantined bytes to the real target file.
+type quarantineWriteHandle struct {
+	iu   *inspectUpload
+	fs   *remoteFS
+	path string
+
+	// closeOnce guards Close's whole body, mirroring inspectUpload's own
+	// closeOnce above: without it, a second Close() call (pkg/sftp is not
+	// guaranteed to call Close exactly once per handle in every code path)
+	// would re-emit inspection evidence, create a second
+	// KindQuarantineRelease approval request, and — on a second approval —
+	// re-deliver the file to the target a second time.
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (h *quarantineWriteHandle) WriteAt(p []byte, off int64) (int, error) {
+	return h.iu.WriteAt(p, off)
+}
+
+// Close blocks (potentially for a long time — up to the configured approval
+// TTL) waiting for a human to release the quarantined upload. It uses
+// fs.ctxOrBackground(), which in production is the SFTP session's context —
+// derived in runSFTP from a context that is cancelled both on gateway
+// shutdown AND when the client's underlying SSH connection goes away (see
+// runSFTP's sessCtx), so a client that disconnects mid-wait does not pin
+// this goroutine (and the approval request it is waiting on) for the full
+// TTL. See runSFTP for the derivation and why that matters.
+func (h *quarantineWriteHandle) Close() error {
+	h.closeOnce.Do(func() { h.closeErr = h.doClose() })
+	return h.closeErr
+}
+
+// doClose is Close's real body, run exactly once via closeOnce above.
+func (h *quarantineWriteHandle) doClose() error {
+	inspErr := h.iu.Close()
+	dec := h.iu.dec
+	// Emit the inspection verdict for every upload — clean, blocked, and
+	// fail-closed-unscannable alike — exactly as the pre-Task-11 memFS path
+	// did (runSFTP's old per-session loop over fs.inspections()). Without
+	// this, a BLOCKED upload would leave no audit trail at all: its bytes
+	// still land in quarantine (Task 10, inside h.iu.Close() above) but
+	// nothing downstream of that would ever say so. Emitted before the error
+	// check below so the blocked/unscannable case is evidenced too, not only
+	// the clean case that goes on to request a release.
+	if h.fs.srv != nil {
+		h.fs.srv.emit(evidence.Event{
+			Time: time.Now().UTC(), Type: evidence.TypeInspection,
+			User: h.fs.user, SourceIP: h.fs.srcIP, Path: h.path, Direction: "upload",
+			Bytes: dec.Bytes, SHA256: dec.SHA256,
+			Verdict: dec.Verdict, ICAPStatus: dec.ICAPStatus,
+			ObjectKey: dec.QuarantineKey, Allow: evidence.BoolPtr(dec.Allow),
+			Reason: dec.Reason, Detail: "sftp content inspection",
+		})
+	}
+	if inspErr != nil {
+		return inspErr // blocked/unscannable — already refused, no release request
+	}
+	if h.fs.srv == nil || h.fs.srv.approvals == nil {
+		return fmt.Errorf("sftp: upload quarantined (key=%s) but no approval store is configured to release it", dec.QuarantineKey)
+	}
+	req, err := h.fs.srv.approvals.Create(approval.Request{
+		Kind:      approval.KindQuarantineRelease,
+		Requester: h.fs.user,
+		Subject:   dec.QuarantineKey,
+		Reason:    fmt.Sprintf("release %s to %s", dec.QuarantineKey, h.path),
+	}, h.fs.srv.approvalTTL)
+	if err != nil {
+		return fmt.Errorf("sftp: create release request: %w", err)
+	}
+	h.fs.srv.emit(evidence.Event{
+		Time: time.Now().UTC(), Type: evidence.TypeApproval,
+		User: h.fs.user, SourceIP: h.fs.srcIP, Target: h.path, ObjectKey: req.ID,
+		Outcome: "requested", Reason: "quarantine release pending",
+	})
+
+	final, werr := h.fs.srv.approvals.Wait(h.fs.ctxOrBackground(), req.ID)
+	approved := werr == nil && final.Approved(time.Now())
+	h.fs.srv.emit(evidence.Event{
+		Time: time.Now().UTC(), Type: evidence.TypeApproval,
+		User: h.fs.user, SourceIP: h.fs.srcIP, Target: h.path, ObjectKey: req.ID,
+		Allow:   evidence.BoolPtr(approved),
+		Outcome: map[bool]string{true: "granted", false: "refused"}[approved],
+		Reason:  "quarantine release " + string(final.EffectiveStatus(time.Now())),
+	})
+	if !approved {
+		return fmt.Errorf("sftp: upload to %s denied: quarantine release %s", h.path, final.EffectiveStatus(time.Now()))
+	}
+
+	src, err := h.fs.srv.inspect.QuarantineReader(h.fs.ctxOrBackground(), dec.QuarantineKey)
+	if err != nil {
+		return fmt.Errorf("sftp: read quarantined content %s: %w", dec.QuarantineKey, err)
+	}
+	defer src.Close()
+	dst, err := h.fs.client.Create(h.path)
+	if err != nil {
+		return fmt.Errorf("sftp: open target %s: %w", h.path, err)
+	}
+	defer dst.Close()
+	if _, err := io.Copy(dst, src); err != nil {
+		return fmt.Errorf("sftp: deliver %s to target: %w", h.path, err)
+	}
+
+	h.fs.srv.emit(evidence.Event{
+		Time: time.Now().UTC(), Type: evidence.TypeTransfer,
+		User: h.fs.user, SourceIP: h.fs.srcIP, Path: h.path, Direction: "upload",
+		Bytes: dec.Bytes, SHA256: dec.SHA256, ObjectKey: dec.QuarantineKey,
+		Detail: "sftp transfer (released from quarantine)",
+	})
 	return nil
 }
 
@@ -346,119 +619,6 @@ func (u *inspectUpload) Close() error {
 	})
 	return u.closeErr
 }
-
-// Fileread (FileGet): capture the download manifest at read time (the bytes
-// actually served) and return a reader over the content. Capturing here — not
-// at session end from mutable state — makes the exfiltration record immune to a
-// later Rename/Remove/overwrite, mirroring the hardened upload path.
-func (m *memFS) Fileread(r *sftp.Request) (io.ReaderAt, error) {
-	p := cleanPath(r.Filepath)
-	m.mu.Lock()
-	f := m.files[p]
-	m.mu.Unlock()
-	if f == nil {
-		return nil, os.ErrNotExist
-	}
-	f.mu.Lock()
-	tr := transfer{path: p, direction: "download", size: int64(len(f.data))}
-	sum := sha256.Sum256(f.data)
-	tr.sha256 = hex.EncodeToString(sum[:])
-	f.mu.Unlock()
-
-	m.mu.Lock()
-	m.completed = append(m.completed, tr)
-	m.mu.Unlock()
-	return f, nil
-}
-
-// Filecmd handles metadata operations. Only the essentials are supported.
-func (m *memFS) Filecmd(r *sftp.Request) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	switch r.Method {
-	case "Remove":
-		delete(m.files, cleanPath(r.Filepath))
-	case "Rename":
-		src, dst := cleanPath(r.Filepath), cleanPath(r.Target)
-		if f, ok := m.files[src]; ok {
-			f.name = dst
-			m.files[dst] = f
-			delete(m.files, src)
-		}
-	case "Mkdir", "Setstat", "Rmdir", "Symlink":
-		// no-ops for the in-memory demo FS
-	}
-	return nil
-}
-
-// Filelist handles List and Stat.
-func (m *memFS) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
-	p := cleanPath(r.Filepath)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	switch r.Method {
-	case "List":
-		var infos []os.FileInfo
-		for name, f := range m.files {
-			if path.Dir(name) == p {
-				infos = append(infos, f.info())
-			}
-		}
-		return listerAt(infos), nil
-	case "Stat":
-		if p == "/" {
-			return listerAt{memFileInfo{name: "/", dir: true, mod: time.Now()}}, nil
-		}
-		if f, ok := m.files[p]; ok {
-			return listerAt{f.info()}, nil
-		}
-		return nil, os.ErrNotExist
-	}
-	return nil, fmt.Errorf("sftp: unsupported list method %q", r.Method)
-}
-
-func (f *memFile) info() memFileInfo {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return memFileInfo{name: path.Base(f.name), size: int64(len(f.data)), mod: f.modTime}
-}
-
-type transfer struct {
-	path      string
-	direction string
-	size      int64
-	sha256    string
-}
-
-// manifests returns a transfer record for every upload and download. Both
-// directions are captured at handle time (uploads at write-handle close,
-// downloads at read) into m.completed, so the manifests are immune to a later
-// Rename/Remove/overwrite and a re-fetch is its own distinct record.
-func (m *memFS) manifests() []transfer {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return append([]transfer(nil), m.completed...)
-}
-
-// memFileInfo implements os.FileInfo.
-type memFileInfo struct {
-	name string
-	size int64
-	dir  bool
-	mod  time.Time
-}
-
-func (i memFileInfo) Name() string { return i.name }
-func (i memFileInfo) Size() int64  { return i.size }
-func (i memFileInfo) Mode() os.FileMode {
-	if i.dir {
-		return os.ModeDir | 0o755
-	}
-	return 0o644
-}
-func (i memFileInfo) ModTime() time.Time { return i.mod }
-func (i memFileInfo) IsDir() bool        { return i.dir }
-func (i memFileInfo) Sys() interface{}   { return nil }
 
 // listerAt adapts a slice of FileInfo to sftp.ListerAt.
 type listerAt []os.FileInfo

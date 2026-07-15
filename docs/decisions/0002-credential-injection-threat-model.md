@@ -62,9 +62,23 @@ target" — is stubbed. What Slice 6 fully implements and tests:
 - credential evidence emission;
 - keystroke-suppression (redaction) mechanism.
 
-When real target authentication lands, the injected `Secret` is consumed on the
-target leg (and suppressed from recording) instead of being fetched-and-destroyed
-at the stand-in boundary. This ADR governs that future step too.
+## Real target authentication (landed)
+
+Real target authentication landed in `docs/superpowers/plans/2026-07-14-real-target-proxy.md`.
+The interactive shell and SFTP subsystem now bridge to a real second SSH
+connection to the target, authenticated per the four credential modes:
+
+- `inject` consumes the CyberArk-fetched `Secret` on the target leg (instead
+  of fetch-then-destroy) and zeroizes it immediately after the handshake.
+- `prompt` collects the target password via genuine SSH keyboard-interactive
+  chaining (`ssh.PartialSuccessError`), not a mid-channel hack.
+- `passthrough` uses real OpenSSH agent forwarding — the target authenticates
+  the human as themselves, not the gateway.
+- `deny` refuses before any channel opens, as before.
+
+SFTP uploads additionally land in the WORM quarantine store unconditionally
+(clean or not) and require a `KindQuarantineRelease` four-eyes approval
+before delivery to the real target — see the design spec's "SFTP" section.
 
 ## Residual risks (documented, not yet mitigated in code)
 
@@ -73,4 +87,3 @@ at the stand-in boundary. This ADR governs that future step too.
   CCP response; we extract the secret into a `[]byte` without an intermediate
   password string and zeroize the response buffer, but cannot control every
   copy the runtime makes — swap-off (ADR-0001) is the backstop.
-- Real target-auth injection is stubbed (see Boundary).

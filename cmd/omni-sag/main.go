@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/rupivbluegreen/omni-sag/internal/api"
 	"github.com/rupivbluegreen/omni-sag/internal/approval"
@@ -87,8 +90,9 @@ func run(cfgPath string) error {
 	})
 
 	var dopts []dialer.Option
+	var sessOpts []session.Option // collected here, appended to `opts` further down where session.Option values are built
 	if ca := cfg.CyberArk; ca != nil {
-		opt, err := dialer.WithCyberArk(dialer.CyberArkParams{
+		prov, err := dialer.NewCyberArkProvider(dialer.CyberArkParams{
 			BaseURL:                ca.BaseURL,
 			ClientCert:             ca.ClientCertPath,
 			ClientKey:              ca.ClientKeyPath,
@@ -103,7 +107,8 @@ func run(cfgPath string) error {
 		if err != nil {
 			return err
 		}
-		dopts = append(dopts, opt)
+		dopts = append(dopts, dialer.WithCredentialProvider(prov))
+		sessOpts = append(sessOpts, session.WithCredentialProvider(prov))
 		log.Printf("omni-sag: CyberArk credential injection enabled (CCP %s)", ca.BaseURL)
 	}
 
@@ -122,6 +127,7 @@ func run(cfgPath string) error {
 			approvalStore = fs
 		}
 		dopts = append(dopts, dialer.WithApprovals(approvalStore, time.Duration(cfg.Approval.ApprovalTTL())*time.Second))
+		sessOpts = append(sessOpts, session.WithApprovals(approvalStore, time.Duration(cfg.Approval.ApprovalTTL())*time.Second))
 		log.Printf("omni-sag: four-eyes approvals enabled")
 	}
 
@@ -149,6 +155,8 @@ func run(cfgPath string) error {
 
 	var opts []session.Option
 	opts = append(opts, session.WithRegistry(reg))
+	opts = append(opts, session.WithDialerPeek(d.PeekHost))
+	opts = append(opts, sessOpts...)
 	if cfg.MFA.Enabled {
 		rc := cfg.MFA.RADIUS
 		opts = append(opts, session.WithMFA(authn.NewRADIUS(authn.RADIUSConfig{
@@ -176,6 +184,23 @@ func run(cfgPath string) error {
 		}
 		opts = append(opts, session.WithInspection(gate))
 		log.Printf("omni-sag: SFTP content inspection enabled (ICAP %s/%s)", cfg.Inspection.ICAP.Endpoint, cfg.Inspection.ICAP.Service)
+	}
+	switch {
+	case cfg.TargetKnownHosts != "":
+		cb, err := knownhosts.New(cfg.TargetKnownHosts)
+		if err != nil {
+			return fmt.Errorf("target_known_hosts: %w", err)
+		}
+		opts = append(opts, session.WithTargetHostKeyCallback(cb))
+		log.Printf("omni-sag: real-target host keys verified against %s", cfg.TargetKnownHosts)
+		if cfg.TargetInsecureHostKey {
+			log.Printf("omni-sag: WARNING target_known_hosts and target_insecure_host_key are both set — verified mode wins, insecure flag ignored")
+		}
+	case cfg.TargetInsecureHostKey:
+		opts = append(opts, session.WithInsecureTargetHostKey())
+		log.Printf("omni-sag: WARNING real-target host key verification is DISABLED (target_insecure_host_key: true) — dev-lab only, never use in production")
+	default:
+		log.Printf("omni-sag: real-target host key verification is NOT configured — shell/SFTP sessions to real targets will fail closed until target_known_hosts or target_insecure_host_key (dev-lab only) is set")
 	}
 	srv := session.New(hostKey, auth, d, met.CountingSink(ev.sessionSink), opts...)
 	met.SetActiveFn(srv.ActiveSessions)

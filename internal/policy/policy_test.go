@@ -108,3 +108,26 @@ func TestRecordMode_Normalize(t *testing.T) {
 		t.Fatal("full must stay full")
 	}
 }
+
+func TestDecide_CarriesTargetUser(t *testing.T) {
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []Rule{{Host: "db1.lab.local", TargetUser: "svc_db1"}},
+	}}}
+	d := p.Decide(Principal{User: "alice", Groups: []string{"dba"}}, Target{Host: "db1.lab.local", Port: 22})
+	if !d.Allow || d.TargetUser != "svc_db1" {
+		t.Fatalf("got Allow=%v TargetUser=%q, want Allow=true TargetUser=svc_db1", d.Allow, d.TargetUser)
+	}
+}
+
+func TestDecide_TargetUserEmptyWhenUnset(t *testing.T) {
+	p := Policy{Roles: []Role{{
+		Name: "dba", Groups: []string{"dba"},
+		Allow: []Rule{{Host: "db1.lab.local"}},
+	}}}
+	d := p.Decide(Principal{User: "alice", Groups: []string{"dba"}}, Target{Host: "db1.lab.local", Port: 22})
+	if d.TargetUser != "" {
+		t.Fatalf("got TargetUser=%q, want empty (caller defaults to login user)", d.TargetUser)
+	}
+}

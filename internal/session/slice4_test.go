@@ -8,15 +8,18 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/pkg/sftp"
 
+	"github.com/rupivbluegreen/omni-sag/internal/approval"
 	"github.com/rupivbluegreen/omni-sag/internal/authn"
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
+	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 	"github.com/rupivbluegreen/omni-sag/internal/recording"
 )
@@ -104,15 +107,35 @@ func TestSlice4_ForwardingAllowedMetadataOnly(t *testing.T) {
 	}
 }
 
+// TestSlice4_SFTPTransferManifest covers an SFTP upload producing a transfer
+// manifest. Since Task 11 (runSFTP now proxies to a real target and, when
+// inspection is enabled, gates delivery behind a quarantine-release
+// approval), this configures inspection + approvals and drives the
+// approval to completion — the manifest now comes from
+// quarantineWriteHandle.Close()'s post-release evidence emission rather than
+// memFS's session-end batch.
 func TestSlice4_SFTPTransferManifest(t *testing.T) {
 	sink := evidence.NewMemSink()
-	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink)
-	client := sshClient(t, addr, "alice")
+	targetHost, targetOpts := wireFakeSFTPTarget(t, nil)
+
+	quar := newFakeBlobStore()
+	gate, err := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := approval.NewFileStore(filepath.Join(t.TempDir(), "approvals.json"))
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	opts := append([]Option{WithInspection(gate), WithApprovals(store, 5*time.Second)}, targetOpts...)
+	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, opts...)
+	client := sshClient(t, addr, "alice%"+targetHost)
 
 	sc, err := sftp.NewClient(client)
 	if err != nil {
 		t.Fatalf("sftp client: %v", err)
 	}
+	defer sc.Close()
 	payload := []byte("the quick brown fox jumps over the lazy dog\n")
 	f, err := sc.Create("/upload.txt")
 	if err != nil {
@@ -121,8 +144,31 @@ func TestSlice4_SFTPTransferManifest(t *testing.T) {
 	if _, err := f.Write(payload); err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
-	sc.Close() // closes the channel -> runSFTP emits manifests
+
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- f.Close() }()
+
+	// Approve the release as a distinct user (four-eyes), the way the TUI/API
+	// would, then wait for the (now-unblocked) Close to finish.
+	var reqID string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && reqID == "" {
+		for _, r := range store.List() {
+			if r.Kind == approval.KindQuarantineRelease && r.Status == approval.StatusPending {
+				reqID = r.ID
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if reqID == "" {
+		t.Fatal("no pending KindQuarantineRelease request was created")
+	}
+	if _, err := store.Approve(reqID, "bob"); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := <-closeErr; err != nil {
+		t.Fatalf("sftp close after approval: %v", err)
+	}
 
 	want := sha256.Sum256(payload)
 	e := waitEvent(t, sink, func(e evidence.Event) bool { return e.Type == evidence.TypeTransfer })
@@ -143,8 +189,10 @@ func TestSlice4_RecordedShellProducesAsciicastAndManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink := evidence.NewMemSink()
-	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, WithRecording(store))
-	client := sshClient(t, addr, "alice")
+	targetHost, targetOpts := wireFakeTarget(t, "targetpw", nil)
+	opts := append([]Option{WithRecording(store)}, targetOpts...)
+	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, opts...)
+	client := sshClient(t, addr, "alice%"+targetHost)
 
 	sess, err := client.NewSession()
 	if err != nil {

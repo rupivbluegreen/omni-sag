@@ -67,6 +67,21 @@ services:
       - ./freeradius/authorize:/etc/raddb/mods-config/files/authorize:ro
     restart: unless-stopped
 
+  ssh-target:
+    image: linuxserver/openssh-server:latest
+    container_name: omni-sag-ssh-target
+    hostname: db1
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "Etc/UTC"
+      PASSWORD_ACCESS: "true"
+      USER_NAME: "svc_db1"
+      USER_PASSWORD: "InjectedSecret123!"
+    ports:
+      - "2200:2222"
+    restart: unless-stopped
+
 volumes:
   samba-data:
   samba-config:

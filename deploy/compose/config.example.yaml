@@ -3,6 +3,13 @@
 listen: ":2222"
 host_key: "hostkey.pem"
 
+# Real-target second SSH leg (shell/SFTP proxy to the ssh-target container
+# below): dev-lab only, no target_known_hosts file exists in this lab, so
+# host-key verification for that second leg is explicitly disabled. Without
+# EITHER this or target_known_hosts, dialTarget fails closed and the
+# Real-target demo rule below can never succeed. Never set this in production.
+target_insecure_host_key: true
+
 ldap:
   url: "ldaps://127.0.0.1:636"
   base_dn: "DC=lab,DC=local"
@@ -148,3 +155,16 @@ policy:
           # credential (Slice 6): passthrough (default) | prompt | inject | deny
           #   inject -> fetch from CyberArk; fails closed if CCP is unavailable
           credential: passthrough
+        # Real-target demo (this design's shell/SFTP proxy, not the -L tunnel
+        # above): alice gets a genuine shell/SFTP on the ssh-target container,
+        # authenticated as svc_db1. Uses "prompt" rather than "inject" because
+        # no mock CyberArk CCP service runs in this compose lab (only the CCP
+        # *client* is exercised, against an in-process httptest.Server, in
+        # internal/credential/ccp_test.go) — inject would fail closed here
+        # with no CCP to fetch from. prompt exercises the same target-side
+        # password-auth path as inject would, with no extra infrastructure.
+        - host: "127.0.0.1"
+          ports: [2200]
+          target_user: "svc_db1"
+          record: full
+          credential: prompt
