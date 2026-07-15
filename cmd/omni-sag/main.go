@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 	"github.com/rupivbluegreen/omni-sag/internal/policysource"
 	"github.com/rupivbluegreen/omni-sag/internal/recording"
+	"github.com/rupivbluegreen/omni-sag/internal/release"
 	"github.com/rupivbluegreen/omni-sag/internal/session"
 	"github.com/rupivbluegreen/omni-sag/internal/sessions"
 )
@@ -124,10 +126,11 @@ func run(cfgPath string) error {
 			if err != nil {
 				return err
 			}
+			fs.SetGroupLookup(auth) // auth is the *authn.LDAPAuthenticator already constructed above for SSH login; Groups() needs no extra wiring
 			approvalStore = fs
 		}
 		dopts = append(dopts, dialer.WithApprovals(approvalStore, time.Duration(cfg.Approval.ApprovalTTL())*time.Second))
-		sessOpts = append(sessOpts, session.WithApprovals(approvalStore, time.Duration(cfg.Approval.ApprovalTTL())*time.Second))
+		sessOpts = append(sessOpts, session.WithApprovals(approvalStore, time.Duration(cfg.Approval.ReleaseTTL())*time.Second))
 		log.Printf("omni-sag: four-eyes approvals enabled")
 	}
 
@@ -184,6 +187,14 @@ func run(cfgPath string) error {
 		}
 		opts = append(opts, session.WithInspection(gate))
 		log.Printf("omni-sag: SFTP content inspection enabled (ICAP %s/%s)", cfg.Inspection.ICAP.Endpoint, cfg.Inspection.ICAP.Service)
+	}
+	if cfg.Approval != nil {
+		relStore, err := release.NewFileStore(filepath.Join(filepath.Dir(cfg.Approval.StorePath), "releases.json"))
+		if err != nil {
+			return err
+		}
+		opts = append(opts, session.WithReleases(relStore, 6*time.Hour))
+		log.Printf("omni-sag: SFTP pull-download releases enabled (window=6h)")
 	}
 	switch {
 	case cfg.TargetKnownHosts != "":

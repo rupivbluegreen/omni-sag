@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -137,4 +138,179 @@ func TestWait_CtxCancelFailsClosed(t *testing.T) {
 	if got.Approved(time.Now()) {
 		t.Fatal("must not be approved on ctx cancel")
 	}
+}
+
+type fakeGroupLookup struct {
+	groups map[string][]string // username -> groups
+	err    error
+}
+
+func (f *fakeGroupLookup) Groups(_ context.Context, username string) ([]string, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.groups[username], nil
+}
+
+func TestFileStore_ApproveGroupScoped_PeerInGroupSucceeds(t *testing.T) {
+	s, err := NewFileStore(filepath.Join(t.TempDir(), "a.json"))
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	s.SetGroupLookup(&fakeGroupLookup{groups: map[string][]string{"bob": {"dba"}}})
+
+	req, err := s.Create(Request{Kind: KindQuarantineRelease, Requester: "alice", RequesterGroups: []string{"dba"}, Subject: "quarantine/key1"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := s.Approve(req.ID, "bob"); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+}
+
+func TestFileStore_ApproveGroupScoped_NonPeerRefused(t *testing.T) {
+	s, err := NewFileStore(filepath.Join(t.TempDir(), "a.json"))
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	s.SetGroupLookup(&fakeGroupLookup{groups: map[string][]string{"carol": {"engineering"}}})
+
+	req, err := s.Create(Request{Kind: KindQuarantineRelease, Requester: "alice", RequesterGroups: []string{"dba"}, Subject: "quarantine/key1"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// carol is a DIFFERENT user from alice (passes plain four-eyes) but is not
+	// in "dba" — must still be refused.
+	_, err = s.Approve(req.ID, "carol")
+	if !errors.Is(err, ErrNotPeerGroup) {
+		t.Fatalf("want ErrNotPeerGroup, got %v", err)
+	}
+}
+
+func TestFileStore_ApproveGroupScoped_LookupFailureFailsClosed(t *testing.T) {
+	s, err := NewFileStore(filepath.Join(t.TempDir(), "a.json"))
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	s.SetGroupLookup(&fakeGroupLookup{err: errors.New("ldap down")})
+
+	req, err := s.Create(Request{Kind: KindQuarantineRelease, Requester: "alice", RequesterGroups: []string{"dba"}, Subject: "quarantine/key1"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := s.Approve(req.ID, "bob"); err == nil {
+		t.Fatal("want an error when GroupLookup fails, got nil (must fail closed, not silently allow)")
+	}
+}
+
+func TestFileStore_ApproveGroupScoped_NoGroupLookupConfiguredKeepsPlainFourEyes(t *testing.T) {
+	s, err := NewFileStore(filepath.Join(t.TempDir(), "a.json")) // no SetGroupLookup call
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	req, err := s.Create(Request{Kind: KindQuarantineRelease, Requester: "alice", RequesterGroups: []string{"dba"}, Subject: "quarantine/key1"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// No GroupLookup configured: any distinct user still succeeds — today's
+	// behavior, unchanged, proving this feature is opt-in.
+	if _, err := s.Approve(req.ID, "carol"); err != nil {
+		t.Fatalf("Approve without a configured GroupLookup must behave as plain four-eyes: %v", err)
+	}
+}
+
+func TestFileStore_ApproveGroupScoped_SessionKindUnaffected(t *testing.T) {
+	s, err := NewFileStore(filepath.Join(t.TempDir(), "a.json"))
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	s.SetGroupLookup(&fakeGroupLookup{groups: map[string][]string{"carol": {"engineering"}}})
+
+	req, err := s.Create(Request{Kind: KindSession, Requester: "alice", RequesterGroups: []string{"dba"}, Subject: "db1.lab.local:22"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// KindSession must NOT be group-scoped even with a GroupLookup configured
+	// and RequesterGroups set — the design scopes this narrowly to
+	// KindQuarantineRelease only.
+	if _, err := s.Approve(req.ID, "carol"); err != nil {
+		t.Fatalf("KindSession approvals must stay plain four-eyes: %v", err)
+	}
+}
+
+// TestFileStore_ApproveGroupScoped_ConcurrentDecideRace exercises the TOCTOU
+// window in decide(): the mutex is released across the live GroupLookup call,
+// so two approvers racing on the same pending request must still yield
+// exactly one winning decision, never a corrupted/overwritten one.
+func TestFileStore_ApproveGroupScoped_ConcurrentDecideRace(t *testing.T) {
+	s, err := NewFileStore(filepath.Join(t.TempDir(), "a.json"))
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	// A slow GroupLookup widens the unlocked window so the race is real, not
+	// theoretical.
+	gl := &slowGroupLookup{delay: 20 * time.Millisecond, groups: map[string][]string{
+		"bob":   {"dba"},
+		"carol": {"dba"},
+	}}
+	s.SetGroupLookup(gl)
+
+	req, err := s.Create(Request{Kind: KindQuarantineRelease, Requester: "alice", RequesterGroups: []string{"dba"}, Subject: "quarantine/key1"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	results := make(chan error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err := s.Approve(req.ID, "bob")
+		results <- err
+	}()
+	go func() {
+		defer wg.Done()
+		_, err := s.Deny(req.ID, "carol")
+		results <- err
+	}()
+	wg.Wait()
+	close(results)
+
+	var oks, notPending int
+	for err := range results {
+		switch {
+		case err == nil:
+			oks++
+		case errors.Is(err, ErrNotPending):
+			notPending++
+		default:
+			t.Fatalf("unexpected error from concurrent decide: %v", err)
+		}
+	}
+	if oks != 1 || notPending != 1 {
+		t.Fatalf("want exactly one winner and one ErrNotPending, got oks=%d notPending=%d", oks, notPending)
+	}
+
+	got, ok := s.Get(req.ID)
+	if !ok {
+		t.Fatal("request must still exist after the race")
+	}
+	if got.Status != StatusApproved && got.Status != StatusDenied {
+		t.Fatalf("request must be decided exactly once, got status=%s", got.Status)
+	}
+	if got.Approver != "bob" && got.Approver != "carol" {
+		t.Fatalf("approver must be whichever goroutine won, got %q", got.Approver)
+	}
+}
+
+// slowGroupLookup simulates a live LDAP round-trip's latency, so a test can
+// exercise the window during which FileStore.decide holds no lock.
+type slowGroupLookup struct {
+	delay  time.Duration
+	groups map[string][]string
+}
+
+func (g *slowGroupLookup) Groups(_ context.Context, username string) ([]string, error) {
+	time.Sleep(g.delay)
+	return g.groups[username], nil
 }

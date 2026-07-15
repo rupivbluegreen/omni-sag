@@ -62,6 +62,8 @@ func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request, approve 
 		writeError(w, http.StatusNotFound, "approval not found")
 	case errors.Is(err, approval.ErrFourEyes):
 		writeError(w, http.StatusForbidden, "four-eyes: you may not decide your own request")
+	case errors.Is(err, approval.ErrNotPeerGroup):
+		writeError(w, http.StatusForbidden, "group-scoped four-eyes: you are not a member of the requester's role-granting group")
 	case errors.Is(err, approval.ErrNotPending):
 		writeError(w, http.StatusConflict, "approval is not pending")
 	case errors.Is(err, approval.ErrStoreUnavailable):

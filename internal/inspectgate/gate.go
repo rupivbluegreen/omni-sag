@@ -259,8 +259,8 @@ func (g *Gate) inspectLarge(ctx context.Context, meta inspect.TransferMeta, cont
 }
 
 // QuarantineReader opens the quarantined object at key for reading — used to
-// deliver a released (approved) upload to its real target. Callers must
-// Close the returned reader.
+// serve an approved upload back to its own uploader via /releases. Callers
+// must Close the returned reader.
 func (g *Gate) QuarantineReader(ctx context.Context, key string) (io.ReadCloser, error) {
 	return g.quarantine.Get(ctx, key)
 }

@@ -50,9 +50,10 @@ func (f *File) DrainGraceSeconds() int {
 
 // ApprovalConfig configures the durable four-eyes approval store.
 type ApprovalConfig struct {
-	StorePath  string `yaml:"store_path"`  // durable JSON file for approval requests
-	TTLSeconds int    `yaml:"ttl_seconds"` // pending-request lifetime (default 900)
-	UseCRD     bool   `yaml:"use_crd"`     // use the (stubbed) CRD store instead of the file store
+	StorePath         string `yaml:"store_path"`          // durable JSON file for approval requests
+	TTLSeconds        int    `yaml:"ttl_seconds"`         // pending-request lifetime (default 900)
+	ReleaseTTLSeconds int    `yaml:"release_ttl_seconds"` // KindQuarantineRelease pending-request lifetime (default 86400 = 24h) — separate from ttl_seconds, which governs session-access approvals
+	UseCRD            bool   `yaml:"use_crd"`             // use the (stubbed) CRD store instead of the file store
 }
 
 // ApprovalTTL returns the configured TTL or the default.
@@ -61,6 +62,18 @@ func (a *ApprovalConfig) ApprovalTTL() int {
 		return 900
 	}
 	return a.TTLSeconds
+}
+
+// ReleaseTTL returns the configured quarantine-release approval TTL (in
+// seconds) or the default (24h). Kept separate from ApprovalTTL, which
+// governs session-access (KindSession) approvals — the two are expected to
+// differ (a release approval is not time-critical the way logging into a
+// live target is).
+func (a *ApprovalConfig) ReleaseTTL() int {
+	if a == nil || a.ReleaseTTLSeconds <= 0 {
+		return 86400
+	}
+	return a.ReleaseTTLSeconds
 }
 
 // APIConfig configures the control-plane API server. It runs on a listener
