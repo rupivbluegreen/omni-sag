@@ -3,12 +3,18 @@ package authn
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/go-ldap/ldap/v3"
 )
+
+// errUserNotFound distinguishes "the search found zero or multiple entries"
+// from lookupUser's other failure modes (service bind, search RPC), so
+// Authenticate knows precisely when its decoy bind applies.
+var errUserNotFound = errors.New("user not uniquely found")
 
 // defaultLDAPTimeout bounds each LDAP request (bind/search) when the caller's
 // context carries no deadline. go-ldap's per-request timeout is otherwise
@@ -50,14 +56,39 @@ func (a *LDAPAuthenticator) Authenticate(ctx context.Context, username, password
 		return Identity{}, fmt.Errorf("%w: empty password", ErrAuth)
 	}
 
-	conn, err := ldap.DialURL(a.cfg.URL, ldap.DialWithTLSConfig(&tls.Config{
-		InsecureSkipVerify: a.cfg.InsecureTLS, //nolint:gosec // dev-only opt-in; rejected under fips.mode=enforce by config validation
-	}))
+	conn, err := a.dial()
 	if err != nil {
-		return Identity{}, fmt.Errorf("%w: connect: %v", ErrAuth, err)
+		return Identity{}, err
 	}
 	defer conn.Close()
 
+	// 1-2. Bind as the service account and find the user; read DN and group membership.
+	entry, err := a.lookupUser(ctx, conn, username)
+	if err != nil {
+		if errors.Is(err, errUserNotFound) {
+			// Equalize round-trips: a wrong-password attempt for an existing
+			// user incurs a user bind below, so a nonexistent user must incur
+			// one too, or response latency becomes a username-enumeration
+			// oracle. Bind a decoy DN that cannot be a real account (avoids
+			// any lockout risk).
+			_ = conn.Bind("CN=omni-sag-nonexistent-decoy,"+a.cfg.BaseDN, password)
+		}
+		return Identity{}, err
+	}
+
+	// 3. Verify the password by binding as the user.
+	if err := conn.Bind(entry.DN, password); err != nil {
+		return Identity{}, fmt.Errorf("%w: user bind: %v", ErrAuth, err)
+	}
+
+	groups := groupCNsFromMemberOf(entry.GetAttributeValues("memberOf"))
+	return Identity{User: username, Groups: groups}, nil
+}
+
+// lookupUser binds as the service account and searches for username,
+// returning the found entry (DN + memberOf). Used by both Authenticate
+// (which additionally verifies a password) and Groups (which does not).
+func (a *LDAPAuthenticator) lookupUser(ctx context.Context, conn *ldap.Conn, username string) (*ldap.Entry, error) {
 	// Bound every subsequent request so a stalled DC cannot block forever.
 	// Honor the caller's deadline if it is tighter than the default.
 	timeout := defaultLDAPTimeout
@@ -72,12 +103,10 @@ func (a *LDAPAuthenticator) Authenticate(ctx context.Context, username, password
 		searchSecs = 1
 	}
 
-	// 1. Bind as the service account to perform the lookup.
 	if err := conn.Bind(a.cfg.BindDN, a.cfg.BindPassword); err != nil {
-		return Identity{}, fmt.Errorf("%w: service bind: %v", ErrAuth, err)
+		return nil, fmt.Errorf("%w: service bind: %v", ErrAuth, err)
 	}
 
-	// 2. Find the user; read DN and group membership.
 	req := ldap.NewSearchRequest(
 		a.cfg.BaseDN,
 		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 1, searchSecs, false,
@@ -87,25 +116,42 @@ func (a *LDAPAuthenticator) Authenticate(ctx context.Context, username, password
 	)
 	res, err := conn.Search(req)
 	if err != nil {
-		return Identity{}, fmt.Errorf("%w: search: %v", ErrAuth, err)
+		return nil, fmt.Errorf("%w: search: %v", ErrAuth, err)
 	}
 	if len(res.Entries) != 1 {
-		// Equalize round-trips: a wrong-password attempt for an existing user
-		// incurs a user bind below, so a nonexistent user must incur one too,
-		// or response latency becomes a username-enumeration oracle. Bind a
-		// decoy DN that cannot be a real account (avoids any lockout risk).
-		_ = conn.Bind("CN=omni-sag-nonexistent-decoy,"+a.cfg.BaseDN, password)
-		return Identity{}, fmt.Errorf("%w: user not uniquely found", ErrAuth)
+		return nil, fmt.Errorf("%w: %w", ErrAuth, errUserNotFound)
 	}
-	entry := res.Entries[0]
+	return res.Entries[0], nil
+}
 
-	// 3. Verify the password by binding as the user.
-	if err := conn.Bind(entry.DN, password); err != nil {
-		return Identity{}, fmt.Errorf("%w: user bind: %v", ErrAuth, err)
+func (a *LDAPAuthenticator) dial() (*ldap.Conn, error) {
+	conn, err := ldap.DialURL(a.cfg.URL, ldap.DialWithTLSConfig(&tls.Config{
+		InsecureSkipVerify: a.cfg.InsecureTLS, //nolint:gosec // dev-only opt-in; rejected under fips.mode=enforce by config validation
+	}))
+	if err != nil {
+		return nil, fmt.Errorf("%w: connect: %v", ErrAuth, err)
 	}
+	return conn, nil
+}
 
-	groups := groupCNsFromMemberOf(entry.GetAttributeValues("memberOf"))
-	return Identity{User: username, Groups: groups}, nil
+// Groups resolves username's current AD group membership via the service
+// account only — no password required. Used for group-scoped four-eyes at
+// quarantine-release approval time (the approver's password is never
+// available to the control plane at that point). Callers must not use this
+// as an authentication check: it proves nothing about who is asking, only
+// what the named account's groups currently are.
+func (a *LDAPAuthenticator) Groups(ctx context.Context, username string) ([]string, error) {
+	conn, err := a.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	entry, err := a.lookupUser(ctx, conn, username)
+	if err != nil {
+		return nil, err
+	}
+	return groupCNsFromMemberOf(entry.GetAttributeValues("memberOf")), nil
 }
 
 // groupCNsFromMemberOf extracts the CN component from each AD group DN in a
