@@ -3,6 +3,7 @@
 #   dba   : role-granting group
 #   alice : member of dba   (tunnel allowed)
 #   bob   : not in dba      (tunnel prohibited)
+#   carol : member of dba   (peer approver for alice's group-scoped four-eyes)
 #
 # Usage: scripts/lab-seed.sh   (after `make lab-up` and provisioning settles)
 set -euo pipefail
@@ -29,8 +30,10 @@ ensure_user() {
 ensure_group dba
 ensure_user alice
 ensure_user bob
+ensure_user carol
 # addmembers is idempotent enough: it errors if already a member, so guard it.
 st group listmembers dba 2>/dev/null | grep -qx alice || st group addmembers dba alice
+st group listmembers dba 2>/dev/null | grep -qx carol || st group addmembers dba carol
 
 echo "seeded. dba members:"
 st group listmembers dba

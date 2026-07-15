@@ -20,9 +20,10 @@ type FileStore struct {
 	path string
 	now  func() time.Time
 
-	mu       sync.Mutex
-	requests map[string]*Request
-	decided  map[string]chan struct{} // closed when a request leaves pending (per process)
+	mu          sync.Mutex
+	requests    map[string]*Request
+	decided     map[string]chan struct{} // closed when a request leaves pending (per process)
+	groupLookup GroupLookup              // optional; nil disables group-scoped four-eyes (plain four-eyes only)
 }
 
 // NewFileStore opens (creating if absent) the store at path and loads any
@@ -162,6 +163,17 @@ func (s *FileStore) List() []Request {
 	return out
 }
 
+// SetGroupLookup enables group-scoped four-eyes for KindQuarantineRelease
+// approvals: Approve additionally requires the approver's current AD groups
+// (resolved via gl) to overlap the request's RequesterGroups. Call once,
+// before serving traffic; nil (the default, if never called) keeps every
+// request kind on plain four-eyes only (approver != requester).
+func (s *FileStore) SetGroupLookup(gl GroupLookup) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.groupLookup = gl
+}
+
 // Approve decides a pending request, enforcing four-eyes.
 func (s *FileStore) Approve(id, approver string) (Request, error) {
 	return s.decide(id, approver, StatusApproved)
@@ -174,13 +186,14 @@ func (s *FileStore) Deny(id, approver string) (Request, error) {
 
 func (s *FileStore) decide(id, approver string, status Status) (Request, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	r, ok := s.requests[id]
 	if !ok {
+		s.mu.Unlock()
 		return Request{}, ErrNotFound
 	}
 	// A request that has already expired (by TTL) cannot be decided.
 	if r.EffectiveStatus(s.now()) != StatusPending {
+		s.mu.Unlock()
 		return Request{}, ErrNotPending
 	}
 	// Four-eyes: the approver must be a distinct actor from the requester.
@@ -190,8 +203,44 @@ func (s *FileStore) decide(id, approver string, status Status) (Request, error) 
 	// request — the deployment MUST configure API subjects to equal SSH login
 	// names, or four-eyes can be defeated across the two namespaces.
 	if approver == "" || canonicalID(approver) == canonicalID(r.Requester) {
+		s.mu.Unlock()
 		return Request{}, ErrFourEyes
 	}
+
+	// Group-scoped four-eyes (additive, opt-in — see SetGroupLookup's doc):
+	// only for an APPROVE decision on a KindQuarantineRelease request that
+	// actually has a RequesterGroups snapshot, and only when a GroupLookup is
+	// configured. s.groupLookup.Groups is a live LDAP call, so it must not run
+	// with s.mu held — that would block every other Get/List/Create/Wait for
+	// the round-trip. We release the lock for the call and re-acquire before
+	// writing the decision, then re-check pending-ness: another approver may
+	// have decided this same request while we were unlocked.
+	if status == StatusApproved && r.Kind == KindQuarantineRelease && len(r.RequesterGroups) > 0 && s.groupLookup != nil {
+		gl := s.groupLookup
+		requesterGroups := r.RequesterGroups
+		s.mu.Unlock()
+
+		approverGroups, gerr := gl.Groups(context.Background(), approver)
+		if gerr != nil {
+			return Request{}, fmt.Errorf("%w: group lookup failed: %v", ErrNotPeerGroup, gerr)
+		}
+		if !groupsOverlap(approverGroups, requesterGroups) {
+			return Request{}, ErrNotPeerGroup
+		}
+
+		s.mu.Lock()
+		r, ok = s.requests[id]
+		if !ok {
+			s.mu.Unlock()
+			return Request{}, ErrNotFound
+		}
+		if r.EffectiveStatus(s.now()) != StatusPending {
+			s.mu.Unlock()
+			return Request{}, ErrNotPending
+		}
+	}
+	defer s.mu.Unlock()
+
 	r.Status = status
 	r.Approver = approver
 	r.DecidedAt = s.now().UTC()
@@ -204,6 +253,21 @@ func (s *FileStore) decide(id, approver string, status Status) (Request, error) 
 	}
 	s.closeDecided(id)
 	return *r, nil
+}
+
+// groupsOverlap reports whether a and b share at least one entry,
+// case-insensitively.
+func groupsOverlap(a, b []string) bool {
+	set := make(map[string]bool, len(a))
+	for _, g := range a {
+		set[canonicalID(g)] = true
+	}
+	for _, g := range b {
+		if set[canonicalID(g)] {
+			return true
+		}
+	}
+	return false
 }
 
 // closeDecided signals waiters. Caller holds s.mu.

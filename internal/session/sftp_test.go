@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -21,6 +23,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/inspect"
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
+	"github.com/rupivbluegreen/omni-sag/internal/release"
 )
 
 // startFakeSFTPTarget runs an in-process SSH server that serves the "sftp"
@@ -220,6 +223,21 @@ func (cleanInspector) Inspect(_ context.Context, _ inspect.TransferMeta, body io
 // already implements inspectgate.BlobStore.
 func newFakeBlobStore() *memQuarantine { return newMemQuarantine() }
 
+func TestWithReleases_SetsFieldsOnServer(t *testing.T) {
+	store, err := release.NewFileStore(filepath.Join(t.TempDir(), "r.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	s := &Server{}
+	WithReleases(store, 6*time.Hour)(s)
+	if s.releases != store {
+		t.Fatal("WithReleases did not set s.releases")
+	}
+	if s.releaseTTL != 6*time.Hour {
+		t.Fatalf("s.releaseTTL = %v, want 6h", s.releaseTTL)
+	}
+}
+
 // TestQuarantineWriteHandle_AutoDeniedWithNoApprovalStoreFailsClosed: even a
 // clean-verdict upload must never reach the target when there is no approval
 // store to release it from quarantine — fail closed, not fail open.
@@ -253,15 +271,14 @@ func TestQuarantineWriteHandle_AutoDeniedWithNoApprovalStoreFailsClosed(t *testi
 	}
 }
 
-// TestQuarantineWriteHandle_ApprovedDeliversToTarget: a clean upload blocks on
-// Close() until a distinct human approves the KindQuarantineRelease request,
-// then (and only then) the quarantined bytes reach the real target file.
-func TestQuarantineWriteHandle_ApprovedDeliversToTarget(t *testing.T) {
+// TestQuarantineWriteHandle_ApprovedRecordsReleaseNotPush: a clean upload
+// blocks on Close() until a distinct human approves the
+// KindQuarantineRelease request, then (and only then) a release is recorded
+// — the bytes are never pushed to the target (supersedes the old
+// ApprovedDeliversToTarget behavior from before this task).
+func TestQuarantineWriteHandle_ApprovedRecordsReleaseNotPush(t *testing.T) {
 	quar := newFakeBlobStore()
-	g, err := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
-	if err != nil {
-		t.Fatalf("inspectgate.New: %v", err)
-	}
+	g, _ := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
 	fakeConn := startFakeSFTPTarget(t, nil)
 	targetClient, err := sftp.NewClient(sshClientOver(t, fakeConn))
 	if err != nil {
@@ -269,17 +286,18 @@ func TestQuarantineWriteHandle_ApprovedDeliversToTarget(t *testing.T) {
 	}
 	defer targetClient.Close()
 
-	store, err := approval.NewFileStore(filepath.Join(t.TempDir(), "approvals.json"))
+	approvals, err := approval.NewFileStore(filepath.Join(t.TempDir(), "approvals.json"))
 	if err != nil {
-		t.Fatalf("NewFileStore: %v", err)
+		t.Fatalf("approval.NewFileStore: %v", err)
 	}
-	s := &Server{sink: noopSink{}, inspect: g, approvals: store, approvalTTL: 5 * time.Second}
-	fs := &remoteFS{client: targetClient, gate: g, srv: s, user: "alice"}
+	releases, err := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	s := &Server{sink: noopSink{}, inspect: g, approvals: approvals, approvalTTL: 5 * time.Second, releases: releases, releaseTTL: 6 * time.Hour}
+	fs := &remoteFS{client: targetClient, gate: g, srv: s, user: "alice", matchedGroups: []string{"dba"}, releases: releases, releaseTTL: 6 * time.Hour}
 
-	h, err := fs.Filewrite(&sftp.Request{Method: "Put", Filepath: "/upload.txt"})
-	if err != nil {
-		t.Fatalf("Filewrite: %v", err)
-	}
+	h, _ := fs.Filewrite(&sftp.Request{Method: "Put", Filepath: "/upload.txt"})
 	if _, err := h.WriteAt([]byte("clean content"), 0); err != nil {
 		t.Fatalf("WriteAt: %v", err)
 	}
@@ -287,38 +305,83 @@ func TestQuarantineWriteHandle_ApprovedDeliversToTarget(t *testing.T) {
 	closeErr := make(chan error, 1)
 	go func() { closeErr <- h.(io.Closer).Close() }()
 
-	// Poll for the pending request the way the TUI/API would, then approve it
-	// as a different user (four-eyes).
 	var reqID string
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		for _, r := range store.List() {
+	for time.Now().Before(deadline) && reqID == "" {
+		for _, r := range approvals.List() {
 			if r.Kind == approval.KindQuarantineRelease && r.Status == approval.StatusPending {
 				reqID = r.ID
 			}
 		}
-		if reqID != "" {
-			break
+		time.Sleep(10 * time.Millisecond)
+	}
+	if reqID == "" {
+		t.Fatal("no pending release request")
+	}
+	if _, err := approvals.Approve(reqID, "bob"); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := <-closeErr; err != nil {
+		t.Fatalf("Close after approval: %v", err)
+	}
+
+	// The target must NEVER have received the file — this is the core
+	// behavior change: pull, not push.
+	if _, err := targetClient.Open("/upload.txt"); err == nil {
+		t.Fatal("approved upload must NOT be delivered to the target — pull-download model, not push")
+	}
+	// A release must exist for alice, listing the original filename.
+	list := releases.ListFor("alice", time.Now())
+	if len(list) != 1 {
+		t.Fatalf("releases.ListFor(alice) = %v, want exactly one release", list)
+	}
+	if list[0].OriginalFilename != "/upload.txt" {
+		t.Fatalf("release.OriginalFilename = %q, want /upload.txt", list[0].OriginalFilename)
+	}
+}
+
+func TestQuarantineWriteHandle_ApprovedButNoReleaseStoreConfiguredFailsClosed(t *testing.T) {
+	quar := newFakeBlobStore()
+	g, _ := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	fakeConn := startFakeSFTPTarget(t, nil)
+	targetClient, err := sftp.NewClient(sshClientOver(t, fakeConn))
+	if err != nil {
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+	defer targetClient.Close()
+
+	approvals, err := approval.NewFileStore(filepath.Join(t.TempDir(), "approvals.json"))
+	if err != nil {
+		t.Fatalf("approval.NewFileStore: %v", err)
+	}
+	// No releases store configured — s.releases is nil.
+	s := &Server{sink: noopSink{}, inspect: g, approvals: approvals, approvalTTL: 5 * time.Second}
+	fs := &remoteFS{client: targetClient, gate: g, srv: s, user: "alice"}
+
+	h, _ := fs.Filewrite(&sftp.Request{Method: "Put", Filepath: "/upload.txt"})
+	_, _ = h.WriteAt([]byte("clean content"), 0)
+
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- h.(io.Closer).Close() }()
+
+	var reqID string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && reqID == "" {
+		for _, r := range approvals.List() {
+			if r.Kind == approval.KindQuarantineRelease && r.Status == approval.StatusPending {
+				reqID = r.ID
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	if reqID == "" {
-		t.Fatal("no pending KindQuarantineRelease request was created")
+		t.Fatal("no pending release request")
 	}
-	if _, err := store.Approve(reqID, "bob"); err != nil {
+	if _, err := approvals.Approve(reqID, "bob"); err != nil {
 		t.Fatalf("Approve: %v", err)
 	}
-
-	if err := <-closeErr; err != nil {
-		t.Fatalf("Close after approval: %v", err)
-	}
-	delivered, err := targetClient.Open("/upload.txt")
-	if err != nil {
-		t.Fatalf("target file was not delivered: %v", err)
-	}
-	got, _ := io.ReadAll(delivered)
-	if string(got) != "clean content" {
-		t.Fatalf("delivered content = %q, want %q", got, "clean content")
+	if err := <-closeErr; err == nil {
+		t.Fatal("Close must fail closed when approved but no release store is configured to record it")
 	}
 }
 
@@ -535,7 +598,7 @@ func TestRemoteFS_FilecmdEmitsEvidenceForDestructiveOps(t *testing.T) {
 
 // --- Minor finding #5: quarantineWriteHandle.Close() must be idempotent —
 // a second call must not re-emit inspection evidence, create a second
-// KindQuarantineRelease request, or re-deliver to the target. ---
+// KindQuarantineRelease request, or record a second release. ---
 
 func TestQuarantineWriteHandle_CloseIsIdempotent(t *testing.T) {
 	quar := newFakeBlobStore()
@@ -554,8 +617,12 @@ func TestQuarantineWriteHandle_CloseIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFileStore: %v", err)
 	}
-	s := &Server{sink: noopSink{}, inspect: g, approvals: store, approvalTTL: 5 * time.Second}
-	fs := &remoteFS{client: targetClient, gate: g, srv: s, user: "alice"}
+	releases, err := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	s := &Server{sink: noopSink{}, inspect: g, approvals: store, approvalTTL: 5 * time.Second, releases: releases, releaseTTL: 6 * time.Hour}
+	fs := &remoteFS{client: targetClient, gate: g, srv: s, user: "alice", releases: releases, releaseTTL: 6 * time.Hour}
 
 	h, err := fs.Filewrite(&sftp.Request{Method: "Put", Filepath: "/upload.txt"})
 	if err != nil {
@@ -598,13 +665,12 @@ func TestQuarantineWriteHandle_CloseIsIdempotent(t *testing.T) {
 		t.Fatalf("want exactly 1 KindQuarantineRelease request created across both Close() calls, got %d", releaseReqs)
 	}
 
-	delivered, err := targetClient.Open("/upload.txt")
-	if err != nil {
-		t.Fatalf("target file was not delivered: %v", err)
+	if _, err := targetClient.Open("/upload.txt"); err == nil {
+		t.Fatal("approved upload must NOT be delivered to the target — pull-download model, not push")
 	}
-	got, _ := io.ReadAll(delivered)
-	if string(got) != "clean content" {
-		t.Fatalf("delivered content = %q, want %q (must not be duplicated by a second delivery)", got, "clean content")
+	list := releases.ListFor("alice", time.Now())
+	if len(list) != 1 {
+		t.Fatalf("releases.ListFor(alice) = %v, want exactly one release (not duplicated by a second Close)", list)
 	}
 }
 
@@ -634,4 +700,250 @@ func TestRunSFTP_EmitsSessionStartAndEndOnNormalCompletion(t *testing.T) {
 	waitEvent(t, sink, func(e evidence.Event) bool {
 		return e.Type == evidence.TypeSessionEnd && e.User == "alice" && e.Detail == ""
 	})
+}
+
+// --- Task 7: the /releases virtual SFTP directory ---
+
+func TestRemoteFS_ReleasesDirectory_ListsOwnReleasesOnly(t *testing.T) {
+	releases, err := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	if _, err := releases.Create(release.Release{QuarantineKey: "q/k1", Requester: "alice", OriginalFilename: "report.csv"}, time.Hour); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := releases.Create(release.Release{QuarantineKey: "q/k2", Requester: "bob", OriginalFilename: "secret.txt"}, time.Hour); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	fs := &remoteFS{user: "alice", releases: releases}
+	listing, err := fs.Filelist(&sftp.Request{Method: "List", Filepath: "/releases"})
+	if err != nil {
+		t.Fatalf("Filelist: %v", err)
+	}
+	infos := make([]os.FileInfo, 8)
+	n, _ := listing.ListAt(infos, 0)
+	if n != 1 {
+		t.Fatalf("got %d entries, want exactly 1 (alice's own release, not bob's)", n)
+	}
+}
+
+func TestRemoteFS_ReleasesDirectory_ReadStreamsFromQuarantine(t *testing.T) {
+	quar := newFakeBlobStore()
+	if err := quar.Put(context.Background(), "q/k1", "application/octet-stream", strings.NewReader("secret report"), -1); err != nil {
+		t.Fatalf("seed quarantine: %v", err)
+	}
+	g, err := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	if err != nil {
+		t.Fatalf("inspectgate.New: %v", err)
+	}
+	releases, err := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	rel, err := releases.Create(release.Release{QuarantineKey: "q/k1", Requester: "alice", OriginalFilename: "report.csv"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	fs := &remoteFS{user: "alice", releases: releases, gate: g, ctx: context.Background()}
+	r, err := fs.Fileread(&sftp.Request{Method: "Get", Filepath: "/releases/" + rel.ID})
+	if err != nil {
+		t.Fatalf("Fileread: %v", err)
+	}
+	buf := make([]byte, 32)
+	n, _ := r.ReadAt(buf, 0)
+	if got := string(buf[:n]); got != "secret report" {
+		t.Fatalf("got %q, want %q", got, "secret report")
+	}
+}
+
+func TestRemoteFS_ReleasesDirectory_WrongUserCannotRead(t *testing.T) {
+	quar := newFakeBlobStore()
+	_ = quar.Put(context.Background(), "q/k1", "application/octet-stream", strings.NewReader("secret"), -1)
+	g, _ := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	releases, _ := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	rel, err := releases.Create(release.Release{QuarantineKey: "q/k1", Requester: "alice"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	fs := &remoteFS{user: "mallory", releases: releases, gate: g, ctx: context.Background()}
+	if _, err := fs.Fileread(&sftp.Request{Method: "Get", Filepath: "/releases/" + rel.ID}); err == nil {
+		t.Fatal("a different user must not be able to read alice's release")
+	}
+}
+
+func TestRemoteFS_ReleasesDirectory_ExpiredCannotBeRead(t *testing.T) {
+	quar := newFakeBlobStore()
+	_ = quar.Put(context.Background(), "q/k1", "application/octet-stream", strings.NewReader("secret"), -1)
+	g, _ := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	releases, _ := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	rel, err := releases.Create(release.Release{QuarantineKey: "q/k1", Requester: "alice"}, time.Millisecond)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	fs := &remoteFS{user: "alice", releases: releases, gate: g, ctx: context.Background()}
+	if _, err := fs.Fileread(&sftp.Request{Method: "Get", Filepath: "/releases/" + rel.ID}); err == nil {
+		t.Fatal("an expired release must not be readable, even by its own requester")
+	}
+}
+
+func TestRemoteFS_ReleasesDirectory_UnlimitedReadsWithinWindow(t *testing.T) {
+	quar := newFakeBlobStore()
+	_ = quar.Put(context.Background(), "q/k1", "application/octet-stream", strings.NewReader("secret"), -1)
+	g, _ := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	releases, _ := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	rel, err := releases.Create(release.Release{QuarantineKey: "q/k1", Requester: "alice"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	fs := &remoteFS{user: "alice", releases: releases, gate: g, ctx: context.Background()}
+	for i := 0; i < 3; i++ {
+		if _, err := fs.Fileread(&sftp.Request{Method: "Get", Filepath: "/releases/" + rel.ID}); err != nil {
+			t.Fatalf("read #%d: %v", i, err)
+		}
+	}
+}
+
+func TestRemoteFS_ReleasesDirectory_WriteRefused(t *testing.T) {
+	releases, _ := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	fs := &remoteFS{user: "alice", releases: releases}
+	if _, err := fs.Filewrite(&sftp.Request{Method: "Put", Filepath: "/releases/anything"}); err == nil {
+		t.Fatal("writing under /releases must be refused — it's a read-only virtual namespace")
+	}
+}
+
+func TestRemoteFS_ReleasesDirectory_FilecmdRefused(t *testing.T) {
+	releases, _ := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	fs := &remoteFS{user: "alice", releases: releases}
+	if err := fs.Filecmd(&sftp.Request{Method: "Remove", Filepath: "/releases/anything"}); err == nil {
+		t.Fatal("Filecmd under /releases must be refused")
+	}
+}
+
+// TestRemoteFS_ReleasesDirectory_StatOwnReleaseReturnsFileInfo: a real SFTP
+// client typically Stat/Lstat's a path before Get — Filelist's Stat branch on
+// /releases/<id> must resolve to the owning release, not the bare-directory
+// placeholder, or clients will refuse to download it ("not a regular file").
+func TestRemoteFS_ReleasesDirectory_StatOwnReleaseReturnsFileInfo(t *testing.T) {
+	releases, err := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	rel, err := releases.Create(release.Release{QuarantineKey: "q/k1", Requester: "alice", OriginalFilename: "report.csv"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	fs := &remoteFS{user: "alice", releases: releases}
+	listing, err := fs.Filelist(&sftp.Request{Method: "Stat", Filepath: "/releases/" + rel.ID})
+	if err != nil {
+		t.Fatalf("Filelist Stat: %v", err)
+	}
+	infos := make([]os.FileInfo, 1)
+	n, _ := listing.ListAt(infos, 0)
+	if n != 1 {
+		t.Fatalf("got %d entries, want 1", n)
+	}
+	if infos[0].IsDir() {
+		t.Fatal("Stat on /releases/<id> must report IsDir()=false — it's a regular file, not the /releases directory")
+	}
+}
+
+// TestRemoteFS_ReleasesDirectory_StatWrongUserOrExpiredErrors: Stat must use
+// the same identity+expiry check as Fileread/readRelease, with the same
+// error for both failure reasons — no oracle that would let a caller
+// distinguish "not yours" from "expired" from "doesn't exist".
+func TestRemoteFS_ReleasesDirectory_StatWrongUserOrExpiredErrors(t *testing.T) {
+	releases, err := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	rel, err := releases.Create(release.Release{QuarantineKey: "q/k1", Requester: "alice"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	expired, err := releases.Create(release.Release{QuarantineKey: "q/k2", Requester: "alice"}, time.Millisecond)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	wrongUser := &remoteFS{user: "mallory", releases: releases}
+	_, err = wrongUser.Filelist(&sftp.Request{Method: "Stat", Filepath: "/releases/" + rel.ID})
+	if err == nil {
+		t.Fatal("Stat on another user's release must be refused")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("wrong-user Stat error = %v, want os.ErrNotExist (same as Fileread's)", err)
+	}
+
+	owner := &remoteFS{user: "alice", releases: releases}
+	err = func() error {
+		_, err := owner.Filelist(&sftp.Request{Method: "Stat", Filepath: "/releases/" + expired.ID})
+		return err
+	}()
+	if err == nil {
+		t.Fatal("Stat on an expired release must be refused, even for its own requester")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired Stat error = %v, want os.ErrNotExist (same as Fileread's)", err)
+	}
+}
+
+// TestRemoteFS_ReleasesDirectory_ReadRefusesOversizedObject: readCloserAtAdapter
+// buffers a quarantined object fully into memory to satisfy io.ReaderAt — a
+// release larger than maxReleaseReadBytes must be refused outright rather
+// than silently buffered without bound (a resource-exhaustion risk on a
+// gateway process, since inspectgate's small/large split only bounds
+// inspection-time memory, not the eventual quarantined object's size).
+func TestRemoteFS_ReleasesDirectory_ReadRefusesOversizedObject(t *testing.T) {
+	quar := newFakeBlobStore()
+	if err := quar.Put(context.Background(), "q/big", "application/octet-stream", &zeroReader{n: maxReleaseReadBytes + 1}, -1); err != nil {
+		t.Fatalf("seed quarantine: %v", err)
+	}
+	g, err := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	if err != nil {
+		t.Fatalf("inspectgate.New: %v", err)
+	}
+	releases, err := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	rel, err := releases.Create(release.Release{QuarantineKey: "q/big", Requester: "alice"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	fs := &remoteFS{user: "alice", releases: releases, gate: g, ctx: context.Background()}
+	r, err := fs.Fileread(&sftp.Request{Method: "Get", Filepath: "/releases/" + rel.ID})
+	if err != nil {
+		t.Fatalf("Fileread: %v", err)
+	}
+	buf := make([]byte, 32)
+	if _, err := r.ReadAt(buf, 0); err == nil {
+		t.Fatal("a release larger than maxReleaseReadBytes must be refused, not silently truncated or served")
+	}
+}
+
+// zeroReader emits n zero bytes without allocating a buffer of that size up
+// front — used to seed an oversized quarantine object cheaply in the test
+// above.
+type zeroReader struct{ n int64 }
+
+func (z *zeroReader) Read(p []byte) (int, error) {
+	if z.n <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > z.n {
+		p = p[:z.n]
+	}
+	for i := range p {
+		p[i] = 0
+	}
+	z.n -= int64(len(p))
+	return len(p), nil
 }

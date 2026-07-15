@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/inspect"
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
+	"github.com/rupivbluegreen/omni-sag/internal/release"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -108,7 +110,10 @@ func (s *Server) runSFTP(ctx, connCtx context.Context, channel ssh.Channel, pr p
 	}
 	defer sftpClient.Close()
 
-	fs := &remoteFS{client: sftpClient, gate: s.inspect, srv: s, user: pr.User, srcIP: srcIP, ctx: connCtx}
+	fs := &remoteFS{
+		client: sftpClient, gate: s.inspect, srv: s, user: pr.User, srcIP: srcIP, ctx: connCtx,
+		matchedGroups: decision.MatchedGroups, releases: s.releases, releaseTTL: s.releaseTTL,
+	}
 	server := sftp.NewRequestServer(channel, sftp.Handlers{
 		FileGet:  fs,
 		FilePut:  fs,
@@ -126,18 +131,39 @@ func (s *Server) runSFTP(ctx, connCtx context.Context, channel ssh.Channel, pr p
 
 func cleanPath(p string) string { return path.Clean("/" + p) }
 
+// releasesPrefix is the virtual SFTP directory serving approved
+// pull-download releases — see remoteFS.Fileread/Filelist.
+const releasesPrefix = "/releases"
+
+func isReleasesPath(p string) bool {
+	return p == releasesPrefix || strings.HasPrefix(p, releasesPrefix+"/")
+}
+
+// releaseIDFrom extracts the release ID from a /releases/<id> path. Returns
+// "" for the bare /releases directory itself.
+func releaseIDFrom(p string) string {
+	if p == releasesPrefix {
+		return ""
+	}
+	return strings.TrimPrefix(p, releasesPrefix+"/")
+}
+
 // remoteFS serves the SFTP subsystem by proxying to a real *sftp.Client
 // connected to the target, replacing the in-memory stand-in (memFS) for
-// reads and (as of Task 11) writes. A clean-verdict upload does not deliver
-// to the target immediately — Filewrite's returned handle blocks on Close()
-// until a human approves its release from quarantine.
+// reads and (as of Task 11) writes. A clean-verdict upload is never pushed to
+// the target — Filewrite's returned handle blocks on Close() until a human
+// approves its release from quarantine, then records a release for the
+// uploader to pull down themselves (Task 6).
 type remoteFS struct {
-	client *sftp.Client
-	gate   *inspectgate.Gate // set when inspection is configured; used by Filewrite
-	srv    *Server           // for approvals/evidence; nil only in Task 9's read-only tests
-	user   string
-	srcIP  string // source IP of the client connection; threaded into every evidence event Close() emits
-	ctx    context.Context
+	client        *sftp.Client
+	gate          *inspectgate.Gate // set when inspection is configured; used by Filewrite
+	srv           *Server           // for approvals/evidence; nil only in Task 9's read-only tests
+	user          string
+	srcIP         string // source IP of the client connection; threaded into every evidence event Close() emits
+	ctx           context.Context
+	matchedGroups []string      // decision.MatchedGroups for this session's target — snapshotted onto release requests for group-scoped four-eyes
+	releases      release.Store // for recording approved releases and serving /releases; nil disables the pull-download flow
+	releaseTTL    time.Duration
 }
 
 // ctxOrBackground returns fs.ctx, falling back to context.Background() for
@@ -158,11 +184,91 @@ func (fs *remoteFS) ctxOrBackground() context.Context {
 // exactly this record (see downloadTap's doc comment for why it is
 // immune to a later Rename/Remove/overwrite of the source file).
 func (fs *remoteFS) Fileread(r *sftp.Request) (io.ReaderAt, error) {
-	f, err := fs.client.Open(cleanPath(r.Filepath))
+	p := cleanPath(r.Filepath)
+	if isReleasesPath(p) {
+		return fs.readRelease(p)
+	}
+	f, err := fs.client.Open(p)
 	if err != nil {
 		return nil, err
 	}
-	return newDownloadTap(f, cleanPath(r.Filepath), fs), nil
+	return newDownloadTap(f, p, fs), nil
+}
+
+// readRelease serves a /releases/<id> read: the release must belong to
+// fs.user and not be expired (both checked fresh on every access, per the
+// design — a release may be read any number of times within its window from
+// any number of separate SFTP sessions), then streams directly from the WORM
+// quarantine store via Gate.QuarantineReader.
+func (fs *remoteFS) readRelease(p string) (io.ReaderAt, error) {
+	if fs.releases == nil {
+		return nil, fmt.Errorf("sftp: /releases is not enabled")
+	}
+	id := releaseIDFrom(p)
+	if id == "" {
+		return nil, fmt.Errorf("sftp: %s is a directory", p)
+	}
+	rel, ok := fs.releases.Get(fs.user, id, time.Now())
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	if fs.gate == nil {
+		return nil, fmt.Errorf("sftp: /releases is not enabled")
+	}
+	rc, err := fs.gate.QuarantineReader(fs.ctxOrBackground(), rel.QuarantineKey)
+	if err != nil {
+		return nil, fmt.Errorf("sftp: read release %s: %w", id, err)
+	}
+	return &readCloserAtAdapter{rc: rc}, nil
+}
+
+// maxReleaseReadBytes bounds how much of a quarantined object
+// readCloserAtAdapter will buffer into memory for one /releases read.
+// inspectgate's small/large split (see Gate.Inspect/inspectLarge) only
+// bounds memory used DURING inspection — large uploads are streamed through
+// via Put(..., -1) rather than buffered whole — it does not cap the eventual
+// size of the object sitting in quarantine. Without a cap here, a large
+// clean upload that passed inspection with bounded memory could still OOM
+// the gateway process the moment its owner reads it back, since the
+// Gate/BlobStore has no range-GET support to stream a read instead. Same
+// order of magnitude as maxChunkedBodyBytes (internal/inspect/chunk.go) and
+// maxReorderBytes above, for the same reason: cap in-memory buffering of
+// externally-controlled content.
+const maxReleaseReadBytes = 64 << 20 // 64 MiB
+
+// readCloserAtAdapter adapts a sequential io.ReadCloser (an S3 GET stream —
+// not seekable) to io.ReaderAt by buffering it into memory on first use, up
+// to maxReleaseReadBytes. A release larger than that is refused outright
+// (ReadAt returns an error), never silently truncated or partially served.
+// This is a pragmatic cap, not a streaming rewrite: serving arbitrarily
+// large releases without buffering would need range-GET support in
+// Gate/BlobStore that does not exist today — out of scope for this task.
+type readCloserAtAdapter struct {
+	rc   io.ReadCloser
+	buf  []byte
+	err  error
+	once sync.Once
+}
+
+func (a *readCloserAtAdapter) ReadAt(p []byte, off int64) (int, error) {
+	a.once.Do(func() {
+		a.buf, a.err = io.ReadAll(io.LimitReader(a.rc, maxReleaseReadBytes+1))
+		_ = a.rc.Close()
+		if a.err == nil && int64(len(a.buf)) > maxReleaseReadBytes {
+			a.err = fmt.Errorf("sftp: release exceeds %d byte read limit", maxReleaseReadBytes)
+		}
+	})
+	if a.err != nil {
+		return 0, a.err
+	}
+	if off >= int64(len(a.buf)) {
+		return 0, io.EOF
+	}
+	n := copy(p, a.buf[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
 }
 
 // downloadTap wraps a real target file's io.ReaderAt (from Fileread) so a
@@ -278,9 +384,13 @@ func (d *downloadTap) Close() error {
 
 // Filelist proxies List/Stat to the real target.
 func (fs *remoteFS) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	p := cleanPath(r.Filepath)
+	if isReleasesPath(p) {
+		return fs.listReleases(r.Method, p)
+	}
 	switch r.Method {
 	case "List":
-		infos, err := fs.client.ReadDir(cleanPath(r.Filepath))
+		infos, err := fs.client.ReadDir(p)
 		if err != nil {
 			return nil, err
 		}
@@ -288,7 +398,7 @@ func (fs *remoteFS) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		copy(out, infos)
 		return listerAt(out), nil
 	case "Stat":
-		info, err := fs.client.Stat(cleanPath(r.Filepath))
+		info, err := fs.client.Stat(p)
 		if err != nil {
 			return nil, err
 		}
@@ -296,6 +406,61 @@ func (fs *remoteFS) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	}
 	return nil, fmt.Errorf("sftp: unsupported list method %q", r.Method)
 }
+
+// listReleases serves /releases List and Stat requests — scoped to fs.user's
+// own non-expired releases only. Stat on the bare /releases directory itself
+// returns a synthetic releaseDirInfo; Stat on /releases/<id> runs the exact
+// same identity+expiry lookup readRelease uses (fs.releases.Get) and fails
+// with the same os.ErrNotExist whether the ID doesn't exist, belongs to
+// another user, or has expired — no distinguishing error, so Stat cannot be
+// used as an oracle for any of those cases the way Fileread already isn't.
+func (fs *remoteFS) listReleases(method, p string) (sftp.ListerAt, error) {
+	if fs.releases == nil {
+		return nil, fmt.Errorf("sftp: /releases is not enabled")
+	}
+	if method == "Stat" {
+		id := releaseIDFrom(p)
+		if id == "" {
+			return listerAt{releaseDirInfo{}}, nil
+		}
+		rel, ok := fs.releases.Get(fs.user, id, time.Now())
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		return listerAt{releaseFileInfo{rel: rel}}, nil
+	}
+	list := fs.releases.ListFor(fs.user, time.Now())
+	infos := make([]os.FileInfo, len(list))
+	for i, r := range list {
+		infos[i] = releaseFileInfo{rel: r}
+	}
+	return listerAt(infos), nil
+}
+
+// releaseFileInfo presents one Release as an os.FileInfo entry in /releases.
+// Name() returns the release ID, not OriginalFilename: Fileread/readRelease
+// address entries by ID (releaseIDFrom), and keying the listing on the same
+// identifier avoids ambiguity when two releases share a filename.
+// OriginalFilename remains available on the Release itself for a future
+// listing-detail UX pass.
+type releaseFileInfo struct{ rel release.Release }
+
+func (i releaseFileInfo) Name() string       { return i.rel.ID }
+func (i releaseFileInfo) Size() int64        { return 0 } // unknown without a HEAD on quarantine; acceptable for a listing
+func (i releaseFileInfo) Mode() os.FileMode  { return 0o444 }
+func (i releaseFileInfo) ModTime() time.Time { return i.rel.ApprovedAt }
+func (i releaseFileInfo) IsDir() bool        { return false }
+func (i releaseFileInfo) Sys() interface{}   { return nil }
+
+// releaseDirInfo represents the /releases directory itself for Stat.
+type releaseDirInfo struct{}
+
+func (releaseDirInfo) Name() string       { return "releases" }
+func (releaseDirInfo) Size() int64        { return 0 }
+func (releaseDirInfo) Mode() os.FileMode  { return os.ModeDir | 0o555 }
+func (releaseDirInfo) ModTime() time.Time { return time.Time{} }
+func (releaseDirInfo) IsDir() bool        { return true }
+func (releaseDirInfo) Sys() interface{}   { return nil }
 
 // Filecmd proxies Remove/Rename/Mkdir/Rmdir to the real target. Unlike the
 // old in-memory memFS (where these only mutated a throwaway map), these are
@@ -305,6 +470,9 @@ func (fs *remoteFS) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 // This is evidence only: no approval-gating for these operations, which is
 // a bigger design decision out of scope here.
 func (fs *remoteFS) Filecmd(r *sftp.Request) error {
+	if isReleasesPath(cleanPath(r.Filepath)) {
+		return fmt.Errorf("sftp: /releases is read-only")
+	}
 	switch r.Method {
 	case "Remove":
 		p := cleanPath(r.Filepath)
@@ -361,10 +529,13 @@ func (fs *remoteFS) emitFilecmd(op, p, detail string, err error) {
 // newInspectUpload in this file), but Close no longer decides delivery by
 // verdict alone. A clean upload is quarantined (Task 10 made that
 // unconditional) and then requires a KindQuarantineRelease approval before
-// the gateway delivers it to the real target file. Blocked/unscannable
-// content was already fail-closed before this task and still never creates
-// a release request.
+// the gateway records a release for pull-download (Task 6) — it is never
+// pushed to the target. Blocked/unscannable content was already fail-closed
+// before this task and still never creates a release request.
 func (fs *remoteFS) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+	if isReleasesPath(cleanPath(r.Filepath)) {
+		return nil, fmt.Errorf("sftp: /releases is read-only")
+	}
 	if fs.gate == nil {
 		// No inspection configured: deliver straight through, no quarantine
 		// step — matches the project's existing "inspection is opt-in"
@@ -382,7 +553,8 @@ func (fs *remoteFS) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 
 // quarantineWriteHandle wraps an inspectUpload (Task 10's now-unconditional
 // quarantine) and, on Close, blocks for a KindQuarantineRelease approval
-// before delivering the quarantined bytes to the real target file.
+// before recording a release for the quarantined content (Task 6) — the
+// target file is never touched.
 type quarantineWriteHandle struct {
 	iu   *inspectUpload
 	fs   *remoteFS
@@ -393,7 +565,7 @@ type quarantineWriteHandle struct {
 	// guaranteed to call Close exactly once per handle in every code path)
 	// would re-emit inspection evidence, create a second
 	// KindQuarantineRelease approval request, and — on a second approval —
-	// re-deliver the file to the target a second time.
+	// record a second, duplicate release.
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -444,10 +616,11 @@ func (h *quarantineWriteHandle) doClose() error {
 		return fmt.Errorf("sftp: upload quarantined (key=%s) but no approval store is configured to release it", dec.QuarantineKey)
 	}
 	req, err := h.fs.srv.approvals.Create(approval.Request{
-		Kind:      approval.KindQuarantineRelease,
-		Requester: h.fs.user,
-		Subject:   dec.QuarantineKey,
-		Reason:    fmt.Sprintf("release %s to %s", dec.QuarantineKey, h.path),
+		Kind:            approval.KindQuarantineRelease,
+		Requester:       h.fs.user,
+		RequesterGroups: h.fs.matchedGroups,
+		Subject:         dec.QuarantineKey,
+		Reason:          fmt.Sprintf("release %s to %s", dec.QuarantineKey, h.path),
 	}, h.fs.srv.approvalTTL)
 	if err != nil {
 		return fmt.Errorf("sftp: create release request: %w", err)
@@ -471,25 +644,23 @@ func (h *quarantineWriteHandle) doClose() error {
 		return fmt.Errorf("sftp: upload to %s denied: quarantine release %s", h.path, final.EffectiveStatus(time.Now()))
 	}
 
-	src, err := h.fs.srv.inspect.QuarantineReader(h.fs.ctxOrBackground(), dec.QuarantineKey)
-	if err != nil {
-		return fmt.Errorf("sftp: read quarantined content %s: %w", dec.QuarantineKey, err)
+	if h.fs.releases == nil {
+		return fmt.Errorf("sftp: upload %s approved for release (key=%s) but no release store is configured", h.path, dec.QuarantineKey)
 	}
-	defer src.Close()
-	dst, err := h.fs.client.Create(h.path)
+	rel, err := h.fs.releases.Create(release.Release{
+		QuarantineKey:    dec.QuarantineKey,
+		Requester:        h.fs.user,
+		OriginalFilename: h.path,
+	}, h.fs.releaseTTL)
 	if err != nil {
-		return fmt.Errorf("sftp: open target %s: %w", h.path, err)
-	}
-	defer dst.Close()
-	if _, err := io.Copy(dst, src); err != nil {
-		return fmt.Errorf("sftp: deliver %s to target: %w", h.path, err)
+		return fmt.Errorf("sftp: record release for %s: %w", h.path, err)
 	}
 
 	h.fs.srv.emit(evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeTransfer,
-		User: h.fs.user, SourceIP: h.fs.srcIP, Path: h.path, Direction: "upload",
+		User: h.fs.user, SourceIP: h.fs.srcIP, Path: h.path, Direction: "released",
 		Bytes: dec.Bytes, SHA256: dec.SHA256, ObjectKey: dec.QuarantineKey,
-		Detail: "sftp transfer (released from quarantine)",
+		Detail: fmt.Sprintf("released to /releases (id=%s, expires=%s) — pull-download by %s, not pushed to target", rel.ID, rel.ExpiresAt.Format(time.RFC3339), h.fs.user),
 	})
 	return nil
 }

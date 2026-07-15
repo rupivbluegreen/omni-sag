@@ -143,6 +143,20 @@ This applies globally to every inspected upload — not a per-rule toggle
 (matches Task 10's own unconditional-quarantine precedent: one consistent
 model, no policy-surface growth).
 
+**Known limitation (as implemented):** `/releases` is served by the same
+`remoteFS` that proxies real-target SFTP, and the gateway dials the target
+eagerly at session start — before any request, including a `/releases`-only
+one, is even seen. So retrieval currently requires the target to be
+reachable, even though the bytes themselves live in S3 and never need it.
+This contradicts the "completely separate session" framing above in one
+respect: that session must still be a `user%host` session naming a target
+whose second SSH leg the gateway can dial. Approved files remain safe and
+retrievable-in-principle regardless (nothing in quarantine ever depends on
+target reachability); this is a UX/availability gap, not a security one.
+Closing it means making the target dial lazy — deferred until a non-
+`/releases` request actually needs it — tracked as a follow-up, not done in
+this design's initial implementation.
+
 ## What this does NOT change
 
 - Task 10's unconditional quarantine (every upload, clean or not, gets a WORM

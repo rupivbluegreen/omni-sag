@@ -22,6 +22,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 	"github.com/rupivbluegreen/omni-sag/internal/recording"
+	"github.com/rupivbluegreen/omni-sag/internal/release"
 )
 
 // startServerWith wires a server with options and returns its address.
@@ -127,7 +128,11 @@ func TestSlice4_SFTPTransferManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFileStore: %v", err)
 	}
-	opts := append([]Option{WithInspection(gate), WithApprovals(store, 5*time.Second)}, targetOpts...)
+	releases, err := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	opts := append([]Option{WithInspection(gate), WithApprovals(store, 5*time.Second), WithReleases(releases, 6*time.Hour)}, targetOpts...)
 	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, opts...)
 	client := sshClient(t, addr, "alice%"+targetHost)
 
@@ -172,7 +177,7 @@ func TestSlice4_SFTPTransferManifest(t *testing.T) {
 
 	want := sha256.Sum256(payload)
 	e := waitEvent(t, sink, func(e evidence.Event) bool { return e.Type == evidence.TypeTransfer })
-	if e.Direction != "upload" || e.Path != "/upload.txt" {
+	if e.Direction != "released" || e.Path != "/upload.txt" {
 		t.Fatalf("manifest path/direction wrong: %+v", e)
 	}
 	if e.Bytes != int64(len(payload)) {
@@ -180,6 +185,9 @@ func TestSlice4_SFTPTransferManifest(t *testing.T) {
 	}
 	if e.SHA256 != hex.EncodeToString(want[:]) {
 		t.Fatalf("manifest hash %s, want %s", e.SHA256, hex.EncodeToString(want[:]))
+	}
+	if list := releases.ListFor("alice", time.Now()); len(list) != 1 {
+		t.Fatalf("releases.ListFor(alice) = %v, want exactly one release", list)
 	}
 }
 

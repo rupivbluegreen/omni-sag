@@ -368,3 +368,21 @@ func TestCompilePolicy_TargetUser(t *testing.T) {
 		t.Fatalf("TargetUser = %q, want svc_db1", got)
 	}
 }
+
+func TestApprovalConfig_ReleaseTTL_Default(t *testing.T) {
+	var a *ApprovalConfig
+	if got := a.ReleaseTTL(); got != 86400 {
+		t.Fatalf("ReleaseTTL() on nil config = %d, want 86400 (24h)", got)
+	}
+	a = &ApprovalConfig{}
+	if got := a.ReleaseTTL(); got != 86400 {
+		t.Fatalf("ReleaseTTL() on zero-value config = %d, want 86400", got)
+	}
+}
+
+func TestApprovalConfig_ReleaseTTL_Configured(t *testing.T) {
+	a := &ApprovalConfig{ReleaseTTLSeconds: 3600}
+	if got := a.ReleaseTTL(); got != 3600 {
+		t.Fatalf("ReleaseTTL() = %d, want 3600", got)
+	}
+}

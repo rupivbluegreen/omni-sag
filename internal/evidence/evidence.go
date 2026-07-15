@@ -52,7 +52,7 @@ type Event struct {
 	SHA256    string `json:"sha256,omitempty"`     // digest of the artifact/file
 	Bytes     int64  `json:"bytes,omitempty"`      // size in bytes
 	Path      string `json:"path,omitempty"`       // SFTP path
-	Direction string `json:"direction,omitempty"`  // upload | download
+	Direction string `json:"direction,omitempty"`  // upload | download | released | remove | rename | mkdir | rmdir
 
 	// Content-inspection fields (inspection events).
 	Verdict    string `json:"verdict,omitempty"`     // clean | blocked | modified | error
