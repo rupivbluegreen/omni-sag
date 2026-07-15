@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"io"
 	"net"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -698,4 +699,126 @@ func TestRunSFTP_EmitsSessionStartAndEndOnNormalCompletion(t *testing.T) {
 	waitEvent(t, sink, func(e evidence.Event) bool {
 		return e.Type == evidence.TypeSessionEnd && e.User == "alice" && e.Detail == ""
 	})
+}
+
+// --- Task 7: the /releases virtual SFTP directory ---
+
+func TestRemoteFS_ReleasesDirectory_ListsOwnReleasesOnly(t *testing.T) {
+	releases, err := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	if _, err := releases.Create(release.Release{QuarantineKey: "q/k1", Requester: "alice", OriginalFilename: "report.csv"}, time.Hour); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := releases.Create(release.Release{QuarantineKey: "q/k2", Requester: "bob", OriginalFilename: "secret.txt"}, time.Hour); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	fs := &remoteFS{user: "alice", releases: releases}
+	listing, err := fs.Filelist(&sftp.Request{Method: "List", Filepath: "/releases"})
+	if err != nil {
+		t.Fatalf("Filelist: %v", err)
+	}
+	infos := make([]os.FileInfo, 8)
+	n, _ := listing.ListAt(infos, 0)
+	if n != 1 {
+		t.Fatalf("got %d entries, want exactly 1 (alice's own release, not bob's)", n)
+	}
+}
+
+func TestRemoteFS_ReleasesDirectory_ReadStreamsFromQuarantine(t *testing.T) {
+	quar := newFakeBlobStore()
+	if err := quar.Put(context.Background(), "q/k1", "application/octet-stream", strings.NewReader("secret report"), -1); err != nil {
+		t.Fatalf("seed quarantine: %v", err)
+	}
+	g, err := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	if err != nil {
+		t.Fatalf("inspectgate.New: %v", err)
+	}
+	releases, err := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	rel, err := releases.Create(release.Release{QuarantineKey: "q/k1", Requester: "alice", OriginalFilename: "report.csv"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	fs := &remoteFS{user: "alice", releases: releases, gate: g, ctx: context.Background()}
+	r, err := fs.Fileread(&sftp.Request{Method: "Get", Filepath: "/releases/" + rel.ID})
+	if err != nil {
+		t.Fatalf("Fileread: %v", err)
+	}
+	buf := make([]byte, 32)
+	n, _ := r.ReadAt(buf, 0)
+	if got := string(buf[:n]); got != "secret report" {
+		t.Fatalf("got %q, want %q", got, "secret report")
+	}
+}
+
+func TestRemoteFS_ReleasesDirectory_WrongUserCannotRead(t *testing.T) {
+	quar := newFakeBlobStore()
+	_ = quar.Put(context.Background(), "q/k1", "application/octet-stream", strings.NewReader("secret"), -1)
+	g, _ := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	releases, _ := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	rel, err := releases.Create(release.Release{QuarantineKey: "q/k1", Requester: "alice"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	fs := &remoteFS{user: "mallory", releases: releases, gate: g, ctx: context.Background()}
+	if _, err := fs.Fileread(&sftp.Request{Method: "Get", Filepath: "/releases/" + rel.ID}); err == nil {
+		t.Fatal("a different user must not be able to read alice's release")
+	}
+}
+
+func TestRemoteFS_ReleasesDirectory_ExpiredCannotBeRead(t *testing.T) {
+	quar := newFakeBlobStore()
+	_ = quar.Put(context.Background(), "q/k1", "application/octet-stream", strings.NewReader("secret"), -1)
+	g, _ := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	releases, _ := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	rel, err := releases.Create(release.Release{QuarantineKey: "q/k1", Requester: "alice"}, time.Millisecond)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	fs := &remoteFS{user: "alice", releases: releases, gate: g, ctx: context.Background()}
+	if _, err := fs.Fileread(&sftp.Request{Method: "Get", Filepath: "/releases/" + rel.ID}); err == nil {
+		t.Fatal("an expired release must not be readable, even by its own requester")
+	}
+}
+
+func TestRemoteFS_ReleasesDirectory_UnlimitedReadsWithinWindow(t *testing.T) {
+	quar := newFakeBlobStore()
+	_ = quar.Put(context.Background(), "q/k1", "application/octet-stream", strings.NewReader("secret"), -1)
+	g, _ := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	releases, _ := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	rel, err := releases.Create(release.Release{QuarantineKey: "q/k1", Requester: "alice"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	fs := &remoteFS{user: "alice", releases: releases, gate: g, ctx: context.Background()}
+	for i := 0; i < 3; i++ {
+		if _, err := fs.Fileread(&sftp.Request{Method: "Get", Filepath: "/releases/" + rel.ID}); err != nil {
+			t.Fatalf("read #%d: %v", i, err)
+		}
+	}
+}
+
+func TestRemoteFS_ReleasesDirectory_WriteRefused(t *testing.T) {
+	releases, _ := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	fs := &remoteFS{user: "alice", releases: releases}
+	if _, err := fs.Filewrite(&sftp.Request{Method: "Put", Filepath: "/releases/anything"}); err == nil {
+		t.Fatal("writing under /releases must be refused — it's a read-only virtual namespace")
+	}
+}
+
+func TestRemoteFS_ReleasesDirectory_FilecmdRefused(t *testing.T) {
+	releases, _ := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	fs := &remoteFS{user: "alice", releases: releases}
+	if err := fs.Filecmd(&sftp.Request{Method: "Remove", Filepath: "/releases/anything"}); err == nil {
+		t.Fatal("Filecmd under /releases must be refused")
+	}
 }
