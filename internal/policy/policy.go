@@ -99,6 +99,14 @@ type Decision struct {
 	CredentialMode  string     // credential posture of the matched target (empty on deny)
 	RequireApproval bool       // matched target requires a four-eyes approval
 	TargetUser      string     // account to use on the target; empty => same as login user
+	// MatchedGroups is the subset of the principal's own Groups that actually
+	// granted the matched role — i.e. intersect(Principal.Groups, the matched
+	// Role.Groups), not the principal's full group list (a principal can hold
+	// groups irrelevant to this specific decision). Empty on deny. Used to
+	// snapshot approval.Request.RequesterGroups for group-scoped four-eyes on
+	// quarantine-release approvals — see docs/superpowers/specs/
+	// 2026-07-14-group-scoped-approval-and-pull-release-design.md.
+	MatchedGroups []string
 	// Port is the real second-SSH-leg port to dial for the gateway's
 	// shell/SFTP proxy to a real target (see DecideHost's doc comment for why
 	// this can only be resolved AFTER matching, unlike the -L forwarding
@@ -126,6 +134,24 @@ func (p Policy) rolesFor(pr Principal) []Role {
 				out = append(out, r)
 				break
 			}
+		}
+	}
+	return out
+}
+
+// intersectGroups returns the elements of principalGroups that case-
+// insensitively match an entry in roleGroups, preserving the principal's own
+// casing (not the role's) since that's what a later live LDAP group-lookup
+// comparison will need to match against.
+func intersectGroups(principalGroups, roleGroups []string) []string {
+	want := make(map[string]bool, len(roleGroups))
+	for _, g := range roleGroups {
+		want[strings.ToLower(g)] = true
+	}
+	var out []string
+	for _, g := range principalGroups {
+		if want[strings.ToLower(g)] {
+			out = append(out, g)
 		}
 	}
 	return out
@@ -165,6 +191,7 @@ func (p Policy) Decide(pr Principal, t Target) Decision {
 					CredentialMode:  rule.Credential,
 					RequireApproval: rule.RequireApproval,
 					TargetUser:      rule.TargetUser,
+					MatchedGroups:   intersectGroups(pr.Groups, r.Groups),
 				}
 			}
 		}
@@ -244,6 +271,7 @@ func (p Policy) DecideHost(pr Principal, host string) Decision {
 		CredentialMode:  m.rule.Credential,
 		RequireApproval: m.rule.RequireApproval,
 		TargetUser:      m.rule.TargetUser,
+		MatchedGroups:   intersectGroups(pr.Groups, m.role.Groups),
 		Port:            m.rule.Ports[0],
 	}
 }
