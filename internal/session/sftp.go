@@ -19,6 +19,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/inspect"
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
+	"github.com/rupivbluegreen/omni-sag/internal/release"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -108,7 +109,10 @@ func (s *Server) runSFTP(ctx, connCtx context.Context, channel ssh.Channel, pr p
 	}
 	defer sftpClient.Close()
 
-	fs := &remoteFS{client: sftpClient, gate: s.inspect, srv: s, user: pr.User, srcIP: srcIP, ctx: connCtx}
+	fs := &remoteFS{
+		client: sftpClient, gate: s.inspect, srv: s, user: pr.User, srcIP: srcIP, ctx: connCtx,
+		matchedGroups: decision.MatchedGroups, releases: s.releases, releaseTTL: s.releaseTTL,
+	}
 	server := sftp.NewRequestServer(channel, sftp.Handlers{
 		FileGet:  fs,
 		FilePut:  fs,
@@ -132,12 +136,15 @@ func cleanPath(p string) string { return path.Clean("/" + p) }
 // to the target immediately — Filewrite's returned handle blocks on Close()
 // until a human approves its release from quarantine.
 type remoteFS struct {
-	client *sftp.Client
-	gate   *inspectgate.Gate // set when inspection is configured; used by Filewrite
-	srv    *Server           // for approvals/evidence; nil only in Task 9's read-only tests
-	user   string
-	srcIP  string // source IP of the client connection; threaded into every evidence event Close() emits
-	ctx    context.Context
+	client        *sftp.Client
+	gate          *inspectgate.Gate // set when inspection is configured; used by Filewrite
+	srv           *Server           // for approvals/evidence; nil only in Task 9's read-only tests
+	user          string
+	srcIP         string // source IP of the client connection; threaded into every evidence event Close() emits
+	ctx           context.Context
+	matchedGroups []string      // decision.MatchedGroups for this session's target — snapshotted onto release requests for group-scoped four-eyes
+	releases      release.Store // for recording approved releases and serving /releases; nil disables the pull-download flow
+	releaseTTL    time.Duration
 }
 
 // ctxOrBackground returns fs.ctx, falling back to context.Background() for

@@ -21,6 +21,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/inspect"
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
+	"github.com/rupivbluegreen/omni-sag/internal/release"
 )
 
 // startFakeSFTPTarget runs an in-process SSH server that serves the "sftp"
@@ -219,6 +220,21 @@ func (cleanInspector) Inspect(_ context.Context, _ inspect.TransferMeta, body io
 // brief describes them; memQuarantine (sftp_inspect_test.go, same package)
 // already implements inspectgate.BlobStore.
 func newFakeBlobStore() *memQuarantine { return newMemQuarantine() }
+
+func TestWithReleases_SetsFieldsOnServer(t *testing.T) {
+	store, err := release.NewFileStore(filepath.Join(t.TempDir(), "r.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	s := &Server{}
+	WithReleases(store, 6*time.Hour)(s)
+	if s.releases != store {
+		t.Fatal("WithReleases did not set s.releases")
+	}
+	if s.releaseTTL != 6*time.Hour {
+		t.Fatalf("s.releaseTTL = %v, want 6h", s.releaseTTL)
+	}
+}
 
 // TestQuarantineWriteHandle_AutoDeniedWithNoApprovalStoreFailsClosed: even a
 // clean-verdict upload must never reach the target when there is no approval

@@ -29,6 +29,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 	"github.com/rupivbluegreen/omni-sag/internal/ratelimit"
 	"github.com/rupivbluegreen/omni-sag/internal/recording"
+	"github.com/rupivbluegreen/omni-sag/internal/release"
 	"github.com/rupivbluegreen/omni-sag/internal/sessions"
 	"golang.org/x/crypto/ssh"
 )
@@ -71,6 +72,8 @@ type Server struct {
 	bfLimiter        *ratelimit.Limiter   // per-source-IP brute-force throttle (always set)
 	approvals        approval.Store       // optional; required for SFTP uploads when inspection is enabled (quarantine-release gate)
 	approvalTTL      time.Duration
+	releases         release.Store // optional; required for the /releases pull-download directory
+	releaseTTL       time.Duration // how long an approved release stays retrievable (design default: 6h)
 	handshakeTimeout time.Duration
 	sem              chan struct{} // bounds concurrent in-flight handshakes
 
@@ -119,6 +122,15 @@ func WithInspection(g *inspectgate.Gate) Option {
 // dialer.WithApprovals — same Store, same TUI/API queue, different Kind.
 func WithApprovals(store approval.Store, ttl time.Duration) Option {
 	return func(s *Server) { s.approvals = store; s.approvalTTL = ttl }
+}
+
+// WithReleases enables the /releases pull-download SFTP directory: once a
+// quarantine-release approval is granted, the uploader retrieves the file
+// themselves within ttl instead of it being auto-delivered to the target.
+// Nil store (the default) means Filewrite's approved branch has nowhere to
+// record a release — see Task 6 for the resulting fail-closed behavior.
+func WithReleases(store release.Store, ttl time.Duration) Option {
+	return func(s *Server) { s.releases = store; s.releaseTTL = ttl }
 }
 
 // WithCredentialProvider resolves inject-mode target credentials for the
