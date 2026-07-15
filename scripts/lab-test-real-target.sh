@@ -13,10 +13,11 @@
 #      the real ssh-target container, authenticated as svc_db1.
 #   2. alice uploads a file over real SFTP; it is content-inspected,
 #      unconditionally quarantined, and held pending a KindQuarantineRelease
-#      four-eyes approval; this script approves it via omnisag-ctl (a
-#      different identity from the uploader); the release then delivers the
-#      quarantined bytes to the real target file, which this script reads
-#      back directly from the target container to confirm delivery.
+#      approval. bob (not in alice's dba group) attempts to approve it and is
+#      refused by group-scoped four-eyes; carol (a peer in dba) approves it.
+#      The approved upload is never pushed to the target — alice retrieves it
+#      herself via a fresh SFTP session's /releases directory, and bob (no
+#      route to that target at all) cannot reach it.
 #
 # Usage: scripts/lab-test-real-target.sh
 set -euo pipefail
@@ -30,16 +31,18 @@ ICAP_PORT="${ICAP_PORT:-1344}"
 TARGET_SSH_PORT="${TARGET_SSH_PORT:-2200}" # ssh-target container, host-mapped
 
 GW_USER="alice"
-GW_PASSWORD="Passw0rd!"          # lab-seed.sh's LAB_USER_PW default
+BOB_USER="bob"                   # not in dba: refused both on approval and on target access
+CAROL_USER="carol"               # in dba, same as alice: the peer approver
+GW_PASSWORD="Passw0rd!"          # lab-seed.sh's LAB_USER_PW default, shared by all seeded users
 TARGET_HOST="127.0.0.1"          # must match the demo Rule's `host:` exactly
 TARGET_USER="svc_db1"
 TARGET_PASSWORD="InjectedSecret123!" # docker-compose.yml's ssh-target USER_PASSWORD
-API_TOKEN="lab-test-token-$$"
-# svc_db1's home is /config (see /etc/passwd in the ssh-target image); the
-# container filesystem root is root-owned and NOT writable by svc_db1, so a
-# literal "/upload.txt" (the plan's original sketch) fails with permission
-# denied — this is an ssh-target-image detail, not a gateway bug. Use a path
-# svc_db1 can actually create.
+API_TOKEN="lab-test-token-$$"          # lab-tester: listing only, not tied to any AD identity
+API_TOKEN_BOB="lab-test-token-bob-$$"      # subject "bob", for the refused approval attempt
+API_TOKEN_CAROL="lab-test-token-carol-$$"  # subject "carol", for the peer approval
+# A quarantined upload is never written to the real target (Task 6), so this
+# is just a logical destination string recorded on the release — it does not
+# need to be writable by svc_db1.
 REMOTE_UPLOAD_PATH="/config/upload.txt"
 
 RED=$'\033[31m'; GREEN=$'\033[32m'; RESET=$'\033[0m'
@@ -209,11 +212,11 @@ echo "fake ICAP responder up on 127.0.0.1:$ICAP_PORT"
 # content inspection wired at the fake ICAP responder above. State files
 # (host key, evidence, recordings, approvals) are redirected into WORKDIR so
 # this script never touches the repo tree.
-python3 - "$BASE_CONFIG" "$WORKDIR/config.yaml" "$WORKDIR" "$ICAP_PORT" "$API_PORT" "$API_TOKEN" <<'PY'
+python3 - "$BASE_CONFIG" "$WORKDIR/config.yaml" "$WORKDIR" "$ICAP_PORT" "$API_PORT" "$API_TOKEN" "$API_TOKEN_BOB" "$API_TOKEN_CAROL" <<'PY'
 import sys
 import yaml
 
-base_path, out_path, workdir, icap_port, api_port, api_token = sys.argv[1:7]
+base_path, out_path, workdir, icap_port, api_port, api_token, api_token_bob, api_token_carol = sys.argv[1:9]
 
 with open(base_path) as f:
     cfg = yaml.safe_load(f)
@@ -225,7 +228,14 @@ cfg["recording"]["local_dir"] = f"{workdir}/recordings"
 
 cfg["api"] = {
     "listen": f":{api_port}",
-    "tokens": [{"token": api_token, "subject": "lab-tester", "role": "operator"}],
+    # bob/carol's subjects must equal their AD usernames exactly: Approve's
+    # group-scoped four-eyes resolves the approver's CURRENT groups via LDAP
+    # by this subject (approval.FileStore.decide -> GroupLookup.Groups).
+    "tokens": [
+        {"token": api_token, "subject": "lab-tester", "role": "operator"},
+        {"token": api_token_bob, "subject": "bob", "role": "operator"},
+        {"token": api_token_carol, "subject": "carol", "role": "operator"},
+    ],
 }
 cfg["approval"] = {
     "store_path": f"{workdir}/approvals.json",
@@ -579,14 +589,34 @@ if [ -z "$REQ_ID" ]; then
 fi
 echo "found pending request: $REQ_ID"
 
-echo "== approving the request (as a different identity than the uploader) =="
-APPROVE_OUT="$("$CTL_BIN" -api "http://127.0.0.1:$API_PORT" -token "$API_TOKEN" approve "$REQ_ID")"
-if ! printf '%s' "$APPROVE_OUT" | jq -e '.status == "approved"' >/dev/null 2>&1; then
-  fail "approve did not return status=approved: $APPROVE_OUT"
+echo "== attempt release-approval as bob (not in dba) — must be refused =="
+if BOB_APPROVE_OUT="$("$CTL_BIN" -api "http://127.0.0.1:$API_PORT" -token "$API_TOKEN_BOB" approve "$REQ_ID" 2>&1)"; then
+  fail "bob's approval unexpectedly succeeded: $BOB_APPROVE_OUT"
   kill "$SFTP_PID" 2>/dev/null || true
   exit 1
 fi
-pass "quarantine-release request approved via omnisag-ctl"
+if ! printf '%s' "$BOB_APPROVE_OUT" | grep -q "group-scoped four-eyes"; then
+  fail "bob's approval was refused, but not for the expected reason: $BOB_APPROVE_OUT"
+  kill "$SFTP_PID" 2>/dev/null || true
+  exit 1
+fi
+STILL_PENDING="$("$CTL_BIN" -api "http://127.0.0.1:$API_PORT" -token "$API_TOKEN" approvals \
+  | jq -r --arg id "$REQ_ID" '.[] | select(.id==$id) | .status')"
+if [ "$STILL_PENDING" != "pending" ]; then
+  fail "request status after bob's refused attempt: expected pending, got '$STILL_PENDING'"
+  kill "$SFTP_PID" 2>/dev/null || true
+  exit 1
+fi
+pass "bob (not in dba) refused: group-scoped four-eyes rejected the approval; request still pending"
+
+echo "== approve as carol (in dba, same group as alice, different identity) — must succeed =="
+APPROVE_OUT="$("$CTL_BIN" -api "http://127.0.0.1:$API_PORT" -token "$API_TOKEN_CAROL" approve "$REQ_ID")"
+if ! printf '%s' "$APPROVE_OUT" | jq -e '.status == "approved"' >/dev/null 2>&1; then
+  fail "carol's approval did not return status=approved: $APPROVE_OUT"
+  kill "$SFTP_PID" 2>/dev/null || true
+  exit 1
+fi
+pass "quarantine-release request approved by carol, a peer in the uploader's group"
 
 if ! wait "$SFTP_PID"; then
   fail "sftp put did not complete successfully"
@@ -600,11 +630,170 @@ if [ "$PUT_RESULT" != "OK" ]; then
   echo "--- sftp driver transcript ---" >&2; tail -n 80 "$WORKDIR/sftp_put.log" >&2
   exit 1
 fi
-pass "upload released from quarantine and delivered by the gateway"
+pass "upload released from quarantine and recorded for pull-download"
 
-# --- Test 3: verify delivery by reading the file back from the real target -
-echo "== verify the file actually landed on the real target =="
-cat >"$WORKDIR/verify_target.py" <<'PY'
+# --- Test 3: alice retrieves her own release via /releases -----------------
+echo "== alice retrieves her own release via /releases in a NEW sftp session =="
+cat >"$WORKDIR/sftp_get_release.py" <<'PY'
+#!/usr/bin/env python3
+import os
+import pty
+import re
+import select
+import signal
+import sys
+import time
+
+
+def read_avail(fd, timeout):
+    r, _, _ = select.select([fd], [], [], timeout)
+    if fd in r:
+        try:
+            return os.read(fd, 65536)
+        except OSError:
+            return b""
+    return None
+
+
+def finish(fd, pid, code, lines):
+    for l in lines:
+        print(l)
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+    sys.exit(code)
+
+
+def main():
+    gw_port, login_at, gw_pw, tgt_pw, local_get_path = sys.argv[1:6]
+    cmd = [
+        "sftp", "-P", gw_port,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "PreferredAuthentications=password,keyboard-interactive",
+        "-o", "PubkeyAuthentication=no",
+        "-o", "ConnectTimeout=10",
+        login_at,
+    ]
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvp(cmd[0], cmd)
+        os._exit(127)
+
+    buf = b""
+    auth_deadline = time.time() + 45
+
+    def wait_for(pattern, dl):
+        nonlocal buf
+        pat = pattern.encode()
+        while True:
+            if pat in buf:
+                return True
+            if time.time() > dl:
+                return False
+            chunk = read_avail(fd, min(1.0, max(0.0, dl - time.time())))
+            if chunk is None:
+                continue
+            if chunk == b"":
+                return False
+            buf += chunk
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.flush()
+
+    if not wait_for("password:", auth_deadline):
+        finish(fd, pid, 1, ["GET_RESULT=FAIL:never saw gateway password prompt"])
+    os.write(fd, (gw_pw + "\n").encode())
+
+    if not wait_for("Target password:", auth_deadline):
+        finish(fd, pid, 1, ["GET_RESULT=FAIL:never saw target password prompt"])
+    os.write(fd, (tgt_pw + "\n").encode())
+
+    if not wait_for("sftp>", auth_deadline):
+        finish(fd, pid, 1, ["GET_RESULT=FAIL:never saw sftp prompt after auth"])
+
+    # Same "wait for a NEW prompt after this mark" idiom as sftp_put.py: the
+    # first wait_for above can return instantly on the ALREADY-present prompt,
+    # so every subsequent command result is bounded by counting occurrences
+    # after the position where the command was sent, not just pattern-in-buf.
+    mark = len(buf)
+    os.write(fd, b"ls -1 /releases\n")
+    ls_deadline = time.time() + 20
+    if not wait_for("sftp>", ls_deadline) or buf.rfind(b"sftp>") <= mark:
+        while buf.count(b"sftp>", mark) < 1 and time.time() < ls_deadline:
+            chunk = read_avail(fd, 1.0)
+            if chunk is None:
+                continue
+            if chunk == b"":
+                break
+            buf += chunk
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.flush()
+    listing = buf[mark:].decode(errors="replace")
+    m = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", listing)
+    if not m:
+        finish(fd, pid, 1, ["GET_RESULT=FAIL:no release id in listing: " + listing.strip().replace("\n", "|")])
+    release_id = m.group(0)
+
+    mark = len(buf)
+    os.write(fd, f"get /releases/{release_id} {local_get_path}\n".encode())
+    get_deadline = time.time() + 30
+    if not wait_for("sftp>", get_deadline) or buf.rfind(b"sftp>") <= mark:
+        while buf.count(b"sftp>", mark) < 1 and time.time() < get_deadline:
+            chunk = read_avail(fd, 1.0)
+            if chunk is None:
+                continue
+            if chunk == b"":
+                break
+            buf += chunk
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.flush()
+    get_text = buf[mark:].decode(errors="replace").lower()
+
+    os.write(fd, b"quit\n")
+    drain_deadline = time.time() + 8
+    while time.time() < drain_deadline:
+        chunk = read_avail(fd, 1.0)
+        if chunk is None:
+            continue
+        if chunk == b"":
+            break
+
+    if "couldn't" in get_text or "no such file" in get_text or "permission denied" in get_text:
+        finish(fd, pid, 1, ["RELEASE_ID=" + release_id, "GET_RESULT=FAIL:get reported an error"])
+    finish(fd, pid, 0, ["RELEASE_ID=" + release_id, "GET_RESULT=OK"])
+
+
+if __name__ == "__main__":
+    main()
+PY
+
+GET_OUT="$(python3 "$WORKDIR/sftp_get_release.py" "$GW_PORT" "${GW_USER}%${TARGET_HOST}@${TARGET_HOST}" \
+  "$GW_PASSWORD" "$TARGET_PASSWORD" "$WORKDIR/alice-release.txt" 2>"$WORKDIR/sftp_get_release.log")"
+RELEASE_ID="$(printf '%s\n' "$GET_OUT" | sed -n 's/^RELEASE_ID=//p')"
+GET_RESULT="$(printf '%s\n' "$GET_OUT" | sed -n 's/^GET_RESULT=//p')"
+if [ -z "$RELEASE_ID" ] || [ "$GET_RESULT" != "OK" ]; then
+  fail "alice could not retrieve her release: id='$RELEASE_ID' result='$GET_RESULT'"
+  echo "--- driver transcript ---" >&2; tail -n 80 "$WORKDIR/sftp_get_release.log" >&2
+  exit 1
+fi
+if ! diff -q "$WORKDIR/lab-upload.txt" "$WORKDIR/alice-release.txt" >/dev/null 2>&1; then
+  fail "retrieved release content does not match the original upload"
+  exit 1
+fi
+pass "alice retrieved release $RELEASE_ID via /releases in a fresh session; content matches the upload"
+
+# --- Test 4: bob cannot reach alice's release -------------------------------
+echo "== bob cannot see or read alice's release =="
+cat >"$WORKDIR/sftp_refused.py" <<'PY'
 #!/usr/bin/env python3
 import os
 import pty
@@ -625,15 +814,15 @@ def read_avail(fd, timeout):
 
 
 def main():
-    port, user_at_host, password, remote_path = sys.argv[1:5]
+    gw_port, login_at, gw_pw, tgt_pw = sys.argv[1:5]
     cmd = [
-        "ssh", "-p", port,
+        "sftp", "-P", gw_port,
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "PreferredAuthentications=password",
+        "-o", "PreferredAuthentications=password,keyboard-interactive",
         "-o", "PubkeyAuthentication=no",
         "-o", "ConnectTimeout=10",
-        user_at_host, "cat", remote_path,
+        login_at,
     ]
     pid, fd = pty.fork()
     if pid == 0:
@@ -641,18 +830,38 @@ def main():
         os._exit(127)
 
     buf = b""
-    deadline = time.time() + 20
-    sent = False
-    while time.time() < deadline:
-        chunk = read_avail(fd, 1.0)
-        if chunk is None:
-            continue
-        if chunk == b"":
-            break
-        buf += chunk
-        if not sent and b"password:" in buf:
-            os.write(fd, (password + "\n").encode())
-            sent = True
+
+    def wait_for(pattern, dl):
+        nonlocal buf
+        pat = pattern.encode()
+        while True:
+            if pat in buf:
+                return True
+            if time.time() > dl:
+                return False
+            chunk = read_avail(fd, min(1.0, max(0.0, dl - time.time())))
+            if chunk is None:
+                continue
+            if chunk == b"":
+                return False
+            buf += chunk
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.flush()
+
+    if not wait_for("password:", time.time() + 30):
+        print("RESULT=FAIL:never saw gateway password prompt")
+        sys.exit(1)
+    os.write(fd, (gw_pw + "\n").encode())
+
+    # bob holds no role granting host 127.0.0.1, so the gateway's own auth
+    # decision never issues a "Target password:" challenge for him (see
+    # session.go: the credential-mode peek only prompts when a rule
+    # matched). Answer it anyway if it somehow appears, so this assertion is
+    # about the sftp subsystem being refused, not about which prompt bob sees.
+    if wait_for("Target password:", time.time() + 8):
+        os.write(fd, (tgt_pw + "\n").encode())
+
+    got_sftp_prompt = wait_for("sftp>", time.time() + 15)
 
     try:
         os.close(fd)
@@ -667,24 +876,21 @@ def main():
     except ChildProcessError:
         pass
 
-    text = buf.decode(errors="replace")
-    if sent:
-        after = text.split("\n", 1)
-        text = after[1] if len(after) > 1 else ""
-    lines = [l.strip("\r") for l in text.splitlines()]
-    content_lines = [l for l in lines if l and "password:" not in l]
-    print("TARGET_CONTENT=" + (content_lines[0] if content_lines else ""))
+    print("RESULT=" + ("UNEXPECTED_SFTP_PROMPT" if got_sftp_prompt else "REFUSED"))
 
 
 if __name__ == "__main__":
     main()
 PY
-VERIFY_OUT="$(python3 "$WORKDIR/verify_target.py" "$TARGET_SSH_PORT" "${TARGET_USER}@${TARGET_HOST}" "$TARGET_PASSWORD" "$REMOTE_UPLOAD_PATH")"
-DELIVERED="$(printf '%s\n' "$VERIFY_OUT" | sed -n 's/^TARGET_CONTENT=//p')"
-if [ "$DELIVERED" != "hello from the lab" ]; then
-  fail "delivered content mismatch: got '$DELIVERED'"
+
+BOB_SFTP_OUT="$(python3 "$WORKDIR/sftp_refused.py" "$GW_PORT" "${BOB_USER}%${TARGET_HOST}@${TARGET_HOST}" \
+  "$GW_PASSWORD" "$TARGET_PASSWORD" 2>"$WORKDIR/sftp_refused.log")"
+BOB_SFTP_RESULT="$(printf '%s\n' "$BOB_SFTP_OUT" | sed -n 's/^RESULT=//p')"
+if [ "$BOB_SFTP_RESULT" != "REFUSED" ]; then
+  fail "bob's sftp session to the release-bearing target was not refused: $BOB_SFTP_RESULT"
+  echo "--- driver transcript ---" >&2; tail -n 80 "$WORKDIR/sftp_refused.log" >&2
   exit 1
 fi
-pass "released upload delivered to the real target (read back directly from ssh-target)"
+pass "bob (not in dba) has no route to the target: his sftp session is refused before /releases is reachable"
 
 echo "ALL PASS"
