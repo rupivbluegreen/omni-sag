@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -821,4 +822,128 @@ func TestRemoteFS_ReleasesDirectory_FilecmdRefused(t *testing.T) {
 	if err := fs.Filecmd(&sftp.Request{Method: "Remove", Filepath: "/releases/anything"}); err == nil {
 		t.Fatal("Filecmd under /releases must be refused")
 	}
+}
+
+// TestRemoteFS_ReleasesDirectory_StatOwnReleaseReturnsFileInfo: a real SFTP
+// client typically Stat/Lstat's a path before Get — Filelist's Stat branch on
+// /releases/<id> must resolve to the owning release, not the bare-directory
+// placeholder, or clients will refuse to download it ("not a regular file").
+func TestRemoteFS_ReleasesDirectory_StatOwnReleaseReturnsFileInfo(t *testing.T) {
+	releases, err := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	rel, err := releases.Create(release.Release{QuarantineKey: "q/k1", Requester: "alice", OriginalFilename: "report.csv"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	fs := &remoteFS{user: "alice", releases: releases}
+	listing, err := fs.Filelist(&sftp.Request{Method: "Stat", Filepath: "/releases/" + rel.ID})
+	if err != nil {
+		t.Fatalf("Filelist Stat: %v", err)
+	}
+	infos := make([]os.FileInfo, 1)
+	n, _ := listing.ListAt(infos, 0)
+	if n != 1 {
+		t.Fatalf("got %d entries, want 1", n)
+	}
+	if infos[0].IsDir() {
+		t.Fatal("Stat on /releases/<id> must report IsDir()=false — it's a regular file, not the /releases directory")
+	}
+}
+
+// TestRemoteFS_ReleasesDirectory_StatWrongUserOrExpiredErrors: Stat must use
+// the same identity+expiry check as Fileread/readRelease, with the same
+// error for both failure reasons — no oracle that would let a caller
+// distinguish "not yours" from "expired" from "doesn't exist".
+func TestRemoteFS_ReleasesDirectory_StatWrongUserOrExpiredErrors(t *testing.T) {
+	releases, err := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	rel, err := releases.Create(release.Release{QuarantineKey: "q/k1", Requester: "alice"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	expired, err := releases.Create(release.Release{QuarantineKey: "q/k2", Requester: "alice"}, time.Millisecond)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	wrongUser := &remoteFS{user: "mallory", releases: releases}
+	_, err = wrongUser.Filelist(&sftp.Request{Method: "Stat", Filepath: "/releases/" + rel.ID})
+	if err == nil {
+		t.Fatal("Stat on another user's release must be refused")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("wrong-user Stat error = %v, want os.ErrNotExist (same as Fileread's)", err)
+	}
+
+	owner := &remoteFS{user: "alice", releases: releases}
+	err = func() error {
+		_, err := owner.Filelist(&sftp.Request{Method: "Stat", Filepath: "/releases/" + expired.ID})
+		return err
+	}()
+	if err == nil {
+		t.Fatal("Stat on an expired release must be refused, even for its own requester")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired Stat error = %v, want os.ErrNotExist (same as Fileread's)", err)
+	}
+}
+
+// TestRemoteFS_ReleasesDirectory_ReadRefusesOversizedObject: readCloserAtAdapter
+// buffers a quarantined object fully into memory to satisfy io.ReaderAt — a
+// release larger than maxReleaseReadBytes must be refused outright rather
+// than silently buffered without bound (a resource-exhaustion risk on a
+// gateway process, since inspectgate's small/large split only bounds
+// inspection-time memory, not the eventual quarantined object's size).
+func TestRemoteFS_ReleasesDirectory_ReadRefusesOversizedObject(t *testing.T) {
+	quar := newFakeBlobStore()
+	if err := quar.Put(context.Background(), "q/big", "application/octet-stream", &zeroReader{n: maxReleaseReadBytes + 1}, -1); err != nil {
+		t.Fatalf("seed quarantine: %v", err)
+	}
+	g, err := inspectgate.New(inspectgate.Config{Inspector: cleanInspector{}, Quarantine: quar})
+	if err != nil {
+		t.Fatalf("inspectgate.New: %v", err)
+	}
+	releases, err := release.NewFileStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatalf("release.NewFileStore: %v", err)
+	}
+	rel, err := releases.Create(release.Release{QuarantineKey: "q/big", Requester: "alice"}, time.Hour)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	fs := &remoteFS{user: "alice", releases: releases, gate: g, ctx: context.Background()}
+	r, err := fs.Fileread(&sftp.Request{Method: "Get", Filepath: "/releases/" + rel.ID})
+	if err != nil {
+		t.Fatalf("Fileread: %v", err)
+	}
+	buf := make([]byte, 32)
+	if _, err := r.ReadAt(buf, 0); err == nil {
+		t.Fatal("a release larger than maxReleaseReadBytes must be refused, not silently truncated or served")
+	}
+}
+
+// zeroReader emits n zero bytes without allocating a buffer of that size up
+// front — used to seed an oversized quarantine object cheaply in the test
+// above.
+type zeroReader struct{ n int64 }
+
+func (z *zeroReader) Read(p []byte) (int, error) {
+	if z.n <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > z.n {
+		p = p[:z.n]
+	}
+	for i := range p {
+		p[i] = 0
+	}
+	z.n -= int64(len(p))
+	return len(p), nil
 }

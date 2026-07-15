@@ -199,9 +199,7 @@ func (fs *remoteFS) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 // fs.user and not be expired (both checked fresh on every access, per the
 // design — a release may be read any number of times within its window from
 // any number of separate SFTP sessions), then streams directly from the WORM
-// quarantine store — the same Gate.QuarantineReader delivery path Filewrite
-// already used before this feature existed, just now serving the uploader
-// instead of the target.
+// quarantine store via Gate.QuarantineReader.
 func (fs *remoteFS) readRelease(p string) (io.ReaderAt, error) {
 	if fs.releases == nil {
 		return nil, fmt.Errorf("sftp: /releases is not enabled")
@@ -224,12 +222,27 @@ func (fs *remoteFS) readRelease(p string) (io.ReaderAt, error) {
 	return &readCloserAtAdapter{rc: rc}, nil
 }
 
+// maxReleaseReadBytes bounds how much of a quarantined object
+// readCloserAtAdapter will buffer into memory for one /releases read.
+// inspectgate's small/large split (see Gate.Inspect/inspectLarge) only
+// bounds memory used DURING inspection — large uploads are streamed through
+// via Put(..., -1) rather than buffered whole — it does not cap the eventual
+// size of the object sitting in quarantine. Without a cap here, a large
+// clean upload that passed inspection with bounded memory could still OOM
+// the gateway process the moment its owner reads it back, since the
+// Gate/BlobStore has no range-GET support to stream a read instead. Same
+// order of magnitude as maxChunkedBodyBytes (internal/inspect/chunk.go) and
+// maxReorderBytes above, for the same reason: cap in-memory buffering of
+// externally-controlled content.
+const maxReleaseReadBytes = 64 << 20 // 64 MiB
+
 // readCloserAtAdapter adapts a sequential io.ReadCloser (an S3 GET stream —
-// not seekable) to io.ReaderAt by buffering it fully into memory on first
-// use. Acceptable here because it mirrors what Filewrite's own delivery step
-// already did (a full sequential io.Copy of a quarantined object), and
-// quarantined content already has a size ceiling enforced upstream by
-// inspectgate's small/large split.
+// not seekable) to io.ReaderAt by buffering it into memory on first use, up
+// to maxReleaseReadBytes. A release larger than that is refused outright
+// (ReadAt returns an error), never silently truncated or partially served.
+// This is a pragmatic cap, not a streaming rewrite: serving arbitrarily
+// large releases without buffering would need range-GET support in
+// Gate/BlobStore that does not exist today — out of scope for this task.
 type readCloserAtAdapter struct {
 	rc   io.ReadCloser
 	buf  []byte
@@ -239,8 +252,11 @@ type readCloserAtAdapter struct {
 
 func (a *readCloserAtAdapter) ReadAt(p []byte, off int64) (int, error) {
 	a.once.Do(func() {
-		a.buf, a.err = io.ReadAll(a.rc)
+		a.buf, a.err = io.ReadAll(io.LimitReader(a.rc, maxReleaseReadBytes+1))
 		_ = a.rc.Close()
+		if a.err == nil && int64(len(a.buf)) > maxReleaseReadBytes {
+			a.err = fmt.Errorf("sftp: release exceeds %d byte read limit", maxReleaseReadBytes)
+		}
 	})
 	if a.err != nil {
 		return 0, a.err
@@ -370,7 +386,7 @@ func (d *downloadTap) Close() error {
 func (fs *remoteFS) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	p := cleanPath(r.Filepath)
 	if isReleasesPath(p) {
-		return fs.listReleases(r.Method)
+		return fs.listReleases(r.Method, p)
 	}
 	switch r.Method {
 	case "List":
@@ -391,14 +407,27 @@ func (fs *remoteFS) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	return nil, fmt.Errorf("sftp: unsupported list method %q", r.Method)
 }
 
-// listReleases serves the /releases directory listing — scoped to fs.user's
-// own non-expired releases only.
-func (fs *remoteFS) listReleases(method string) (sftp.ListerAt, error) {
+// listReleases serves /releases List and Stat requests — scoped to fs.user's
+// own non-expired releases only. Stat on the bare /releases directory itself
+// returns a synthetic releaseDirInfo; Stat on /releases/<id> runs the exact
+// same identity+expiry lookup readRelease uses (fs.releases.Get) and fails
+// with the same os.ErrNotExist whether the ID doesn't exist, belongs to
+// another user, or has expired — no distinguishing error, so Stat cannot be
+// used as an oracle for any of those cases the way Fileread already isn't.
+func (fs *remoteFS) listReleases(method, p string) (sftp.ListerAt, error) {
 	if fs.releases == nil {
 		return nil, fmt.Errorf("sftp: /releases is not enabled")
 	}
 	if method == "Stat" {
-		return listerAt{releaseDirInfo{}}, nil
+		id := releaseIDFrom(p)
+		if id == "" {
+			return listerAt{releaseDirInfo{}}, nil
+		}
+		rel, ok := fs.releases.Get(fs.user, id, time.Now())
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		return listerAt{releaseFileInfo{rel: rel}}, nil
 	}
 	list := fs.releases.ListFor(fs.user, time.Now())
 	infos := make([]os.FileInfo, len(list))
