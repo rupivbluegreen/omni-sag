@@ -68,6 +68,7 @@ type Dialer struct {
 	// it is the resolved-address (SSRF/DNS-rebinding) guard. Defaults to the
 	// strict production guard; an Option may relax it for test/dev harnesses.
 	dialControl dialControlFunc
+	debug       bool // opt-in: mirrors every emitted evidence event to stdout; see WithDebug
 }
 
 // SetPolicy atomically replaces the dialer's policy. A control-plane policy
@@ -99,6 +100,29 @@ func WithCredentialProvider(p *credential.Provider) Option {
 // shared with the API — the data path never imports the control plane.
 func WithApprovals(store approval.Store, ttl time.Duration) Option {
 	return func(d *Dialer) { d.approvals = store; d.approvalTTL = ttl }
+}
+
+// WithDebug mirrors every evidence event (tunnel decision, approval,
+// credential resolution) to stdout as it's emitted, in addition to the sink.
+// Dev/troubleshooting only — do not enable in production.
+func WithDebug(enabled bool) Option {
+	return func(d *Dialer) { d.debug = enabled }
+}
+
+// emit sends an evidence event, logging (never swallowing) any sink error,
+// and — when debug is enabled — also prints the event itself to stdout so a
+// live tail of decisions doesn't require reading evidence.jsonl.
+func (d *Dialer) emit(e evidence.Event) {
+	if d.debug {
+		allow := "?"
+		if e.Allow != nil {
+			allow = fmt.Sprintf("%v", *e.Allow)
+		}
+		log.Printf("omni-sag: debug: %s user=%s target=%s allow=%s reason=%q", e.Type, e.User, e.Target, allow, e.Reason)
+	}
+	if err := d.sink.Emit(e); err != nil {
+		log.Printf("omni-sag: evidence emit failed (type=%s user=%s target=%s): %v", e.Type, e.User, e.Target, err)
+	}
 }
 
 // New returns a Dialer bound to a policy and an evidence sink. A credential
@@ -165,7 +189,7 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 	// must not silently drop the record: surface it, but the decision stands.
 	// Slice 3 will decide whether an un-recordable allow should fail closed;
 	// for now the failure is logged so a degraded sink is observable.
-	if err := d.sink.Emit(evidence.Event{
+	d.emit(evidence.Event{
 		Time:        time.Now().UTC(),
 		Type:        evidence.TypeTunnelDecision,
 		User:        pr.User,
@@ -175,10 +199,7 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 		Reason:      reason,
 		MatchedRole: decision.MatchedRole,
 		RecordMode:  string(decision.RecordMode),
-	}); err != nil {
-		log.Printf("omni-sag: evidence emit failed (tunnel_decision user=%s target=%s allow=%v): %v",
-			pr.User, target, effectiveAllow, err)
-	}
+	})
 
 	if !decision.Allow {
 		return nil, fmt.Errorf("%w: %s", ErrDenied, decision.Reason)
@@ -272,7 +293,7 @@ func (d *Dialer) emitApproval(pr policy.Principal, sourceIP string, target polic
 	case "refused":
 		allow = evidence.BoolPtr(false)
 	}
-	if err := d.sink.Emit(evidence.Event{
+	d.emit(evidence.Event{
 		Time:      time.Now().UTC(),
 		Type:      evidence.TypeApproval,
 		User:      pr.User,
@@ -282,9 +303,7 @@ func (d *Dialer) emitApproval(pr policy.Principal, sourceIP string, target polic
 		Outcome:   outcome,
 		Reason:    "approval " + status,
 		ObjectKey: reqID,
-	}); err != nil {
-		log.Printf("omni-sag: evidence emit failed (approval user=%s target=%s): %v", pr.User, target, err)
-	}
+	})
 }
 
 // resolveCredential applies the target's credential mode and emits a credential
@@ -319,7 +338,7 @@ func (d *Dialer) resolveCredential(ctx context.Context, pr policy.Principal, sou
 			outcome = "fail_closed"
 		}
 	}
-	if err := d.sink.Emit(evidence.Event{
+	d.emit(evidence.Event{
 		Time:           time.Now().UTC(),
 		Type:           evidence.TypeCredential,
 		User:           pr.User,
@@ -329,9 +348,7 @@ func (d *Dialer) resolveCredential(ctx context.Context, pr policy.Principal, sou
 		CredentialMode: string(mode.Normalize()),
 		Outcome:        outcome,
 		Reason:         reason,
-	}); err != nil {
-		log.Printf("omni-sag: evidence emit failed (credential user=%s target=%s): %v", pr.User, target, err)
-	}
+	})
 
 	if cerr != nil {
 		return fmt.Errorf("%w: %v", ErrCredentialRefused, cerr)
