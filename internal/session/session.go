@@ -86,7 +86,10 @@ type Server struct {
 	active   atomic.Int64   // current active connections
 	draining atomic.Bool    // set once ctx is cancelled; refuses new connections
 
-	debug bool // opt-in: logs the underlying auth/MFA error to stdout on failure; see WithDebug
+	debug          bool // opt-in: logs the underlying auth/MFA error to stdout on failure; see WithDebug
+	sshDisabled    bool // opt-in: rejects "shell" requests on session channels; see WithSSHDisabled
+	tunnelDisabled bool // opt-in: rejects "direct-tcpip" channels (-L port forwarding); see WithTunnelDisabled
+	sftpDisabled   bool // opt-in: rejects "subsystem"+"sftp" requests on session channels; see WithSFTPDisabled
 }
 
 // WithRegistry registers each authenticated connection in reg so the
@@ -106,6 +109,31 @@ type Option func(*Server)
 // the gateway's stdout.
 func WithDebug(enabled bool) Option {
 	return func(s *Server) { s.debug = enabled }
+}
+
+// WithSSHDisabled rejects every "shell" request on a "session" channel
+// (interactive PTY shell to the real target), regardless of policy. SFTP and
+// -L port forwarding are unaffected. False (the default) leaves the shell
+// available; policy still separately governs which hosts/ports a shell may
+// reach.
+func WithSSHDisabled(disabled bool) Option {
+	return func(s *Server) { s.sshDisabled = disabled }
+}
+
+// WithTunnelDisabled rejects every "direct-tcpip" channel (-L port
+// forwarding) outright, regardless of policy. Interactive shell and SFTP are
+// unaffected. False (the default) leaves forwarding available; policy still
+// separately governs which hosts/ports a tunnel may reach.
+func WithTunnelDisabled(disabled bool) Option {
+	return func(s *Server) { s.tunnelDisabled = disabled }
+}
+
+// WithSFTPDisabled rejects every "subsystem"+"sftp" request on a "session"
+// channel, regardless of policy. Interactive shell and -L port forwarding
+// are unaffected. False (the default) leaves SFTP available; policy still
+// separately governs which hosts/ports SFTP may reach.
+func WithSFTPDisabled(disabled bool) Option {
+	return func(s *Server) { s.sftpDisabled = disabled }
 }
 
 // WithMFA gates every successful primary authentication behind a second
@@ -511,6 +539,10 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 		ct := newCh.ChannelType()
 		if ct != "direct-tcpip" && ct != "session" {
 			_ = newCh.Reject(ssh.UnknownChannelType, "unsupported channel type")
+			continue
+		}
+		if ct == "direct-tcpip" && s.tunnelDisabled {
+			_ = newCh.Reject(ssh.Prohibited, "port forwarding disabled: gateway configuration disables -L tunnels")
 			continue
 		}
 		select {

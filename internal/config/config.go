@@ -32,6 +32,13 @@ type File struct {
 
 	TargetKnownHosts      string `yaml:"target_known_hosts"`       // OpenSSH known_hosts path verifying real-target host keys
 	TargetInsecureHostKey bool   `yaml:"target_insecure_host_key"` // dev-lab only: explicitly disable target host-key verification; see WithInsecureTargetHostKey
+
+	// Capability toggles: any combination may be disabled independently. All
+	// default to false (enabled), so a config.yaml written before these
+	// fields existed keeps serving all three, unchanged.
+	DisableSSH    bool `yaml:"disable_ssh"`    // reject interactive PTY shell ("shell" requests on session channels)
+	DisableTunnel bool `yaml:"disable_tunnel"` // reject -L port forwarding ("direct-tcpip" channels)
+	DisableSFTP   bool `yaml:"disable_sftp"`   // reject the SFTP subsystem ("subsystem"+"sftp" requests on session channels)
 }
 
 // MetricsConfig configures the Prometheus metrics endpoint, served on its own
@@ -258,6 +265,9 @@ func (f *File) validate() error {
 	}
 	if f.HostKey == "" {
 		f.HostKey = "hostkey.pem"
+	}
+	if f.DisableSSH && f.DisableTunnel && f.DisableSFTP {
+		return fmt.Errorf("config: disable_ssh, disable_tunnel, and disable_sftp cannot all be true (the gateway would serve nothing)")
 	}
 	evCount := 0
 	if f.Evidence.File != "" {

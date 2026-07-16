@@ -49,6 +49,9 @@ func TestLoadAndCompile(t *testing.T) {
 	if !f.LDAP.InsecureTLS {
 		t.Fatal("insecure_tls should be true")
 	}
+	if f.DisableSSH || f.DisableTunnel || f.DisableSFTP {
+		t.Fatal("capability toggles should all default to false (enabled)")
+	}
 
 	p := f.CompilePolicy()
 	// compiled policy must produce the same decisions as the demo
@@ -84,6 +87,44 @@ policy:
 `
 	if _, err := Load(writeTemp(t, bad)); err == nil {
 		t.Fatal("expected error for empty rule host")
+	}
+}
+
+func TestValidate_AllCapabilitiesDisabledRejected(t *testing.T) {
+	bad := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+disable_ssh: true
+disable_tunnel: true
+disable_sftp: true
+policy:
+  roles: []
+`
+	if _, err := Load(writeTemp(t, bad)); err == nil {
+		t.Fatal("expected error when disable_ssh, disable_tunnel, and disable_sftp are all true")
+	}
+}
+
+func TestValidate_TwoOfThreeCapabilitiesDisabledIsAllowed(t *testing.T) {
+	ok := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+disable_ssh: true
+disable_sftp: true
+policy:
+  roles: []
+`
+	f, err := Load(writeTemp(t, ok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !f.DisableSSH || !f.DisableSFTP {
+		t.Fatal("disable_ssh and disable_sftp should both be true")
+	}
+	if f.DisableTunnel {
+		t.Fatal("disable_tunnel should be false (omitted)")
 	}
 }
 

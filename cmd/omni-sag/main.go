@@ -165,6 +165,18 @@ func run(cfgPath string, debug bool) error {
 	opts = append(opts, session.WithRegistry(reg))
 	opts = append(opts, session.WithDialerPeek(d.PeekHost))
 	opts = append(opts, session.WithDebug(debug))
+	opts = append(opts, session.WithSSHDisabled(cfg.DisableSSH))
+	opts = append(opts, session.WithTunnelDisabled(cfg.DisableTunnel))
+	opts = append(opts, session.WithSFTPDisabled(cfg.DisableSFTP))
+	if cfg.DisableSSH {
+		log.Printf("omni-sag: interactive shell disabled (disable_ssh)")
+	}
+	if cfg.DisableTunnel {
+		log.Printf("omni-sag: -L port forwarding disabled (disable_tunnel)")
+	}
+	if cfg.DisableSFTP {
+		log.Printf("omni-sag: SFTP disabled (disable_sftp)")
+	}
 	opts = append(opts, sessOpts...)
 	if cfg.MFA.Enabled {
 		rc := cfg.MFA.RADIUS
