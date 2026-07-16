@@ -84,6 +84,10 @@ func (s *Server) handleSession(ctx, connCtx context.Context, newCh ssh.NewChanne
 		case "auth-agent-req@openssh.com":
 			_ = req.Reply(true, nil)
 		case "shell":
+			if s.sshDisabled {
+				_ = req.Reply(false, nil) // interactive shell disabled by gateway configuration (disable_ssh)
+				continue
+			}
 			if shellDone != nil {
 				_ = req.Reply(false, nil) // a shell was already dispatched on this channel
 				continue
@@ -115,6 +119,10 @@ func (s *Server) handleSession(ctx, connCtx context.Context, newCh ssh.NewChanne
 			}
 			var sub subsystemRequest
 			if ssh.Unmarshal(req.Payload, &sub) == nil && sub.Name == "sftp" {
+				if s.sftpDisabled {
+					_ = req.Reply(false, nil) // SFTP disabled by gateway configuration (disable_sftp)
+					continue
+				}
 				_ = req.Reply(true, nil)
 				s.runSFTP(ctx, connCtx, channel, pr, srcIP, sconn, tch)
 				return
