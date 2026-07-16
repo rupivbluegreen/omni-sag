@@ -36,9 +36,10 @@ The things that would make us drop our coffee:
 
 ## Scope notes
 
-Some parts of v1 are deliberate **stand-ins** and are documented as such — the in-memory SFTP
-backend, the echo interactive shell, the OIDC static-token stand-in, and the stubbed Kubernetes CRD
-sources. Issues in the *controls* around them (inspection, recording, evidence, authz) are in scope;
-"the stand-in doesn't proxy to a real backend yet" is a known limitation, not a vulnerability.
+Some parts of v1 are deliberate **stand-ins** and are documented as such — the OIDC static-token
+stand-in, and the stubbed Kubernetes CRD sources (real-target SFTP and interactive shell proxying
+shipped in PR #3, no longer stand-ins). Issues in the *controls* around them (inspection, recording,
+evidence, authz) are in scope; "the stand-in doesn't proxy to a real backend yet" is a known
+limitation, not a vulnerability.
 
 Thanks for helping keep the bouncer honest. 🛡️

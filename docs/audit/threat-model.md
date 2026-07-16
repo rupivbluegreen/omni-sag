@@ -59,9 +59,10 @@ and ADR-0003 (FIPS).
 1. **Evidence emit is fail-open-but-surfaced** (see fail-closed matrix row 16).
 2. **Trailing/whole-bundle deletion** is detectable only with a pinned `-head`
    or WORM (inherent to offline verification).
-3. **SFTP backend and interactive shell are stand-ins** in v1 (in-memory FS /
-   echo shell); the *controls* (inspect-before-accept, recording, evidence) are
-   real, but proxying to a real target shell/backend is v1.x work.
+3. **SFTP backend and interactive shell proxy to the real target** (shipped in
+   PR #3): a second SSH leg opens against the target for the actual shell/SFTP
+   session, gated by the same controls (inspect-before-accept, recording,
+   evidence, quarantine-then-release). No longer a v1 stand-in.
 4. **CRD policy/approval sources are stubs**; file-backed durable stores are the
    v1 implementation. Kubernetes informer reconcilers require a cluster.
 5. **OIDC is a static-token stand-in** behind an `Authorizer` interface; a real
