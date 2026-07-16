@@ -85,6 +85,8 @@ type Server struct {
 	wg       sync.WaitGroup // tracks active connections for graceful drain
 	active   atomic.Int64   // current active connections
 	draining atomic.Bool    // set once ctx is cancelled; refuses new connections
+
+	debug bool // opt-in: logs the underlying auth/MFA error to stdout on failure; see WithDebug
 }
 
 // WithRegistry registers each authenticated connection in reg so the
@@ -95,6 +97,16 @@ func WithRegistry(reg *sessions.Registry) Option {
 
 // Option configures a Server.
 type Option func(*Server)
+
+// WithDebug logs the underlying auth/MFA error to stdout on every failure,
+// in addition to the generic evidence reason. Evidence itself is unchanged
+// (still no failure detail, to avoid a user-enumeration/DC-status oracle) —
+// this only affects the operator-facing stdout log. Do not enable in
+// production: it defeats the anti-enumeration posture for whoever can read
+// the gateway's stdout.
+func WithDebug(enabled bool) Option {
+	return func(s *Server) { s.debug = enabled }
+}
 
 // WithMFA gates every successful primary authentication behind a second
 // factor. If Verify fails, the login is refused (fail closed).
@@ -202,8 +214,17 @@ func New(hostKey ssh.Signer, auth authn.Authenticator, d *dialer.Dialer, sink ev
 }
 
 // emit sends an evidence event, logging (never swallowing) any sink error so a
-// degraded evidence pipeline is observable. Emitting is non-optional.
+// degraded evidence pipeline is observable. Emitting is non-optional. When
+// debug is enabled, the event itself is also mirrored to stdout so a live
+// tail of session activity doesn't require reading evidence.jsonl.
 func (s *Server) emit(e evidence.Event) {
+	if s.debug {
+		allow := "?"
+		if e.Allow != nil {
+			allow = fmt.Sprintf("%v", *e.Allow)
+		}
+		log.Printf("omni-sag: debug: %s user=%s allow=%s reason=%q detail=%q", e.Type, e.User, allow, e.Reason, e.Detail)
+	}
 	if err := s.sink.Emit(e); err != nil {
 		log.Printf("omni-sag: evidence emit failed (type=%s user=%s): %v", e.Type, e.User, err)
 	}
@@ -264,6 +285,9 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		id, err := auth.Authenticate(ctx, loginUser, string(password))
 		if err != nil {
 			s.bfLimiter.RecordFailure(srcIP)
+			if s.debug {
+				log.Printf("omni-sag: debug: auth failed user=%s source=%s err=%v", loginUser, srcIP, err)
+			}
 			s.emit(evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeAuth,
 				User: loginUser, SourceIP: srcIP,
@@ -291,6 +315,9 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 			reason := "mfa approved"
 			if !allowed {
 				reason = "mfa denied"
+				if s.debug {
+					log.Printf("omni-sag: debug: mfa failed user=%s source=%s err=%v", id.User, srcIP, mfaErr)
+				}
 			}
 			s.emit(evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeMFA,

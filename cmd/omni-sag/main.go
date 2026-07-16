@@ -42,14 +42,15 @@ var errBadClientCA = errors.New("api: client_ca is not valid PEM")
 
 func main() {
 	cfgPath := flag.String("config", "config.yaml", "path to configuration file")
+	debug := flag.Bool("debug", false, "log underlying auth/MFA failure detail to stdout (dev only: weakens the anti-enumeration posture, never enable in production)")
 	flag.Parse()
 
-	if err := run(*cfgPath); err != nil {
+	if err := run(*cfgPath, *debug); err != nil {
 		log.Fatalf("omni-sag: %v", err)
 	}
 }
 
-func run(cfgPath string) error {
+func run(cfgPath string, debug bool) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
@@ -93,6 +94,10 @@ func run(cfgPath string) error {
 
 	var dopts []dialer.Option
 	var sessOpts []session.Option // collected here, appended to `opts` further down where session.Option values are built
+	dopts = append(dopts, dialer.WithDebug(debug))
+	if debug {
+		log.Printf("omni-sag: WARNING debug logging enabled — weakens the anti-enumeration posture on stdout, never use in production")
+	}
 	if ca := cfg.CyberArk; ca != nil {
 		prov, err := dialer.NewCyberArkProvider(dialer.CyberArkParams{
 			BaseURL:                ca.BaseURL,
@@ -159,6 +164,7 @@ func run(cfgPath string) error {
 	var opts []session.Option
 	opts = append(opts, session.WithRegistry(reg))
 	opts = append(opts, session.WithDialerPeek(d.PeekHost))
+	opts = append(opts, session.WithDebug(debug))
 	opts = append(opts, sessOpts...)
 	if cfg.MFA.Enabled {
 		rc := cfg.MFA.RADIUS
