@@ -3,12 +3,35 @@
 listen: ":2222"
 host_key: "hostkey.pem"
 
+# drain_grace_seconds: how long a rolling restart waits for in-flight SSH
+# sessions to finish before SIGKILL. Default 30 if omitted.
+# drain_grace_seconds: 30
+
 # Real-target second SSH leg (shell/SFTP proxy to the ssh-target container
 # below): dev-lab only, no target_known_hosts file exists in this lab, so
 # host-key verification for that second leg is explicitly disabled. Without
 # EITHER this or target_known_hosts, dialTarget fails closed and the
 # Real-target demo rule below can never succeed. Never set this in production.
 target_insecure_host_key: true
+# Production alternative: pin real target host keys instead of the insecure
+# bypass above (set exactly one of the two).
+# target_known_hosts: "/etc/omni-sag/target_known_hosts"
+
+# FIPS-readiness posture: off (default) | warn | enforce. enforce rejects
+# non-FIPS TLS params and insecure_tls at boot; see docs/fips.md.
+# fips:
+#   mode: enforce
+
+# Prometheus metrics, on its own out-of-band listener.
+# metrics:
+#   listen: ":9090"
+
+# Capability toggles (all default false = enabled). Any combination may be
+# disabled independently; at least one must stay enabled. Uncomment to
+# restrict this gateway to, e.g., tunnel-only:
+# disable_ssh: true      # reject interactive PTY shell
+# disable_tunnel: true   # reject -L port forwarding
+# disable_sftp: true     # reject the SFTP subsystem
 
 ldap:
   url: "ldaps://127.0.0.1:636"
@@ -135,6 +158,17 @@ inspection:
 #   # cn_roles:
 #   #   - { cn: "ops@corp", role: "operator" }
 
+# Four-eyes approvals: required for any rule setting require_approval, and
+# for SFTP's quarantine-release flow (a KindQuarantineRelease approval, using
+# release_ttl_seconds instead of ttl_seconds). use_crd swaps in the (stubbed)
+# Kubernetes CRD store instead of the durable file store — not yet wired to a
+# real cluster.
+# approval:
+#   store_path: "approvals.json"
+#   ttl_seconds: 900            # session-access approval pending lifetime
+#   release_ttl_seconds: 86400  # quarantine-release approval pending lifetime (24h)
+#   use_crd: false
+
 # Policy hot-reload source (Slice 7). Omit to reload from this config file.
 # CRD-backed source (Kubernetes informer) lands as a follow-up; until then the
 # file source hot-reloads on change and a bad edit keeps the last good policy.
@@ -155,6 +189,10 @@ policy:
           # credential (Slice 6): passthrough (default) | prompt | inject | deny
           #   inject -> fetch from CyberArk; fails closed if CCP is unavailable
           credential: passthrough
+          # require_approval (Slice 6): four-eyes-gate this rule — the
+          # session blocks until a second human approves via omnisag-ctl/API
+          # (never the requester themselves). Needs the approval: block above.
+          # require_approval: false
         # Real-target demo (this design's shell/SFTP proxy, not the -L tunnel
         # above): alice gets a genuine shell/SFTP on the ssh-target container,
         # authenticated as svc_db1. Uses "prompt" rather than "inject" because
