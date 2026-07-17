@@ -462,8 +462,7 @@ func TestPolicyConfig_DisableCIDRHostnameResolutionDefaultsFalse(t *testing.T) {
 
 func TestLoad_ComposeExampleConfigParses(t *testing.T) {
 	// Regression check: the shipped deploy/compose/config.example.yaml must
-	// always be loadable, including the new commented-out
-	// disable_cidr_hostname_resolution documentation added alongside it.
+	// always be loadable.
 	_, err := Load("../../deploy/compose/config.example.yaml")
 	if err != nil {
 		t.Fatalf("deploy/compose/config.example.yaml failed to load: %v", err)
