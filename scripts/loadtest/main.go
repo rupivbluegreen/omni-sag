@@ -1,9 +1,12 @@
+//go:build !windows
+
 // Command loadtest stress-tests a running omni-sag gateway with many
 // concurrent SSH connections, each opening one -L-style tunnel (a
 // direct-tcpip channel, the same mechanism `ssh -L` uses) and holding it
 // open for a measurement window. Not part of the shipped binaries or CI —
 // a manual dev tool, run against a real gateway (e.g. the docker-compose
-// lab) pointed at scripts/loadtest/config.yaml.
+// lab) pointed at scripts/loadtest/config.yaml. Unix-only: uses
+// golang.org/x/sys/unix to raise the open-file limit.
 package main
 
 import (
