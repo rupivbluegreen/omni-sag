@@ -1,6 +1,10 @@
 package policy
 
-import "testing"
+import (
+	"errors"
+	"net"
+	"testing"
+)
 
 // TestDecideHost_SingleUnambiguousRule: exactly one rule matches the host and
 // it names exactly one port — DecideHost succeeds and resolves that port.
@@ -165,5 +169,73 @@ func TestDecideHost_DifferentHostsRemainUnambiguous(t *testing.T) {
 	d := p.DecideHost(pr, "127.0.0.1", nil)
 	if !d.Allow || d.Port != 2200 || d.TargetUser != "svc_db1" {
 		t.Fatalf("distinct-host rule must resolve unambiguously, got %+v", d)
+	}
+}
+
+func TestDecideHost_CIDR_MultiIPAllInRangeAllowed(t *testing.T) {
+	resolve := func(host string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("10.1.1.1"), net.ParseIP("10.2.2.2")}, nil
+	}
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []Rule{{Host: "10.0.0.0/8", Ports: []int{22}}},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	d := p.DecideHost(pr, "multi.lab.local", resolve)
+	if !d.Allow || d.Port != 22 {
+		t.Fatalf("a hostname whose IPs are all in range must be allowed with the resolved port, got %+v", d)
+	}
+}
+
+func TestDecideHost_CIDR_PartialIPMatchDenied(t *testing.T) {
+	resolve := func(host string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("10.1.1.1"), net.ParseIP("192.168.1.1")}, nil
+	}
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []Rule{{Host: "10.0.0.0/8", Ports: []int{22}}},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	d := p.DecideHost(pr, "split.lab.local", resolve)
+	if d.Allow {
+		t.Fatalf("a hostname with only SOME resolved IPs in range must be denied (fail closed), got allow port=%d", d.Port)
+	}
+}
+
+func TestDecideHost_CIDR_SplitAcrossTwoRulesIsAmbiguous(t *testing.T) {
+	resolve := func(host string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("10.1.1.1"), net.ParseIP("172.16.1.1")}, nil
+	}
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow: []Rule{
+			{Host: "10.0.0.0/8", Ports: []int{22}},
+			{Host: "172.16.0.0/12", Ports: []int{22}},
+		},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	d := p.DecideHost(pr, "split2.lab.local", resolve)
+	if d.Allow {
+		t.Fatal("resolved IPs split across two different CIDR rules must be denied (ambiguous)")
+	}
+	if d.Reason == "" {
+		t.Fatal("an ambiguous CIDR split must explain why")
+	}
+}
+
+func TestDecideHost_CIDR_ResolverErrorFailsClosed(t *testing.T) {
+	resolve := func(host string) ([]net.IP, error) { return nil, errors.New("dns down") }
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []Rule{{Host: "10.0.0.0/8", Ports: []int{22}}},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	d := p.DecideHost(pr, "broken.lab.local", resolve)
+	if d.Allow {
+		t.Fatal("a resolver error must fail closed (deny), not allow")
 	}
 }

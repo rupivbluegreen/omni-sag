@@ -1,6 +1,10 @@
 package policy
 
-import "testing"
+import (
+	"fmt"
+	"net"
+	"testing"
+)
 
 // demoPolicy mirrors the Slice 1 demo: a "dba" role granting the DB host, keyed
 // off the "dba" AD group.
@@ -171,5 +175,75 @@ func TestDecide_CIDRRuleStillEnforcesPort(t *testing.T) {
 	d := p.Decide(pr, Target{Host: "10.5.6.7", Port: 22}, nil)
 	if d.Allow {
 		t.Fatal("a CIDR rule with an explicit ports list must still enforce the port")
+	}
+}
+
+func TestDecide_CIDRRuleMatchesResolvedHostname(t *testing.T) {
+	resolve := func(host string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("10.1.2.3")}, nil
+	}
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []Rule{{Host: "10.0.0.0/8", Ports: []int{5432}}},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	d := p.Decide(pr, Target{Host: "db.internal.corp", Port: 5432}, resolve)
+	if !d.Allow {
+		t.Fatalf("hostname resolving inside the CIDR must be allowed, got deny: %s", d.Reason)
+	}
+	if d.MatchedCIDR == nil || d.MatchedCIDR.String() != "10.0.0.0/8" {
+		t.Fatalf("MatchedCIDR = %v, want 10.0.0.0/8", d.MatchedCIDR)
+	}
+}
+
+func TestDecide_CIDRNotConsultedWhenExactRuleMatches(t *testing.T) {
+	called := false
+	spy := func(host string) ([]net.IP, error) {
+		called = true
+		return nil, nil
+	}
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow: []Rule{
+			{Host: "db1.lab.local", Ports: []int{5432}},
+			{Host: "10.0.0.0/8", Ports: []int{5432}},
+		},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	d := p.Decide(pr, Target{Host: "db1.lab.local", Port: 5432}, spy)
+	if !d.Allow {
+		t.Fatalf("exact rule should allow, got deny: %s", d.Reason)
+	}
+	if called {
+		t.Fatal("resolver must not be called when an exact/wildcard rule already matched (cheap-first ordering)")
+	}
+}
+
+func TestDecide_CIDRHostnameDeniedWithNilResolver(t *testing.T) {
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []Rule{{Host: "10.0.0.0/8", Ports: []int{5432}}},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	d := p.Decide(pr, Target{Host: "db.internal.corp", Port: 5432}, nil)
+	if d.Allow {
+		t.Fatal("a hostname target against a CIDR rule with a nil resolver must be denied, not allowed")
+	}
+}
+
+func TestDecide_CIDRHostnameDeniedOnResolverError(t *testing.T) {
+	resolve := func(host string) ([]net.IP, error) { return nil, fmt.Errorf("dns down") }
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []Rule{{Host: "10.0.0.0/8", Ports: []int{5432}}},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	d := p.Decide(pr, Target{Host: "db.internal.corp", Port: 5432}, resolve)
+	if d.Allow {
+		t.Fatal("a resolver error must fail closed (deny), not allow")
 	}
 }
