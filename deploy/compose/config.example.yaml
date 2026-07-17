@@ -175,12 +175,6 @@ inspection:
 # policy_source:
 #   file: "policy.yaml"
 
-# CIDR ranges are accepted as Rule.Host anywhere below (e.g. "10.0.0.0/8"),
-# alongside exact hostnames and "*". A hostname target is matched against a
-# CIDR rule by resolving it first; uncomment to turn that resolution off
-# (CIDR rules then only ever match IP-literal targets):
-# policy:
-#   disable_cidr_hostname_resolution: true
 policy:
   roles:
     - name: dba

@@ -5,9 +5,7 @@ package config
 
 import (
 	"fmt"
-	"net"
 	"os"
-	"strings"
 
 	"github.com/rupivbluegreen/omni-sag/internal/fips"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
@@ -223,11 +221,6 @@ type LDAPConfig struct {
 // PolicyConfig is the YAML shape of the policy document.
 type PolicyConfig struct {
 	Roles []RoleConfig `yaml:"roles"`
-	// DisableCIDRHostnameResolution opts out of resolving hostname targets
-	// for CIDR-shaped rules — matching then falls back to IP-literal targets
-	// only, same as if no resolver were configured. Default false (resolution
-	// enabled); see internal/policy.ResolverFunc.
-	DisableCIDRHostnameResolution bool `yaml:"disable_cidr_hostname_resolution"`
 }
 
 // RoleConfig binds AD groups to allow rules.
@@ -392,11 +385,6 @@ func validatePolicyRoles(roles []RoleConfig) error {
 		for _, rule := range r.Allow {
 			if rule.Host == "" {
 				return fmt.Errorf("config: role %q has a rule with empty host", r.Name)
-			}
-			if strings.Contains(rule.Host, "/") {
-				if _, _, err := net.ParseCIDR(rule.Host); err != nil {
-					return fmt.Errorf("config: role %q rule has host %q that looks like CIDR notation but does not parse: %w", r.Name, rule.Host, err)
-				}
 			}
 			switch rule.Record {
 			case "", "none", "metadata-only", "full":
