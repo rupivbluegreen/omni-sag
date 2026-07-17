@@ -58,6 +58,33 @@ func (s *Server) emitTargetCredential(pr policy.Principal, srcIP, targetHost str
 	})
 }
 
+// passwordAuthMethods returns the auth methods a password-bearing target leg
+// offers (inject and prompt modes): the SSH "password" method AND the
+// "keyboard-interactive" method, both answered with the same secret. Offering
+// both is required because "password" and "keyboard-interactive" are distinct
+// SSH auth methods and a target advertises only one of them — BoKS / PAM-MFA
+// hosts (e.g. clrv0000332537) disable "password" and accept only
+// "keyboard-interactive", so a password-only config fails the handshake with
+// "attempted methods [none]". The keyboard-interactive callback answers every
+// prompt in the challenge with the secret (a BoKS host sends a single
+// echo-off password prompt; a zero-prompt info message — e.g. an MFA push
+// notice — yields an empty answer set and simply proceeds).
+//
+// The secret is held as a Go string inside these closures for the lifetime of
+// the handshake — the same residual exposure ssh.Password already carries (it
+// too retains the string); see ADR-0002. The caller passes the string inline
+// and Destroy()s the backing secret immediately after, exactly as before.
+func passwordAuthMethods(secret string) []ssh.AuthMethod {
+	kbd := ssh.KeyboardInteractive(func(_, _ string, questions []string, _ []bool) ([]string, error) {
+		answers := make([]string, len(questions))
+		for i := range answers {
+			answers[i] = secret
+		}
+		return answers, nil
+	})
+	return []ssh.AuthMethod{ssh.Password(secret), kbd} // omni-sag:target-auth-string — see ADR-0002 residual risk
+}
+
 // dialTarget opens and authenticates the gateway's second SSH leg to the
 // target, per decision's credential mode. It never returns a client on deny
 // or on any auth failure — no downgrade to another mode (mirrors
@@ -114,7 +141,7 @@ func (s *Server) dialTarget(ctx context.Context, sconn ssh.Conn, pr policy.Princ
 		// Residual risk documented in ADR-0002 and this plan's Global
 		// Constraints: ssh.Password requires a Go string; the conversion
 		// happens only in this expression, never bound to a variable.
-		cfg.Auth = []ssh.AuthMethod{ssh.Password(string(res.Secret.Bytes()))} // omni-sag:target-auth-string — see ADR-0002 residual risk
+		cfg.Auth = passwordAuthMethods(string(res.Secret.Bytes())) // omni-sag:target-auth-string — see ADR-0002 residual risk
 		res.Secret.Destroy()
 
 	case credential.ModePrompt:
@@ -125,7 +152,7 @@ func (s *Server) dialTarget(ctx context.Context, sconn ssh.Conn, pr policy.Princ
 			return nil, fmt.Errorf("%w: %s", credential.ErrFailClosed, reason)
 		}
 		s.emitTargetCredential(pr, srcIP, targetHost, targetPort, mode, string(credential.OutcomePrompt), "prompt credential collected", true)
-		cfg.Auth = []ssh.AuthMethod{ssh.Password(string(sec.Bytes()))} // omni-sag:target-auth-string — see ADR-0002 residual risk
+		cfg.Auth = passwordAuthMethods(string(sec.Bytes())) // omni-sag:target-auth-string — see ADR-0002 residual risk
 		sec.Destroy()
 
 	case credential.ModePassthrough:

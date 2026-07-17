@@ -74,6 +74,44 @@ func startFakeTarget(t *testing.T, wantPassword string) net.Conn {
 	return clientConn
 }
 
+// startFakeTargetKbdOnly runs a minimal SSH server that accepts ONLY the
+// "keyboard-interactive" auth method (no PasswordCallback, so the SSH
+// "password" method is not advertised) and authenticates by challenging the
+// client for a single password prompt. This models a BoKS / PAM-MFA target
+// like clrv0000332537, whose sshd offers only keyboard-interactive — the case
+// a password-only dial config fails with "attempted methods [none]".
+func startFakeTargetKbdOnly(t *testing.T, wantPassword string) net.Conn {
+	t.Helper()
+	signer := testHostKey(t)
+	cfg := &ssh.ServerConfig{
+		KeyboardInteractiveCallback: func(_ ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+			answers, err := challenge("", "", []string{"Password: "}, []bool{false})
+			if err != nil {
+				return nil, err
+			}
+			if len(answers) != 1 || answers[0] != wantPassword {
+				return nil, errors.New("wrong password")
+			}
+			return nil, nil
+		},
+	}
+	cfg.AddHostKey(signer)
+
+	clientConn, serverConn := fakeTargetPipe(t)
+	t.Cleanup(func() { clientConn.Close(); serverConn.Close() })
+	go func() {
+		sconn, chans, reqs, err := ssh.NewServerConn(serverConn, cfg)
+		if err != nil {
+			return
+		}
+		defer sconn.Close()
+		go ssh.DiscardRequests(reqs)
+		for range chans {
+		}
+	}()
+	return clientConn
+}
+
 // fakeTargetPipe returns a connected, buffered net.Conn pair over TCP
 // loopback. A raw net.Pipe() cannot be used here: it is fully synchronous
 // with zero internal buffering, and the SSH transport's version exchange has
@@ -338,6 +376,49 @@ func TestDialTarget_PromptSucceeds(t *testing.T) {
 		policy.Decision{CredentialMode: "prompt"}, "db1.lab.local", 22, token)
 	if err != nil {
 		t.Fatalf("dialTarget: %v", err)
+	}
+	defer client.Close()
+}
+
+// TestDialTarget_PromptSucceedsKeyboardInteractiveOnly is the regression test
+// for the keyboard-interactive gap: a target that advertises ONLY
+// keyboard-interactive (BoKS / PAM-MFA, e.g. clrv0000332537) must still
+// authenticate. Before passwordAuthMethods offered keyboard-interactive
+// alongside password, this failed with "unable to authenticate, attempted
+// methods [none], no supported methods remain".
+func TestDialTarget_PromptSucceedsKeyboardInteractiveOnly(t *testing.T) {
+	fakeConn := startFakeTargetKbdOnly(t, "prompted-secret")
+	orig := dialNet
+	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	t.Cleanup(func() { dialNet = orig })
+
+	s := &Server{sink: noopSink{}, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	token := s.stashTargetSecret(credential.New([]byte("prompted-secret")))
+	client, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
+		policy.Decision{CredentialMode: "prompt"}, "db1.lab.local", 22, token)
+	if err != nil {
+		t.Fatalf("dialTarget against keyboard-interactive-only target: %v", err)
+	}
+	defer client.Close()
+}
+
+// TestDialTarget_InjectSucceedsKeyboardInteractiveOnly proves inject mode also
+// authenticates a keyboard-interactive-only target (same gap, inject path).
+func TestDialTarget_InjectSucceedsKeyboardInteractiveOnly(t *testing.T) {
+	fakeConn := startFakeTargetKbdOnly(t, "injected-secret")
+	orig := dialNet
+	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	t.Cleanup(func() { dialNet = orig })
+
+	prov := credential.NewProvider(credential.Config{
+		Fetcher: fakeFetcher{secret: []byte("injected-secret")},
+		Query:   func(credential.Request) credential.Query { return credential.Query{} },
+	})
+	s := &Server{sink: noopSink{}, cred: prov, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	client, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
+		policy.Decision{CredentialMode: "inject"}, "db1.lab.local", 22, "")
+	if err != nil {
+		t.Fatalf("dialTarget against keyboard-interactive-only target: %v", err)
 	}
 	defer client.Close()
 }
