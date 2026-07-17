@@ -98,10 +98,6 @@ func run(cfgPath string, debug bool) error {
 	if debug {
 		log.Printf("omni-sag: WARNING debug logging enabled — weakens the anti-enumeration posture on stdout, never use in production")
 	}
-	if cfg.Policy.DisableCIDRHostnameResolution {
-		dopts = append(dopts, dialer.WithHostnameResolutionDisabled())
-		log.Printf("omni-sag: CIDR policy rules will not resolve hostnames (disable_cidr_hostname_resolution)")
-	}
 	if ca := cfg.CyberArk; ca != nil {
 		prov, err := dialer.NewCyberArkProvider(dialer.CyberArkParams{
 			BaseURL:                ca.BaseURL,

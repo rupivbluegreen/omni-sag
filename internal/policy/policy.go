@@ -6,7 +6,6 @@ package policy
 
 import (
 	"fmt"
-	"net"
 	"strings"
 )
 
@@ -114,14 +113,6 @@ type Decision struct {
 	// path's Target.Port, which the client always supplies up front). Zero on
 	// deny or when Decide (not DecideHost) produced this Decision.
 	Port int
-	// MatchedCIDR is the CIDR range of the rule that granted this decision,
-	// when the match came from a CIDR-shaped Rule.Host rather than an exact
-	// hostname or "*". Nil on deny and on exact/wildcard matches. Threaded
-	// into internal/dialer's connect-time guard so the resolved address is
-	// re-validated against the same range the decision was based on (DNS
-	// rebinding between decision time and connect time is otherwise
-	// invisible to policy).
-	MatchedCIDR *net.IPNet
 }
 
 // ForwardingAllowed reports whether port-forwarding (-L) is permitted for this
@@ -166,29 +157,25 @@ func intersectGroups(principalGroups, roleGroups []string) []string {
 	return out
 }
 
-func (r Rule) matchesPort(port int) bool {
+func (r Rule) matches(t Target) bool {
+	if r.Host != "*" && !strings.EqualFold(r.Host, t.Host) {
+		return false
+	}
 	if len(r.Ports) == 0 {
 		return true
 	}
 	for _, p := range r.Ports {
-		if p == port {
+		if p == t.Port {
 			return true
 		}
 	}
 	return false
 }
 
-func (r Rule) matches(t Target) bool {
-	if r.Host != "*" && !strings.EqualFold(r.Host, t.Host) {
-		return false
-	}
-	return r.matchesPort(t.Port)
-}
-
 // Decide is the pure authorization function: given a Principal and a Target,
 // it returns Allow only if some role the principal holds permits the target.
 // Default is deny.
-func (p Policy) Decide(pr Principal, t Target, resolve ResolverFunc) Decision {
+func (p Policy) Decide(pr Principal, t Target) Decision {
 	roles := p.rolesFor(pr)
 	if len(roles) == 0 {
 		return Decision{Allow: false, RecordMode: RecordNone, Reason: "no role: principal holds no role granting any access"}
@@ -209,35 +196,6 @@ func (p Policy) Decide(pr Principal, t Target, resolve ResolverFunc) Decision {
 			}
 		}
 	}
-	// CIDR rules are consulted only once every exact/wildcard rule has
-	// already failed to match — cheap-first, no resolution unless needed.
-	var ips []net.IP
-	resolved := false
-	for _, r := range roles {
-		for _, rule := range r.Allow {
-			n, ok := rule.cidr()
-			if !ok {
-				continue
-			}
-			if !resolved {
-				ips = targetIPs(t.Host, resolve)
-				resolved = true
-			}
-			if allIn(ips, n) && rule.matchesPort(t.Port) {
-				return Decision{
-					Allow:           true,
-					Reason:          "allowed by role " + r.Name,
-					MatchedRole:     r.Name,
-					RecordMode:      rule.Record.Normalize(),
-					CredentialMode:  rule.Credential,
-					RequireApproval: rule.RequireApproval,
-					TargetUser:      rule.TargetUser,
-					MatchedGroups:   intersectGroups(pr.Groups, r.Groups),
-					MatchedCIDR:     n,
-				}
-			}
-		}
-	}
 	return Decision{Allow: false, RecordMode: RecordNone, Reason: fmt.Sprintf("no rule in roles %s permits %s", roleNames(roles), t)}
 }
 
@@ -246,63 +204,6 @@ func (p Policy) Decide(pr Principal, t Target, resolve ResolverFunc) Decision {
 // path must still enforce ports exactly).
 func (r Rule) matchesHost(host string) bool {
 	return r.Host == "*" || strings.EqualFold(r.Host, host)
-}
-
-// cidr reports whether r.Host is CIDR notation (e.g. "10.0.0.0/8"), returning
-// the parsed range. Only strings containing "/" are considered — hostnames
-// never contain one, so this can't misclassify an exact-host rule.
-func (r Rule) cidr() (*net.IPNet, bool) {
-	if r.Host == "*" || !strings.Contains(r.Host, "/") {
-		return nil, false
-	}
-	_, n, err := net.ParseCIDR(r.Host)
-	if err != nil {
-		return nil, false
-	}
-	return n, true
-}
-
-// ResolverFunc resolves a hostname to its IP addresses, used to match a CIDR
-// rule against a hostname target. A nil ResolverFunc disables hostname
-// resolution: CIDR rules still match IP-literal targets directly.
-type ResolverFunc func(host string) ([]net.IP, error)
-
-// targetIPs returns the IPs to check a CIDR rule against: host itself,
-// parsed, if it is already a literal IP; otherwise resolve(host) when resolve
-// is non-nil. Returns nil (never matches any CIDR) for a hostname with no
-// resolver, or when resolution errors — fail closed rather than guessing.
-func targetIPs(host string, resolve ResolverFunc) []net.IP {
-	if ip := net.ParseIP(host); ip != nil {
-		return []net.IP{ip}
-	}
-	if resolve == nil {
-		return nil
-	}
-	ips, err := resolve(host)
-	if err != nil {
-		return nil
-	}
-	return ips
-}
-
-// allIn reports whether every ip in ips falls within n. False on an empty ips
-// (unresolved/unresolvable host) or if any ip lands outside n — a hostname
-// resolving to several addresses must sit entirely inside one rule's range to
-// match it; a partial or split match is a deny, never a guess.
-func allIn(ips []net.IP, n *net.IPNet) bool {
-	if len(ips) == 0 {
-		return false
-	}
-	for _, ip := range ips {
-		v := ip
-		if v4 := ip.To4(); v4 != nil {
-			v = v4
-		}
-		if !n.Contains(v) {
-			return false
-		}
-	}
-	return true
 }
 
 // DecideHost is Decide's host-only counterpart for the gateway's real-target
@@ -335,7 +236,7 @@ func allIn(ips []net.IP, n *net.IPNet) bool {
 //
 // A rule meant for this flow should therefore name exactly one host and
 // exactly one port.
-func (p Policy) DecideHost(pr Principal, host string, resolve ResolverFunc) Decision {
+func (p Policy) DecideHost(pr Principal, host string) Decision {
 	roles := p.rolesFor(pr)
 	if len(roles) == 0 {
 		return Decision{Allow: false, RecordMode: RecordNone, Reason: "no role: principal holds no role granting any access"}
@@ -343,34 +244,12 @@ func (p Policy) DecideHost(pr Principal, host string, resolve ResolverFunc) Deci
 	type hostMatch struct {
 		role Role
 		rule Rule
-		cidr *net.IPNet
 	}
 	var matches []hostMatch
 	for _, r := range roles {
 		for _, rule := range r.Allow {
 			if rule.matchesHost(host) {
 				matches = append(matches, hostMatch{role: r, rule: rule})
-			}
-		}
-	}
-	if len(matches) == 0 {
-		// No exact/wildcard rule matched host — consult CIDR rules, resolving
-		// only now (cheap-first).
-		var ips []net.IP
-		resolved := false
-		for _, r := range roles {
-			for _, rule := range r.Allow {
-				n, ok := rule.cidr()
-				if !ok {
-					continue
-				}
-				if !resolved {
-					ips = targetIPs(host, resolve)
-					resolved = true
-				}
-				if allIn(ips, n) {
-					matches = append(matches, hostMatch{role: r, rule: rule, cidr: n})
-				}
 			}
 		}
 	}
@@ -394,7 +273,6 @@ func (p Policy) DecideHost(pr Principal, host string, resolve ResolverFunc) Deci
 		TargetUser:      m.rule.TargetUser,
 		MatchedGroups:   intersectGroups(pr.Groups, m.role.Groups),
 		Port:            m.rule.Ports[0],
-		MatchedCIDR:     m.cidr,
 	}
 }
 

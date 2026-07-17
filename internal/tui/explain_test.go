@@ -37,7 +37,7 @@ func TestPolicyView_RoundTripPreservesDecisions(t *testing.T) {
 	}
 	for _, pr := range principals {
 		for _, tg := range targets {
-			if got, want := p2.Decide(pr, tg, nil), p.Decide(pr, tg, nil); !reflect.DeepEqual(got, want) {
+			if got, want := p2.Decide(pr, tg), p.Decide(pr, tg); !reflect.DeepEqual(got, want) {
 				t.Fatalf("decision drift for %v %v: view=%+v orig=%+v", pr, tg, got, want)
 			}
 		}

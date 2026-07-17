@@ -16,7 +16,6 @@ import (
 	"log"
 	"net"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/rupivbluegreen/omni-sag/internal/approval"
@@ -56,27 +55,6 @@ var netDial = func(ctx context.Context, network, addr string, control dialContro
 	return d.DialContext(ctx, network, addr)
 }
 
-// resolverTimeout bounds how long CIDR-rule hostname resolution may block a
-// policy decision. PeekHost runs synchronously in the SSH auth path (see
-// session.WithDialerPeek), so an unbounded DNS lookup there could stall a
-// login; this keeps the worst case small regardless of caller.
-const resolverTimeout = 3 * time.Second
-
-// defaultHostnameResolver is a policy.ResolverFunc backed by net.DefaultResolver.
-func defaultHostnameResolver(host string) ([]net.IP, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), resolverTimeout)
-	defer cancel()
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return nil, err
-	}
-	ips := make([]net.IP, len(addrs))
-	for i, a := range addrs {
-		ips[i] = a.IP
-	}
-	return ips, nil
-}
-
 // Dialer authorizes and opens target connections.
 type Dialer struct {
 	mu          sync.RWMutex // guards policy for hot-reload
@@ -91,11 +69,6 @@ type Dialer struct {
 	// strict production guard; an Option may relax it for test/dev harnesses.
 	dialControl dialControlFunc
 	debug       bool // opt-in: mirrors every emitted evidence event to stdout; see WithDebug
-	// resolver resolves hostname targets for CIDR-shaped policy rules (see
-	// policy.ResolverFunc). Defaults to a real, bounded-timeout DNS lookup;
-	// nil disables hostname resolution (CIDR rules still match IP-literal
-	// targets). See WithHostnameResolver / WithHostnameResolutionDisabled.
-	resolver policy.ResolverFunc
 }
 
 // SetPolicy atomically replaces the dialer's policy. A control-plane policy
@@ -136,20 +109,6 @@ func WithDebug(enabled bool) Option {
 	return func(d *Dialer) { d.debug = enabled }
 }
 
-// WithHostnameResolver overrides the resolver used to match CIDR policy
-// rules against hostname targets. Tests use this to inject a fake resolver;
-// production can use it to point at a non-default resolver.
-func WithHostnameResolver(fn policy.ResolverFunc) Option {
-	return func(d *Dialer) { d.resolver = fn }
-}
-
-// WithHostnameResolutionDisabled turns off hostname resolution for CIDR
-// policy rules — such rules then only ever match IP-literal targets. Wired
-// from config.PolicyConfig.DisableCIDRHostnameResolution.
-func WithHostnameResolutionDisabled() Option {
-	return func(d *Dialer) { d.resolver = nil }
-}
-
 // emit sends an evidence event, logging (never swallowing) any sink error,
 // and — when debug is enabled — also prints the event itself to stdout so a
 // live tail of decisions doesn't require reading evidence.jsonl.
@@ -170,7 +129,7 @@ func (d *Dialer) emit(e evidence.Event) {
 // provider is always installed (a fetcher-less default when none is supplied) so
 // deny/prompt/passthrough modes are enforced; only inject needs CyberArk.
 func New(p policy.Policy, sink evidence.Sink, opts ...Option) *Dialer {
-	d := &Dialer{policy: p, sink: sink, timeout: 10 * time.Second, dialControl: guardResolvedAddr, resolver: defaultHostnameResolver}
+	d := &Dialer{policy: p, sink: sink, timeout: 10 * time.Second, dialControl: guardResolvedAddr}
 	for _, opt := range opts {
 		opt(d)
 	}
@@ -217,7 +176,7 @@ func WithCyberArk(p CyberArkParams) (Option, error) {
 // Non-forwarding uses (e.g. an SFTP or interactive session layered on the
 // target) pass forwarding=false.
 func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP string, target policy.Target, forwarding bool) (net.Conn, error) {
-	decision := d.currentPolicy().Decide(pr, target, d.resolver)
+	decision := d.currentPolicy().Decide(pr, target)
 
 	forwardRefused := decision.Allow && forwarding && !decision.ForwardingAllowed()
 	effectiveAllow := decision.Allow && !forwardRefused
@@ -265,17 +224,7 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 
 	dialCtx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
-	control := d.dialControl
-	if decision.MatchedCIDR != nil {
-		base, n := d.dialControl, decision.MatchedCIDR
-		control = func(network, address string, c syscall.RawConn) error {
-			if err := base(network, address, c); err != nil {
-				return err
-			}
-			return guardWithinCIDR(network, address, n)
-		}
-	}
-	conn, err := netDial(dialCtx, "tcp", target.String(), control)
+	conn, err := netDial(dialCtx, "tcp", target.String(), d.dialControl)
 	if err != nil {
 		return nil, fmt.Errorf("dialer: dial %s: %w", target, err)
 	}
@@ -289,14 +238,14 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 // of any channel opening. The real authorization decision — the one that
 // actually gates a connection — is still made by DialTarget.
 func (d *Dialer) Peek(pr policy.Principal, target policy.Target) policy.Decision {
-	return d.currentPolicy().Decide(pr, target, d.resolver)
+	return d.currentPolicy().Decide(pr, target)
 }
 
 // PeekHost is Peek's host-only counterpart, used by the gateway's real-target
 // shell/SFTP flow — see policy.Policy.DecideHost's doc comment for why no
 // port is available at these call sites.
 func (d *Dialer) PeekHost(pr policy.Principal, host string) policy.Decision {
-	return d.currentPolicy().DecideHost(pr, host, d.resolver)
+	return d.currentPolicy().DecideHost(pr, host)
 }
 
 // gateApproval blocks the session until a four-eyes approval for this target is

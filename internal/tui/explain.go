@@ -47,7 +47,7 @@ type Explanation struct {
 func Explain(pv api.PolicyView, user string, groups []string, host string, port int) Explanation {
 	p := PolicyFromView(pv)
 	pr := policy.Principal{User: user, Groups: groups}
-	d := p.Decide(pr, policy.Target{Host: host, Port: port}, nil)
+	d := p.Decide(pr, policy.Target{Host: host, Port: port})
 
 	// A policy Allow with credential mode "deny" is unconditionally refused by
 	// the dialer (credential.Resolve -> ErrDenied) before any socket opens, so
