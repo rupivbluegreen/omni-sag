@@ -22,7 +22,7 @@ jobs:
       - name: Cross-build every command
         run: |
           set -euo pipefail
-          for pair in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+          for pair in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
             GOOS="${pair%/*}" GOARCH="${pair#*/}" make binaries
           done
           cd bin && sha256sum * > SHA256SUMS

@@ -8,6 +8,10 @@ BINARIES := omni-sag omnisag-ctl omni-verify omnisag-operator
 GOOS   ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+EXT :=
+ifeq ($(GOOS),windows)
+EXT := .exe
+endif
 
 binaries:
 	@mkdir -p bin
@@ -15,7 +19,7 @@ binaries:
 	  echo "building $$b ($(GOOS)/$(GOARCH), $(VERSION))"; \
 	  CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) \
 	    go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" \
-	    -o bin/$${b}_$(GOOS)_$(GOARCH) ./cmd/$$b || exit 1; \
+	    -o bin/$${b}_$(GOOS)_$(GOARCH)$(EXT) ./cmd/$$b || exit 1; \
 	done
 
 test:
