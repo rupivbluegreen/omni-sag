@@ -176,7 +176,7 @@ func WithCyberArk(p CyberArkParams) (Option, error) {
 // Non-forwarding uses (e.g. an SFTP or interactive session layered on the
 // target) pass forwarding=false.
 func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP string, target policy.Target, forwarding bool) (net.Conn, error) {
-	decision := d.currentPolicy().Decide(pr, target)
+	decision := d.currentPolicy().Decide(pr, target, nil)
 
 	forwardRefused := decision.Allow && forwarding && !decision.ForwardingAllowed()
 	effectiveAllow := decision.Allow && !forwardRefused
@@ -238,14 +238,14 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 // of any channel opening. The real authorization decision — the one that
 // actually gates a connection — is still made by DialTarget.
 func (d *Dialer) Peek(pr policy.Principal, target policy.Target) policy.Decision {
-	return d.currentPolicy().Decide(pr, target)
+	return d.currentPolicy().Decide(pr, target, nil)
 }
 
 // PeekHost is Peek's host-only counterpart, used by the gateway's real-target
 // shell/SFTP flow — see policy.Policy.DecideHost's doc comment for why no
 // port is available at these call sites.
 func (d *Dialer) PeekHost(pr policy.Principal, host string) policy.Decision {
-	return d.currentPolicy().DecideHost(pr, host)
+	return d.currentPolicy().DecideHost(pr, host, nil)
 }
 
 // gateApproval blocks the session until a four-eyes approval for this target is

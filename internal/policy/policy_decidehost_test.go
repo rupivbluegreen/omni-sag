@@ -12,7 +12,7 @@ func TestDecideHost_SingleUnambiguousRule(t *testing.T) {
 	}}}
 	pr := Principal{User: "alice", Groups: []string{"dba"}}
 
-	d := p.DecideHost(pr, "db1.lab.local")
+	d := p.DecideHost(pr, "db1.lab.local", nil)
 	if !d.Allow {
 		t.Fatalf("unambiguous single-rule/single-port host must be allowed, got deny: %s", d.Reason)
 	}
@@ -37,7 +37,7 @@ func TestDecideHost_NoRoleForHost(t *testing.T) {
 	}}}
 	pr := Principal{User: "bob", Groups: []string{"domain users"}}
 
-	d := p.DecideHost(pr, "db1.lab.local")
+	d := p.DecideHost(pr, "db1.lab.local", nil)
 	if d.Allow {
 		t.Fatal("principal without the granting role must be denied")
 	}
@@ -60,7 +60,7 @@ func TestDecideHost_EmptyPortsFailsClosed_NotPort22Fallback(t *testing.T) {
 	}}}
 	pr := Principal{User: "alice", Groups: []string{"dba"}}
 
-	d := p.DecideHost(pr, "db1.lab.local")
+	d := p.DecideHost(pr, "db1.lab.local", nil)
 	if d.Allow {
 		t.Fatalf("a rule with no configured port must fail closed for the real-target flow, got allow (port=%d): %s", d.Port, d.Reason)
 	}
@@ -82,7 +82,7 @@ func TestDecideHost_MultiplePortsOnOneRuleFailsClosed(t *testing.T) {
 	}}}
 	pr := Principal{User: "alice", Groups: []string{"dba"}}
 
-	d := p.DecideHost(pr, "db1.lab.local")
+	d := p.DecideHost(pr, "db1.lab.local", nil)
 	if d.Allow {
 		t.Fatalf("a rule with 2+ configured ports must fail closed for the real-target flow, got allow (port=%d)", d.Port)
 	}
@@ -113,7 +113,7 @@ func TestDecideHost_TwoRulesSameHostDifferentPortsFailsClosed(t *testing.T) {
 	}}}
 	pr := Principal{User: "alice", Groups: []string{"dba"}}
 
-	d := p.DecideHost(pr, "db1.lab.local")
+	d := p.DecideHost(pr, "db1.lab.local", nil)
 	if d.Allow {
 		t.Fatalf("two rules matching the same host must fail closed, not silently pick one (got CredentialMode=%q RequireApproval=%v Port=%d)",
 			d.CredentialMode, d.RequireApproval, d.Port)
@@ -142,7 +142,7 @@ func TestDecideHost_TwoRulesAcrossDifferentRolesFailsClosed(t *testing.T) {
 	}}
 	pr := Principal{User: "alice", Groups: []string{"tunnel", "admins"}}
 
-	d := p.DecideHost(pr, "db1.lab.local")
+	d := p.DecideHost(pr, "db1.lab.local", nil)
 	if d.Allow {
 		t.Fatalf("rules from two different held roles matching the same host must still fail closed, got allow: %+v", d)
 	}
@@ -162,7 +162,7 @@ func TestDecideHost_DifferentHostsRemainUnambiguous(t *testing.T) {
 	}}}
 	pr := Principal{User: "alice", Groups: []string{"dba"}}
 
-	d := p.DecideHost(pr, "127.0.0.1")
+	d := p.DecideHost(pr, "127.0.0.1", nil)
 	if !d.Allow || d.Port != 2200 || d.TargetUser != "svc_db1" {
 		t.Fatalf("distinct-host rule must resolve unambiguously, got %+v", d)
 	}
