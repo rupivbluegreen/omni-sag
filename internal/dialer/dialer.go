@@ -16,6 +16,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rupivbluegreen/omni-sag/internal/approval"
@@ -264,7 +265,17 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 
 	dialCtx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
-	conn, err := netDial(dialCtx, "tcp", target.String(), d.dialControl)
+	control := d.dialControl
+	if decision.MatchedCIDR != nil {
+		base, n := d.dialControl, decision.MatchedCIDR
+		control = func(network, address string, c syscall.RawConn) error {
+			if err := base(network, address, c); err != nil {
+				return err
+			}
+			return guardWithinCIDR(network, address, n)
+		}
+	}
+	conn, err := netDial(dialCtx, "tcp", target.String(), control)
 	if err != nil {
 		return nil, fmt.Errorf("dialer: dial %s: %w", target, err)
 	}
