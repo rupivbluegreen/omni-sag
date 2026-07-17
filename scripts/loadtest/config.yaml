@@ -1,0 +1,36 @@
+# Gateway config for scripts/loadtest. Points at the docker-compose dev lab's
+# samba-AD (make lab-up && make lab-seed) and a synthetic echo target that
+# scripts/loadtest/main.go starts itself. The target MUST be a non-loopback
+# address — the dialer's SSRF guard always blocks 127.0.0.0/8 (reaches the
+# bastion itself), even in dev, with no config override; private ranges
+# (RFC1918, e.g. a docker bridge IP) are allowed. Find a usable local address
+# with `ip -4 addr show | grep inet` (pick one that isn't 127.0.0.1, e.g. the
+# docker0 bridge). Change the target/port here AND the -target flag together
+# if you need a different one.
+#
+# Deliberately minimal: no MFA, inspection, approval, or recording, so the
+# measurement isolates the tunnel path itself (auth -> policy -> dialer)
+# rather than mixing in unrelated subsystems.
+listen: ":2222"
+host_key: "hostkey.pem"
+
+ldap:
+  url: "ldaps://127.0.0.1:636"
+  base_dn: "DC=lab,DC=local"
+  bind_dn: "CN=Administrator,CN=Users,DC=lab,DC=local"
+  bind_password: "LabAdminPass123!"
+  user_filter: "(sAMAccountName=%s)"
+  insecure_tls: true
+
+evidence:
+  file: "loadtest-evidence.jsonl"
+
+policy:
+  roles:
+    - name: loadtest
+      groups: ["dba"]
+      allow:
+        - host: "172.17.0.1"
+          ports: [17001]
+          record: none
+          credential: passthrough
