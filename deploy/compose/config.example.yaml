@@ -212,3 +212,11 @@ policy:
           target_user: "svc_db1"
           record: full
           credential: prompt
+        # CIDR rule example: grant access to an entire subnet via CIDR notation
+        # (e.g. all databases in the 10.0.0.0/8 range). Matching works the same
+        # as exact hostnames but applies to IP ranges; hostname targets are
+        # resolved and must fall entirely within the CIDR range to match.
+        - host: "10.0.0.0/8"
+          ports: [5432]
+          record: metadata-only
+          credential: prompt
