@@ -1,6 +1,10 @@
 package policy
 
-import "testing"
+import (
+	"fmt"
+	"net"
+	"testing"
+)
 
 // demoPolicy mirrors the Slice 1 demo: a "dba" role granting the DB host, keyed
 // off the "dba" AD group.
@@ -16,7 +20,7 @@ func demoPolicy() Policy {
 
 func TestDecide_DBAAllowed(t *testing.T) {
 	pr := Principal{User: "alice", Groups: []string{"dba", "domain users"}}
-	d := demoPolicy().Decide(pr, Target{Host: "db1.lab.local", Port: 5432})
+	d := demoPolicy().Decide(pr, Target{Host: "db1.lab.local", Port: 5432}, nil)
 	if !d.Allow {
 		t.Fatalf("dba should be allowed, got deny: %s", d.Reason)
 	}
@@ -27,7 +31,7 @@ func TestDecide_DBAAllowed(t *testing.T) {
 
 func TestDecide_NonDBADenied(t *testing.T) {
 	pr := Principal{User: "bob", Groups: []string{"domain users"}}
-	d := demoPolicy().Decide(pr, Target{Host: "db1.lab.local", Port: 5432})
+	d := demoPolicy().Decide(pr, Target{Host: "db1.lab.local", Port: 5432}, nil)
 	if d.Allow {
 		t.Fatal("non-dba must be denied")
 	}
@@ -35,7 +39,7 @@ func TestDecide_NonDBADenied(t *testing.T) {
 
 func TestDecide_DefaultDeny_NoRoles(t *testing.T) {
 	pr := Principal{User: "nobody", Groups: nil}
-	d := demoPolicy().Decide(pr, Target{Host: "db1.lab.local", Port: 5432})
+	d := demoPolicy().Decide(pr, Target{Host: "db1.lab.local", Port: 5432}, nil)
 	if d.Allow {
 		t.Fatal("principal with no groups must be denied")
 	}
@@ -44,18 +48,18 @@ func TestDecide_DefaultDeny_NoRoles(t *testing.T) {
 func TestDecide_RoleButWrongTarget(t *testing.T) {
 	pr := Principal{User: "alice", Groups: []string{"dba"}}
 	// right host, wrong port
-	if d := demoPolicy().Decide(pr, Target{Host: "db1.lab.local", Port: 22}); d.Allow {
+	if d := demoPolicy().Decide(pr, Target{Host: "db1.lab.local", Port: 22}, nil); d.Allow {
 		t.Fatal("wrong port must be denied")
 	}
 	// wrong host, right port
-	if d := demoPolicy().Decide(pr, Target{Host: "evil.lab.local", Port: 5432}); d.Allow {
+	if d := demoPolicy().Decide(pr, Target{Host: "evil.lab.local", Port: 5432}, nil); d.Allow {
 		t.Fatal("wrong host must be denied")
 	}
 }
 
 func TestDecide_GroupMatchCaseInsensitive(t *testing.T) {
 	pr := Principal{User: "alice", Groups: []string{"DBA"}}
-	if d := demoPolicy().Decide(pr, Target{Host: "db1.lab.local", Port: 5432}); !d.Allow {
+	if d := demoPolicy().Decide(pr, Target{Host: "db1.lab.local", Port: 5432}, nil); !d.Allow {
 		t.Fatalf("group match must be case-insensitive, got: %s", d.Reason)
 	}
 }
@@ -67,7 +71,7 @@ func TestRule_WildcardHostAnyPort(t *testing.T) {
 		Allow:  []Rule{{Host: "*"}}, // any host, any port
 	}}}
 	pr := Principal{User: "root", Groups: []string{"admins"}}
-	if d := p.Decide(pr, Target{Host: "anything.lab.local", Port: 9999}); !d.Allow {
+	if d := p.Decide(pr, Target{Host: "anything.lab.local", Port: 9999}, nil); !d.Allow {
 		t.Fatalf("wildcard host/any-port must allow, got: %s", d.Reason)
 	}
 }
@@ -83,15 +87,15 @@ func TestDecide_RecordModeAndForwarding(t *testing.T) {
 	}}}
 	pr := Principal{User: "alice", Groups: []string{"dba"}}
 
-	full := p.Decide(pr, Target{Host: "full.lab", Port: 22})
+	full := p.Decide(pr, Target{Host: "full.lab", Port: 22}, nil)
 	if full.RecordMode != RecordFull || full.ForwardingAllowed() {
 		t.Fatalf("full target must forbid forwarding: %+v", full)
 	}
-	meta := p.Decide(pr, Target{Host: "meta.lab", Port: 22})
+	meta := p.Decide(pr, Target{Host: "meta.lab", Port: 22}, nil)
 	if meta.RecordMode != RecordMetadataOnly || !meta.ForwardingAllowed() {
 		t.Fatalf("metadata-only must allow forwarding: %+v", meta)
 	}
-	plain := p.Decide(pr, Target{Host: "plain.lab", Port: 22})
+	plain := p.Decide(pr, Target{Host: "plain.lab", Port: 22}, nil)
 	if plain.RecordMode != RecordNone || !plain.ForwardingAllowed() {
 		t.Fatalf("unset record must be none + forwarding allowed: %+v", plain)
 	}
@@ -115,7 +119,7 @@ func TestDecide_CarriesTargetUser(t *testing.T) {
 		Groups: []string{"dba"},
 		Allow:  []Rule{{Host: "db1.lab.local", TargetUser: "svc_db1"}},
 	}}}
-	d := p.Decide(Principal{User: "alice", Groups: []string{"dba"}}, Target{Host: "db1.lab.local", Port: 22})
+	d := p.Decide(Principal{User: "alice", Groups: []string{"dba"}}, Target{Host: "db1.lab.local", Port: 22}, nil)
 	if !d.Allow || d.TargetUser != "svc_db1" {
 		t.Fatalf("got Allow=%v TargetUser=%q, want Allow=true TargetUser=svc_db1", d.Allow, d.TargetUser)
 	}
@@ -126,8 +130,120 @@ func TestDecide_TargetUserEmptyWhenUnset(t *testing.T) {
 		Name: "dba", Groups: []string{"dba"},
 		Allow: []Rule{{Host: "db1.lab.local"}},
 	}}}
-	d := p.Decide(Principal{User: "alice", Groups: []string{"dba"}}, Target{Host: "db1.lab.local", Port: 22})
+	d := p.Decide(Principal{User: "alice", Groups: []string{"dba"}}, Target{Host: "db1.lab.local", Port: 22}, nil)
 	if d.TargetUser != "" {
 		t.Fatalf("got TargetUser=%q, want empty (caller defaults to login user)", d.TargetUser)
+	}
+}
+
+func TestDecide_CIDRRuleMatchesLiteralIPInRange(t *testing.T) {
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []Rule{{Host: "10.0.0.0/8", Ports: []int{5432}}},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	d := p.Decide(pr, Target{Host: "10.5.6.7", Port: 5432}, nil)
+	if !d.Allow {
+		t.Fatalf("literal IP inside the CIDR must be allowed even with a nil resolver, got deny: %s", d.Reason)
+	}
+	if d.MatchedCIDR == nil || d.MatchedCIDR.String() != "10.0.0.0/8" {
+		t.Fatalf("MatchedCIDR = %v, want 10.0.0.0/8", d.MatchedCIDR)
+	}
+}
+
+func TestDecide_CIDRRuleDeniesLiteralIPOutOfRange(t *testing.T) {
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []Rule{{Host: "10.0.0.0/8", Ports: []int{5432}}},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	d := p.Decide(pr, Target{Host: "192.168.1.1", Port: 5432}, nil)
+	if d.Allow {
+		t.Fatal("literal IP outside the CIDR must be denied")
+	}
+}
+
+func TestDecide_CIDRRuleStillEnforcesPort(t *testing.T) {
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []Rule{{Host: "10.0.0.0/8", Ports: []int{5432}}},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	d := p.Decide(pr, Target{Host: "10.5.6.7", Port: 22}, nil)
+	if d.Allow {
+		t.Fatal("a CIDR rule with an explicit ports list must still enforce the port")
+	}
+}
+
+func TestDecide_CIDRRuleMatchesResolvedHostname(t *testing.T) {
+	resolve := func(host string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("10.1.2.3")}, nil
+	}
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []Rule{{Host: "10.0.0.0/8", Ports: []int{5432}}},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	d := p.Decide(pr, Target{Host: "db.internal.corp", Port: 5432}, resolve)
+	if !d.Allow {
+		t.Fatalf("hostname resolving inside the CIDR must be allowed, got deny: %s", d.Reason)
+	}
+	if d.MatchedCIDR == nil || d.MatchedCIDR.String() != "10.0.0.0/8" {
+		t.Fatalf("MatchedCIDR = %v, want 10.0.0.0/8", d.MatchedCIDR)
+	}
+}
+
+func TestDecide_CIDRNotConsultedWhenExactRuleMatches(t *testing.T) {
+	called := false
+	spy := func(host string) ([]net.IP, error) {
+		called = true
+		return nil, nil
+	}
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow: []Rule{
+			{Host: "db1.lab.local", Ports: []int{5432}},
+			{Host: "10.0.0.0/8", Ports: []int{5432}},
+		},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	d := p.Decide(pr, Target{Host: "db1.lab.local", Port: 5432}, spy)
+	if !d.Allow {
+		t.Fatalf("exact rule should allow, got deny: %s", d.Reason)
+	}
+	if called {
+		t.Fatal("resolver must not be called when an exact/wildcard rule already matched (cheap-first ordering)")
+	}
+}
+
+func TestDecide_CIDRHostnameDeniedWithNilResolver(t *testing.T) {
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []Rule{{Host: "10.0.0.0/8", Ports: []int{5432}}},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	d := p.Decide(pr, Target{Host: "db.internal.corp", Port: 5432}, nil)
+	if d.Allow {
+		t.Fatal("a hostname target against a CIDR rule with a nil resolver must be denied, not allowed")
+	}
+}
+
+func TestDecide_CIDRHostnameDeniedOnResolverError(t *testing.T) {
+	resolve := func(host string) ([]net.IP, error) { return nil, fmt.Errorf("dns down") }
+	p := Policy{Roles: []Role{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []Rule{{Host: "10.0.0.0/8", Ports: []int{5432}}},
+	}}}
+	pr := Principal{User: "alice", Groups: []string{"dba"}}
+	d := p.Decide(pr, Target{Host: "db.internal.corp", Port: 5432}, resolve)
+	if d.Allow {
+		t.Fatal("a resolver error must fail closed (deny), not allow")
 	}
 }

@@ -118,3 +118,29 @@ func blockedIP(ip net.IP) (bool, string) {
 		return false, ""
 	}
 }
+
+// guardWithinCIDR re-validates a connect-time address against the CIDR range
+// a policy decision matched at decision time. Policy resolves a hostname
+// once, when Decide/DecideHost runs; the actual connection resolves the same
+// hostname again, independently, moments later inside netDial's Control
+// callback. Between those two resolutions a low-TTL DNS record can rebind to
+// a different address — this closes that gap by checking the exact address
+// about to be dialed, the same way guardResolvedAddr does for the static
+// SSRF blocklist. Composed with (not a replacement for) guardResolvedAddr.
+func guardWithinCIDR(network, address string, n *net.IPNet) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("%w: %s %q resolved to an unparseable address", ErrBlockedAddress, network, address)
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	if !n.Contains(ip) {
+		return fmt.Errorf("%w: %s -> %s (outside matched CIDR %s — possible DNS rebind)", ErrBlockedAddress, address, ip, n)
+	}
+	return nil
+}
