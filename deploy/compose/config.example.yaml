@@ -214,3 +214,22 @@ policy:
           ports: [5432]
           record: metadata-only
           credential: prompt
+    # Multi-CIDR example: infrastructure team can SSH to any host in three
+    # regional networks (corp VPC, staging VPC, backup network). Multiple CIDR
+    # rules are evaluated independently; a hostname must resolve entirely within
+    # a single CIDR rule to match (partial or split matches are denied).
+    - name: infrastructure
+      groups: ["ops"]
+      allow:
+        - host: "10.0.0.0/8"       # entire corp network
+          ports: [22]
+          record: metadata-only
+          credential: prompt
+        - host: "172.16.0.0/12"     # staging VPC
+          ports: [22]
+          record: metadata-only
+          credential: prompt
+        - host: "192.168.0.0/16"    # backup network
+          ports: [22]
+          record: metadata-only
+          credential: prompt
