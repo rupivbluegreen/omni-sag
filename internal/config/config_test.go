@@ -56,12 +56,12 @@ func TestLoadAndCompile(t *testing.T) {
 	p := f.CompilePolicy()
 	// compiled policy must produce the same decisions as the demo
 	allow := p.Decide(policy.Principal{User: "alice", Groups: []string{"dba"}},
-		policy.Target{Host: "db1.lab.local", Port: 5432})
+		policy.Target{Host: "db1.lab.local", Port: 5432}, nil)
 	if !allow.Allow {
 		t.Fatalf("dba should be allowed: %s", allow.Reason)
 	}
 	deny := p.Decide(policy.Principal{User: "bob", Groups: []string{"users"}},
-		policy.Target{Host: "db1.lab.local", Port: 5432})
+		policy.Target{Host: "db1.lab.local", Port: 5432}, nil)
 	if deny.Allow {
 		t.Fatal("non-dba should be denied")
 	}
@@ -293,7 +293,7 @@ policy:
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := f.CompilePolicy().Decide(policy.Principal{User: "a", Groups: []string{"dba"}}, policy.Target{Host: "full.lab", Port: 22})
+	d := f.CompilePolicy().Decide(policy.Principal{User: "a", Groups: []string{"dba"}}, policy.Target{Host: "full.lab", Port: 22}, nil)
 	if d.RecordMode != policy.RecordFull || d.ForwardingAllowed() {
 		t.Fatalf("compiled full record mode not applied: %+v", d)
 	}
@@ -425,5 +425,46 @@ func TestApprovalConfig_ReleaseTTL_Configured(t *testing.T) {
 	a := &ApprovalConfig{ReleaseTTLSeconds: 3600}
 	if got := a.ReleaseTTL(); got != 3600 {
 		t.Fatalf("ReleaseTTL() = %d, want 3600", got)
+	}
+}
+
+func TestValidatePolicyRoles_MalformedCIDRRejected(t *testing.T) {
+	roles := []RoleConfig{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []RuleConfig{{Host: "10.0.0.0/abc"}},
+	}}
+	if err := validatePolicyRoles(roles); err == nil {
+		t.Fatal("a Host containing \"/\" that fails net.ParseCIDR must be rejected at config load, not silently treated as a literal hostname")
+	}
+}
+
+func TestValidatePolicyRoles_ValidCIDRAccepted(t *testing.T) {
+	roles := []RoleConfig{{
+		Name:   "dba",
+		Groups: []string{"dba"},
+		Allow:  []RuleConfig{{Host: "10.0.0.0/8"}},
+	}}
+	if err := validatePolicyRoles(roles); err != nil {
+		t.Fatalf("a valid CIDR host must be accepted, got %v", err)
+	}
+}
+
+func TestPolicyConfig_DisableCIDRHostnameResolutionDefaultsFalse(t *testing.T) {
+	f, err := Load(writeTemp(t, demoYAML))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if f.Policy.DisableCIDRHostnameResolution {
+		t.Fatal("disable_cidr_hostname_resolution must default to false (resolution enabled) when omitted from YAML")
+	}
+}
+
+func TestLoad_ComposeExampleConfigParses(t *testing.T) {
+	// Regression check: the shipped deploy/compose/config.example.yaml must
+	// always be loadable.
+	_, err := Load("../../deploy/compose/config.example.yaml")
+	if err != nil {
+		t.Fatalf("deploy/compose/config.example.yaml failed to load: %v", err)
 	}
 }

@@ -6,6 +6,7 @@ package tui
 
 import (
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/rupivbluegreen/omni-sag/internal/api"
@@ -47,7 +48,7 @@ type Explanation struct {
 func Explain(pv api.PolicyView, user string, groups []string, host string, port int) Explanation {
 	p := PolicyFromView(pv)
 	pr := policy.Principal{User: user, Groups: groups}
-	d := p.Decide(pr, policy.Target{Host: host, Port: port})
+	d := p.Decide(pr, policy.Target{Host: host, Port: port}, nil)
 
 	// A policy Allow with credential mode "deny" is unconditionally refused by
 	// the dialer (credential.Resolve -> ErrDenied) before any socket opens, so
@@ -77,8 +78,44 @@ func Explain(pv api.PolicyView, user string, groups []string, host string, port 
 		} else {
 			lines = append(lines, "  roles held: none (no group grants a role)")
 		}
+		if n := unevaluatedCIDRRules(p, pr, host); n > 0 {
+			lines = append(lines, fmt.Sprintf("  NOTE: %d CIDR rule(s) held could grant this if %q resolves inside their range — Explain checks offline and does not resolve hostnames, so this deny is not conclusive", n, host))
+		}
 	}
 	return Explanation{Decision: d, Reachable: reachable, Lines: lines}
+}
+
+// unevaluatedCIDRRules counts CIDR-shaped rules pr holds, when host is not
+// already a literal IP (which Explain's nil-resolver Decide call already
+// evaluates fully offline). A non-zero count on a deny means the answer is
+// incomplete, not a confirmed no — see Explain's DENY branch.
+func unevaluatedCIDRRules(p policy.Policy, pr policy.Principal, host string) int {
+	if net.ParseIP(host) != nil {
+		return 0
+	}
+	have := make(map[string]bool, len(pr.Groups))
+	for _, g := range pr.Groups {
+		have[strings.ToLower(g)] = true
+	}
+	n := 0
+	for _, r := range p.Roles {
+		held := false
+		for _, g := range r.Groups {
+			if have[strings.ToLower(g)] {
+				held = true
+				break
+			}
+		}
+		if !held {
+			continue
+		}
+		for _, rule := range r.Allow {
+			if rule.Host != "*" && strings.Contains(rule.Host, "/") {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 func orNone(s string) string {

@@ -151,7 +151,7 @@ func TestProp_DecideMatchesSpec(t *testing.T) {
 		pr := genPrincipal(t)
 		tgt := genTarget(t)
 
-		d := p.Decide(pr, tgt)
+		d := p.Decide(pr, tgt, nil)
 		role, rule, want := refFirstMatch(p, pr, tgt)
 
 		// default-deny + allow-implies-match: Allow iff a held role has a
@@ -216,8 +216,8 @@ func TestProp_Deterministic(t *testing.T) {
 		p := genPolicy(t)
 		pr := genPrincipal(t)
 		tgt := genTarget(t)
-		d1 := p.Decide(pr, tgt)
-		d2 := p.Decide(pr, tgt)
+		d1 := p.Decide(pr, tgt, nil)
+		d2 := p.Decide(pr, tgt, nil)
 		if !reflect.DeepEqual(d1, d2) {
 			t.Fatalf("Decide not deterministic:\n%+v\n%+v", d1, d2)
 		}
@@ -232,7 +232,7 @@ func TestProp_GroupCaseInsensitive(t *testing.T) {
 		pr := genPrincipal(t)
 		tgt := genTarget(t)
 
-		base := p.Decide(pr, tgt)
+		base := p.Decide(pr, tgt, nil)
 
 		// Flip case of all group strings (principal + roles), preserving host
 		// casing and everything else.
@@ -241,7 +241,7 @@ func TestProp_GroupCaseInsensitive(t *testing.T) {
 		for i, r := range p.Roles {
 			rolesU[i] = Role{Name: r.Name, Groups: upperAll(r.Groups), Allow: r.Allow}
 		}
-		flipped := Policy{Roles: rolesU}.Decide(prU, tgt)
+		flipped := Policy{Roles: rolesU}.Decide(prU, tgt, nil)
 
 		if base.Allow != flipped.Allow || base.MatchedRole != flipped.MatchedRole {
 			t.Fatalf("group casing changed decision: base=%+v flipped=%+v", base, flipped)
@@ -269,7 +269,7 @@ func TestProp_WildcardHostAnyPort(t *testing.T) {
 		}}}
 		pr := Principal{User: "x", Groups: []string{randCase(t, grp, "prGroupCase")}}
 		tgt := genTarget(t)
-		d := p.Decide(pr, tgt)
+		d := p.Decide(pr, tgt, nil)
 		if !d.Allow {
 			t.Fatalf("wildcard host/any-port must allow target %s, got deny: %s", tgt, d.Reason)
 		}
@@ -290,8 +290,8 @@ func TestProp_EmptyPortsMatchesAnyPort(t *testing.T) {
 		pr := Principal{User: "x", Groups: []string{grp}}
 		p1 := rapid.SampledFrom(portPool).Draw(t, "p1")
 		p2 := rapid.SampledFrom(portPool).Draw(t, "p2")
-		d1 := p.Decide(pr, Target{Host: host, Port: p1})
-		d2 := p.Decide(pr, Target{Host: host, Port: p2})
+		d1 := p.Decide(pr, Target{Host: host, Port: p1}, nil)
+		d2 := p.Decide(pr, Target{Host: host, Port: p2}, nil)
 		if !d1.Allow || !d2.Allow {
 			t.Fatalf("empty ports must match any port: p1=%v p2=%v", d1.Allow, d2.Allow)
 		}
@@ -320,7 +320,7 @@ func TestProp_ExplicitPortsMatchExactly(t *testing.T) {
 				want = true
 			}
 		}
-		d := p.Decide(pr, Target{Host: host, Port: port})
+		d := p.Decide(pr, Target{Host: host, Port: port}, nil)
 		if d.Allow != want {
 			t.Fatalf("port %d in %v: Allow=%v want %v", port, ports, d.Allow, want)
 		}

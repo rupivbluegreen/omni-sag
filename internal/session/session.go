@@ -1,10 +1,10 @@
 // Package session implements the SSH server, channels, and SFTP subsystem.
 //
-// Slice 1 supports exactly one thing end-to-end: port forwarding (ssh -L),
-// which the client realizes as "direct-tcpip" channels. Each such channel is
-// authorized through internal/dialer (the single outbound path) before any
-// target socket is opened. Interactive shells, SFTP, and recording arrive in
-// later slices; here every other channel type is rejected.
+// Two channel types are accepted: "session" (interactive shell, SFTP
+// subsystem) and "direct-tcpip" (port forwarding — ssh -L/-D/-J all realize
+// as this channel type). Each direct-tcpip channel is authorized through
+// internal/dialer (the single outbound path) before any target socket is
+// opened. Every other channel type is rejected.
 package session
 
 import (
