@@ -7,9 +7,11 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/rupivbluegreen/omni-sag/internal/approval"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 )
@@ -341,5 +343,84 @@ func TestRunSCP_RecursiveFlagRefused(t *testing.T) {
 	// rejects -r, not because scp is off.
 	if err := sess.Start("scp -r -t /dir"); err == nil {
 		t.Fatal("Start = nil, want error: -r must be refused")
+	}
+}
+
+func TestRunSCP_CleanUploadQuarantinedAndReleasedNotPushed(t *testing.T) {
+	sink := evidence.NewMemSink()
+	addr, targetHost, q, store, releases := startInspectingServer(t, sink)
+
+	client := sshClient(t, addr, "alice%"+targetHost)
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	uploadErr := make(chan error, 1)
+	go func() {
+		uploadErr <- scpExecUpload(t, sess, "scp -t /clean.txt", []byte("totally benign content"), "clean.txt")
+	}()
+	approveRelease(t, store, "bob")
+	if err := <-uploadErr; err != nil {
+		t.Fatalf("clean upload must succeed once released, got %v", err)
+	}
+	if err := sess.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	sess.Close()
+
+	if list := releases.ListFor("alice", time.Now()); len(list) != 1 {
+		t.Fatalf("releases.ListFor(alice) = %v, want exactly one release", list)
+	}
+	if q.count() != 1 {
+		t.Fatalf("quarantine object count = %d, want 1", q.count())
+	}
+
+	// Never pushed to the target: reading it back via a fresh scp -f must
+	// fail (the file was never written there).
+	getSess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession (verify): %v", err)
+	}
+	defer getSess.Close()
+	stdout, err := getSess.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe (verify): %v", err)
+	}
+	stdin, err := getSess.StdinPipe()
+	if err != nil {
+		t.Fatalf("StdinPipe (verify): %v", err)
+	}
+	if err := getSess.Start("scp -f /clean.txt"); err != nil {
+		t.Fatalf("Start (verify): %v", err)
+	}
+	r := bufio.NewReader(stdout)
+	if _, err := scpReadControlLine(r, stdin); err == nil {
+		t.Fatal("scp -f /clean.txt succeeded — upload must never reach the target")
+	}
+}
+
+func TestRunSCP_BlockedUploadRefusedNeverReleased(t *testing.T) {
+	sink := evidence.NewMemSink()
+	addr, targetHost, q, store, _ := startInspectingServer(t, sink)
+
+	client := sshClient(t, addr, "alice%"+targetHost)
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+	err = scpExecUpload(t, sess, "scp -t /virus.txt", []byte("prefix X5O!P%@AP EICAR test string"), "virus.txt")
+	if err == nil {
+		t.Fatal("scpExecUpload = nil error, want refusal for EICAR content")
+	}
+
+	if q.count() != 1 {
+		t.Fatalf("quarantine object count = %d, want 1 (blocked content is still quarantined for evidence)", q.count())
+	}
+	for _, r := range store.List() {
+		if r.Kind == approval.KindQuarantineRelease {
+			t.Fatalf("blocked upload must never create a release request, found: %+v", r)
+		}
 	}
 }
