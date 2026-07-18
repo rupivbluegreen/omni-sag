@@ -196,7 +196,7 @@ func (s *Server) runSCP(ctx, connCtx context.Context, channel ssh.Channel, pr po
 	})
 	defer channel.Close()
 
-	ok := s.runSCPTransfer(ctx, connCtx, channel, pr, srcIP, sconn, tch, dir, remotePath)
+	ok, detail := s.runSCPTransfer(ctx, connCtx, channel, pr, srcIP, sconn, tch, dir, remotePath)
 
 	status := uint32(0)
 	if !ok {
@@ -205,7 +205,7 @@ func (s *Server) runSCP(ctx, connCtx context.Context, channel ssh.Channel, pr po
 	_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(&exitStatusMsg{Status: status}))
 	s.emit(evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
-		User: pr.User, SourceIP: srcIP,
+		User: pr.User, SourceIP: srcIP, Detail: detail,
 	})
 }
 
@@ -213,14 +213,10 @@ func (s *Server) runSCP(ctx, connCtx context.Context, channel ssh.Channel, pr po
 // scpDownload, mirroring runSFTP's target-resolution shape (sftp.go:52-101)
 // exactly — same dialerPeek/Allow re-check, same targetPort fallback, same
 // targetConnCache reuse across shell/sftp/scp channels on one connection.
-func (s *Server) runSCPTransfer(ctx, connCtx context.Context, channel ssh.Channel, pr policy.Principal, srcIP string, sconn ssh.Conn, tch *targetConnCache, dir scpDirection, remotePath string) bool {
+func (s *Server) runSCPTransfer(ctx, connCtx context.Context, channel ssh.Channel, pr policy.Principal, srcIP string, sconn ssh.Conn, tch *targetConnCache, dir scpDirection, remotePath string) (bool, string) {
 	if pr.TargetHost == "" {
 		_ = scpSendFatal(channel, "scp: no target selected")
-		s.emit(evidence.Event{
-			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
-			User: pr.User, SourceIP: srcIP, Detail: "scp refused: no target selected",
-		})
-		return false
+		return false, "scp refused: no target selected"
 	}
 	decision := policy.Decision{}
 	if s.dialerPeek != nil {
@@ -232,11 +228,7 @@ func (s *Server) runSCPTransfer(ctx, connCtx context.Context, channel ssh.Channe
 			reason = "no policy decision available for this target"
 		}
 		_ = scpSendFatal(channel, "scp: "+reason)
-		s.emit(evidence.Event{
-			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
-			User: pr.User, SourceIP: srcIP, Detail: "scp refused: " + reason,
-		})
-		return false
+		return false, "scp refused: " + reason
 	}
 	targetPort := decision.Port
 	if targetPort <= 0 {
@@ -247,20 +239,12 @@ func (s *Server) runSCPTransfer(ctx, connCtx context.Context, channel ssh.Channe
 	})
 	if err != nil {
 		_ = scpSendFatal(channel, "scp: "+err.Error())
-		s.emit(evidence.Event{
-			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
-			User: pr.User, SourceIP: srcIP, Detail: "scp refused: " + err.Error(),
-		})
-		return false
+		return false, "scp refused: " + err.Error()
 	}
 	sftpClient, err := sftp.NewClient(targetClient)
 	if err != nil {
 		_ = scpSendFatal(channel, "scp: target sftp client: "+err.Error())
-		s.emit(evidence.Event{
-			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
-			User: pr.User, SourceIP: srcIP, Detail: "scp refused: target sftp client: " + err.Error(),
-		})
-		return false
+		return false, "scp refused: target sftp client: " + err.Error()
 	}
 	defer sftpClient.Close()
 
@@ -269,9 +253,9 @@ func (s *Server) runSCPTransfer(ctx, connCtx context.Context, channel ssh.Channe
 		matchedGroups: decision.MatchedGroups, releases: s.releases, releaseTTL: s.releaseTTL,
 	}
 	if dir == scpUpload {
-		return s.scpUpload(fs, channel, remotePath)
+		return s.scpUpload(fs, channel, remotePath), ""
 	}
-	return s.scpDownload(fs, channel, remotePath)
+	return s.scpDownload(fs, channel, remotePath), ""
 }
 
 // scpUpload receives one file from channel (classic SCP sink role) and
@@ -340,6 +324,11 @@ func (s *Server) scpUpload(fs *remoteFS, channel ssh.Channel, remotePath string)
 // sftp.go:178-196), so downloads get the identical evidence.TypeTransfer
 // manifest sftp get already produces. Returns false on any failure.
 func (s *Server) scpDownload(fs *remoteFS, channel ssh.Channel, remotePath string) bool {
+	info, err := fs.client.Stat(remotePath)
+	if err != nil {
+		_ = scpSendFatal(channel, "scp: "+err.Error())
+		return false
+	}
 	rd, err := fs.Fileread(&sftp.Request{Method: "Get", Filepath: remotePath})
 	if err != nil {
 		_ = scpSendFatal(channel, "scp: "+err.Error())
@@ -351,11 +340,6 @@ func (s *Server) scpDownload(fs *remoteFS, channel ssh.Channel, remotePath strin
 			_ = closer.Close()
 		}
 	}()
-	info, err := fs.client.Stat(remotePath)
-	if err != nil {
-		_ = scpSendFatal(channel, "scp: "+err.Error())
-		return false
-	}
 	r := bufio.NewReader(channel)
 	cline := fmt.Sprintf("C0644 %d %s\n", info.Size(), path.Base(remotePath))
 	if _, err := channel.Write([]byte(cline)); err != nil {

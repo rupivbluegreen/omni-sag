@@ -280,6 +280,50 @@ func TestRunSCP_DisabledByDefaultRefusesExec(t *testing.T) {
 	}
 }
 
+func TestRunSCP_RefusedSessionEmitsExactlyOneSessionEnd(t *testing.T) {
+	// A target-resolution refusal (here: policy-deny) must emit exactly one
+	// SessionEnd event carrying the refusal reason — not a detailed one from
+	// runSCPTransfer plus a second bare one from runSCP. Wire a target via
+	// wireFakeSFTPTarget (which supplies its own allowing WithDialerPeek),
+	// then override it with a denying WithDialerPeek applied afterward —
+	// options are applied in order in New, so the later one wins.
+	targetHost, targetOpts := wireFakeSFTPTarget(t, nil)
+	sink := evidence.NewMemSink()
+	opts := append([]Option{WithSCPEnabled(true)}, targetOpts...)
+	opts = append(opts, WithDialerPeek(func(policy.Principal, string) policy.Decision {
+		return policy.Decision{Allow: false, Reason: "denied for test"}
+	}))
+	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, opts...)
+
+	client := sshClient(t, addr, "alice%"+targetHost)
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := sess.Start("scp -t /denied.txt"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// The refusal is signalled via the classic-SCP fatal status byte, not an
+	// SSH-level Start error, so Wait returns the exec's exit-status (1) as an
+	// *ssh.ExitError rather than nil — that's expected here.
+	_ = sess.Wait()
+	sess.Close()
+
+	waitEvent(t, sink, func(e evidence.Event) bool {
+		return e.Type == evidence.TypeSessionEnd && e.Detail == "scp refused: denied for test"
+	})
+
+	count := 0
+	for _, e := range sink.Events() {
+		if e.Type == evidence.TypeSessionEnd {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("SessionEnd event count = %d, want exactly 1 (events: %+v)", count, sink.Events())
+	}
+}
+
 func TestRunSCP_RecursiveFlagRefused(t *testing.T) {
 	targetHost, targetOpts := wireFakeSFTPTarget(t, nil)
 	sink := evidence.NewMemSink()
