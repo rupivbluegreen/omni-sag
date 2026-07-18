@@ -46,8 +46,12 @@ leg only).
   it is **never** delivered to the target, matching SFTP put's existing
   behavior exactly (`sftp.go:663`). This is inherited, not new.
 - `disable_sftp` already gates default-protocol scp today (same
-  `subsystem sftp` path). The new `disable_scp` toggle introduced here
-  gates *only* this legacy `-O` exec-channel path.
+  `subsystem sftp` path). The new `enable_scp` toggle introduced here gates
+  *only* this legacy `-O` exec-channel path, and is **opt-in (default OFF)** —
+  the opposite sense from the three `disable_*` toggles — because it adds an
+  exec-channel surface that should stay off unless explicitly turned on. It
+  is NOT part of the "at least one capability must stay enabled" rule (that
+  rule governs only ssh/tunnel/sftp), since scp is off by default anyway.
 - Every exec-channel session must send an RFC 4254 §6.10 `exit-status`
   channel request before closing (0 on success, 1 on any refusal) — without
   it, a real SSH client's session `Wait()` reports "remote command exited
@@ -56,7 +60,17 @@ leg only).
 
 ---
 
-### Task 1: `disable_scp` config field + validation
+### Task 1: `enable_scp` config field + validation
+
+> **Superseded / already implemented.** This task shipped first as a
+> `disable_scp` (opt-out) toggle, then was converted to `enable_scp` (opt-in,
+> default OFF) per a design decision — see the Global Constraints note above
+> and commit `refactor(config): make legacy scp opt-in (enable_scp)`. The
+> steps below are retained for historical context; the code as merged uses
+> `File.EnableSCP bool` (yaml `enable_scp`) and reverts the "all disabled"
+> validation to the original three toggles (ssh/tunnel/sftp). Downstream
+> Tasks 3/5/6/7 consume `EnableSCP`/`WithSCPEnabled`, not the disable_scp
+> names shown in this section.
 
 **Files:**
 - Modify: `internal/config/config.go:41-44` (struct fields), `:276-278`
@@ -64,8 +78,9 @@ leg only).
 - Test: `internal/config/config_test.go`
 
 **Interfaces:**
-- Produces: `File.DisableSCP bool` (yaml `disable_scp`), consumed by Task 3
-  (`session.WithSCPDisabled`) and Task 5 (`cmd/omni-sag/main.go`).
+- Produces: `File.EnableSCP bool` (yaml `enable_scp`, opt-in default false),
+  consumed by Task 3 (`session.WithSCPEnabled`) and Task 5
+  (`cmd/omni-sag/main.go`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -538,9 +553,16 @@ git commit -m "feat(session): scp classic-protocol wire codec and command parser
 - Consumes: `parseSCPCommand`, `scpSendOK/Fatal`, `scpReadAck`,
   `scpReadControlLine` (Task 2); `remoteFS`, `targetConnCache.getOrDial`,
   `Server.dialTarget`, `Server.emit` (existing, `sftp.go`/`target.go`/`session.go`)
-- Produces: `Server.scpDisabled bool`, `WithSCPDisabled(bool) Option`,
+- Produces: `Server.scpEnabled bool`, `WithSCPEnabled(bool) Option`,
   `func (s *Server) runSCP(ctx, connCtx context.Context, channel ssh.Channel, pr policy.Principal, srcIP string, sconn ssh.Conn, tch *targetConnCache, dir scpDirection, remotePath string)`
   — consumed by Task 4's tests and Task 5's main.go wiring.
+
+**IMPORTANT — legacy scp is opt-IN (default OFF).** Unlike the three
+`disable_*` toggles, scp is gated by `scpEnabled` which defaults false: the
+exec case rejects every scp exec request UNLESS `WithSCPEnabled(true)` was
+passed. Every happy-path scp test below must therefore pass
+`WithSCPEnabled(true)` in its server options, or the exec request is refused
+before any transfer runs.
 
 - [ ] **Step 1: Write the failing integration test**
 
@@ -641,7 +663,8 @@ func scpExecDownload(t *testing.T, sess *ssh.Session, cmd string) []byte {
 func TestRunSCP_UploadThenDownloadRoundTripsThroughRealTarget(t *testing.T) {
 	targetHost, targetOpts := wireFakeSFTPTarget(t, nil)
 	sink := evidence.NewMemSink()
-	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, targetOpts...)
+	opts := append([]Option{WithSCPEnabled(true)}, targetOpts...)
+	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, opts...)
 
 	client := sshClient(t, addr, "alice%"+targetHost)
 
@@ -677,24 +700,10 @@ func TestRunSCP_UploadThenDownloadRoundTripsThroughRealTarget(t *testing.T) {
 	})
 }
 
-func TestRunSCP_DisabledRefusesExecEvenWithValidPolicy(t *testing.T) {
-	targetHost, targetOpts := wireFakeSFTPTarget(t, nil)
-	sink := evidence.NewMemSink()
-	opts := append([]Option{WithSCPDisabled(true)}, targetOpts...)
-	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, opts...)
-
-	client := sshClient(t, addr, "alice%"+targetHost)
-	sess, err := client.NewSession()
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	defer sess.Close()
-	if err := sess.Start("scp -t /blocked.txt"); err == nil {
-		t.Fatal("Start = nil, want error: disable_scp must refuse the exec request")
-	}
-}
-
-func TestRunSCP_RecursiveFlagRefused(t *testing.T) {
+func TestRunSCP_DisabledByDefaultRefusesExec(t *testing.T) {
+	// No WithSCPEnabled option: legacy scp is opt-in and OFF by default, so
+	// the exec request must be refused even though policy would allow the
+	// target.
 	targetHost, targetOpts := wireFakeSFTPTarget(t, nil)
 	sink := evidence.NewMemSink()
 	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, targetOpts...)
@@ -705,6 +714,26 @@ func TestRunSCP_RecursiveFlagRefused(t *testing.T) {
 		t.Fatalf("NewSession: %v", err)
 	}
 	defer sess.Close()
+	if err := sess.Start("scp -t /blocked.txt"); err == nil {
+		t.Fatal("Start = nil, want error: scp is opt-in and must be refused unless enable_scp is set")
+	}
+}
+
+func TestRunSCP_RecursiveFlagRefused(t *testing.T) {
+	targetHost, targetOpts := wireFakeSFTPTarget(t, nil)
+	sink := evidence.NewMemSink()
+	opts := append([]Option{WithSCPEnabled(true)}, targetOpts...)
+	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, opts...)
+
+	client := sshClient(t, addr, "alice%"+targetHost)
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+	// scp IS enabled here, so this exercises the parser's -r rejection, not
+	// the enable gate: the exec request is refused because parseSCPCommand
+	// rejects -r, not because scp is off.
 	if err := sess.Start("scp -r -t /dir"); err == nil {
 		t.Fatal("Start = nil, want error: -r must be refused")
 	}
@@ -714,39 +743,40 @@ func TestRunSCP_RecursiveFlagRefused(t *testing.T) {
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `go test ./internal/session/... -run TestRunSCP -v`
-Expected: FAIL — `Start("scp -t ...")` succeeds today because `interactive.go`'s
-`default` case does `req.Reply(false, nil)`... actually re-check: Go's
-`ssh.Session.Start` returns an error precisely when the server replies
-`false` to the exec request, so today (no `case "exec"` at all, falls to
-`default`) `Start` should already fail for ALL of these tests, including the
-first one that expects success. Confirm the first test fails with an error
-from `Start`, and the third/fourth (which also expect an error) may
-spuriously pass before `scpDisabled`/parsing even exist — that's expected
-and will be re-verified once Step 3 lands (Step 4 below covers this).
+Expected: FAIL to compile — `WithSCPEnabled` is undefined (added in Step 3).
+Once it compiles, note that today (no `case "exec"` at all, falls to
+`default` which does `req.Reply(false, nil)`) `ssh.Session.Start` fails for
+ALL of these, including the round-trip test that expects success — that's
+the expected RED state, re-verified green in Step 4 after Step 3 lands.
 
 - [ ] **Step 3: Add the field, option, and `runSCP`/`scpUpload`/`scpDownload`**
 
-In `internal/session/session.go`, change line 92 (end of the disabled-flags
-block) to add a fourth field:
+In `internal/session/session.go`, find the disabled-flags block (the three
+fields `sshDisabled`/`tunnelDisabled`/`sftpDisabled`, around line 90-92) and
+add a fourth field with the OPPOSITE sense — `scpEnabled` (opt-in), not
+`scpDisabled`:
 
 ```go
 	sshDisabled    bool // opt-in: rejects "shell" requests on session channels; see WithSSHDisabled
 	tunnelDisabled bool // opt-in: rejects "direct-tcpip" channels (-L port forwarding); see WithTunnelDisabled
 	sftpDisabled   bool // opt-in: rejects "subsystem"+"sftp" requests on session channels; see WithSFTPDisabled
-	scpDisabled    bool // opt-in: rejects "exec" requests matching "scp -t/-f" (legacy protocol); see WithSCPDisabled
+	scpEnabled     bool // opt-IN (default false = OFF): only when true are "exec" requests matching "scp -t/-f" (legacy protocol) served; see WithSCPEnabled
 ```
 
-Add after `WithSFTPDisabled` (after line 137):
+Add after `WithSFTPDisabled` (after the existing `WithSFTPDisabled`
+function, around line 137):
 
 ```go
-// WithSCPDisabled rejects every "exec" request matching the legacy scp
-// protocol's "scp -t"/"scp -f" grammar, regardless of policy.
-// Default-protocol scp (no client -O flag) is unaffected — it rides the
-// "subsystem"+"sftp" path governed by WithSFTPDisabled instead. False (the
-// default) leaves legacy scp available; policy still separately governs
-// which hosts/ports it may reach.
-func WithSCPDisabled(disabled bool) Option {
-	return func(s *Server) { s.scpDisabled = disabled }
+// WithSCPEnabled turns ON the legacy exec-based scp protocol ("exec"
+// requests matching "scp -t"/"scp -f"). Unlike the three WithXDisabled
+// options, this is opt-IN: false (the default) rejects every scp exec
+// request outright, since the legacy protocol adds an exec-channel surface
+// that stays off unless an operator explicitly enables it. Default-protocol
+// scp (modern clients, no -O flag) is unaffected either way — it rides the
+// "subsystem"+"sftp" path governed by WithSFTPDisabled. When enabled, policy
+// still separately governs which hosts/ports scp may reach.
+func WithSCPEnabled(enabled bool) Option {
+	return func(s *Server) { s.scpEnabled = enabled }
 }
 ```
 
@@ -760,8 +790,8 @@ before `default:`, i.e. after line 130):
 				_ = req.Reply(false, nil) // a shell was already dispatched on this channel
 				continue
 			}
-			if s.scpDisabled {
-				_ = req.Reply(false, nil) // legacy scp disabled by gateway configuration (disable_scp)
+			if !s.scpEnabled {
+				_ = req.Reply(false, nil) // legacy scp is opt-in and disabled (enable_scp not set)
 				continue
 			}
 			var e execRequest
@@ -1021,17 +1051,17 @@ every function in this file uses the parameter name `remotePath`, never
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `go test ./internal/session/... -run TestRunSCP -v`
-Expected: PASS, all four tests
+Expected: PASS, all three tests
 (`TestRunSCP_UploadThenDownloadRoundTripsThroughRealTarget`,
-`TestRunSCP_DisabledRefusesExecEvenWithValidPolicy`,
+`TestRunSCP_DisabledByDefaultRefusesExec`,
 `TestRunSCP_RecursiveFlagRefused`).
 
 - [ ] **Step 5: Run the full session package test suite (regression check)**
 
 Run: `go test ./internal/session/... -v 2>&1 | tail -60`
 Expected: PASS — every existing shell/sftp/tunnel test is unaffected (the
-`exec` case is new, and `shellDone != nil` / `scpDisabled` gate it exactly
-like `shell`/`subsystem` gate themselves already).
+`exec` case is new, and `shellDone != nil` / `!s.scpEnabled` gate it, so with
+scp off by default no existing test path reaches the scp code at all).
 
 - [ ] **Step 6: Commit**
 
@@ -1045,14 +1075,35 @@ git commit -m "feat(session): serve legacy-protocol scp over the exec channel"
 ### Task 4: Quarantine/inspection integration for scp upload
 
 **Files:**
+- Modify: `internal/session/sftp_inspect_test.go` (one line — enable scp in
+  the shared `startInspectingServer` helper's options)
 - Test: `internal/session/scp_test.go` (append)
 
 **Interfaces:**
 - Consumes: `startInspectingServer`, `approveRelease`
-  (`sftp_inspect_test.go` — same package, already defined, no changes
-  needed); `runSCP` (Task 3).
+  (`sftp_inspect_test.go` — same package, already defined); `runSCP`,
+  `WithSCPEnabled` (Task 3).
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Enable scp in the shared inspecting-server helper**
+
+Legacy scp is opt-in (Task 3), so the shared test helper that starts an
+inspection-enabled gateway must turn it on for these scp integration tests
+to reach the scp code at all. In `internal/session/sftp_inspect_test.go`,
+find the `opts :=` line inside `startInspectingServer` (it reads
+`opts := append([]Option{WithInspection(gate), WithApprovals(store, 5*time.Second), WithReleases(releases, 6*time.Hour)}, targetOpts...)`)
+and add `WithSCPEnabled(true)` to that option list:
+
+```go
+	opts := append([]Option{WithInspection(gate), WithApprovals(store, 5*time.Second), WithReleases(releases, 6*time.Hour), WithSCPEnabled(true)}, targetOpts...)
+```
+
+This is harmless to the existing SFTP tests that also use this helper — they
+never open an exec channel, so enabling scp changes none of their behavior —
+and it lets the scp tests below exercise the real quarantine path. Run the
+existing inspection tests once after this edit to confirm no regression:
+`go test ./internal/session/... -run TestSFTP_Inspection -v` → PASS.
+
+- [ ] **Step 2: Write the failing tests**
 
 Append to `internal/session/scp_test.go`:
 
@@ -1140,21 +1191,22 @@ func TestRunSCP_BlockedUploadRefusedNeverReleased(t *testing.T) {
 Add `"github.com/rupivbluegreen/omni-sag/internal/approval"` to
 `scp_test.go`'s import block for the second test's `approval.KindQuarantineRelease`.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 3: Run tests to verify they pass**
 
 Run: `go test ./internal/session/... -run 'TestRunSCP_CleanUploadQuarantinedAndReleasedNotPushed|TestRunSCP_BlockedUploadRefusedNeverReleased' -v`
-Expected: both should actually PASS already if Task 3 is correct (this task
+Expected: both PASS if Task 3 + Step 1's helper change are correct (this task
 adds coverage of a path — the shared `fs.Filewrite` — that Task 3 already
 wired up correctly, since `fs.gate` is populated from `s.inspect`
-unconditionally in `runSCPTransfer`). If either FAILS, it indicates a real
-gap in Task 3's wiring — do not proceed to Step 3 until root-caused per
-`superpowers:systematic-debugging`, since this task has no separate
-"implementation step" otherwise.
+unconditionally in `runSCPTransfer`, and Step 1 enabled scp in the helper so
+the exec request is served). If either FAILS, root-cause per
+`superpowers:systematic-debugging` before committing: a refused exec (scp not
+enabled in the helper) looks different from a broken quarantine wiring —
+check the failure mode against Step 1 first.
 
-- [ ] **Step 3: If both passed on the first run, confirm and commit; if not, fix `runSCPTransfer`'s `fs := &remoteFS{...}` construction (Task 3) until they do, then commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add internal/session/scp_test.go
+git add internal/session/scp_test.go internal/session/sftp_inspect_test.go
 git commit -m "test(session): scp upload quarantine/release-not-push coverage"
 ```
 
@@ -1167,17 +1219,21 @@ git commit -m "test(session): scp upload quarantine/release-not-push coverage"
 - Modify: `deploy/compose/config.example.yaml` (capability-toggles block)
 
 **Interfaces:**
-- Consumes: `cfg.DisableSCP` (Task 1), `session.WithSCPDisabled` (Task 3).
+- Consumes: `cfg.EnableSCP` (Task 1), `session.WithSCPEnabled` (Task 3).
 
 - [ ] **Step 1: Wire the option and boot log line**
 
-In `cmd/omni-sag/main.go`, change lines 172-183 to:
+In `cmd/omni-sag/main.go`, find the block that appends the three
+`session.WithXDisabled(cfg.DisableX)` options and logs each disabled
+capability (around lines 172-183). Add the opt-in scp option and its boot
+log line — note the OPPOSITE sense from the three disable_* toggles (the
+log fires when scp is ENABLED, not disabled):
 
 ```go
 	opts = append(opts, session.WithSSHDisabled(cfg.DisableSSH))
 	opts = append(opts, session.WithTunnelDisabled(cfg.DisableTunnel))
 	opts = append(opts, session.WithSFTPDisabled(cfg.DisableSFTP))
-	opts = append(opts, session.WithSCPDisabled(cfg.DisableSCP))
+	opts = append(opts, session.WithSCPEnabled(cfg.EnableSCP))
 	if cfg.DisableSSH {
 		log.Printf("omni-sag: interactive shell disabled (disable_ssh)")
 	}
@@ -1187,8 +1243,8 @@ In `cmd/omni-sag/main.go`, change lines 172-183 to:
 	if cfg.DisableSFTP {
 		log.Printf("omni-sag: SFTP disabled (disable_sftp) — also disables default-protocol scp, which rides the same subsystem")
 	}
-	if cfg.DisableSCP {
-		log.Printf("omni-sag: legacy-protocol scp (-O) disabled (disable_scp)")
+	if cfg.EnableSCP {
+		log.Printf("omni-sag: legacy-protocol scp (-O) ENABLED (enable_scp) — extra exec-channel surface is live")
 	}
 ```
 
@@ -1197,21 +1253,25 @@ In `cmd/omni-sag/main.go`, change lines 172-183 to:
 Run: `go build ./...`
 Expected: no errors
 
-- [ ] **Step 3: Document the new toggle in the example config**
+- [ ] **Step 3: Document the toggles in the example config**
 
 In `deploy/compose/config.example.yaml`, find the capability-toggles
 comment block (search `disable_sftp`) and change it to:
 
 ```yaml
-# Capability toggles (all default false = enabled). Any combination may be
-# disabled independently; at least one must stay enabled. Uncomment to
-# restrict this gateway to, e.g., tunnel-only:
+# Capability toggles. The three disable_* below default false (enabled); any
+# combination may be disabled independently, but at least one must stay
+# enabled. Uncomment to restrict this gateway to, e.g., tunnel-only:
 # disable_ssh: true      # reject interactive PTY shell
 # disable_tunnel: true   # reject -L port forwarding
 # disable_sftp: true     # reject the SFTP subsystem (also disables default-
-#                         # protocol scp, which rides the same subsystem)
-# disable_scp: true      # reject legacy-protocol scp ("-O" flag); default-
-#                         # protocol scp is governed by disable_sftp instead
+#                        # protocol scp, which rides the same subsystem)
+#
+# enable_scp is the OPPOSITE sense — opt-in, default OFF. The legacy
+# exec-based scp protocol (OpenSSH's "-O" flag) stays disabled unless you set
+# this. Modern scp clients need nothing here — they use the SFTP subsystem
+# above. Only enable for old clients that force the legacy protocol:
+# enable_scp: true       # serve legacy-protocol scp ("-O" flag)
 ```
 
 - [ ] **Step 4: Run the config test suite (confirm the example config still parses)**
@@ -1223,7 +1283,7 @@ Expected: PASS
 
 ```bash
 git add cmd/omni-sag/main.go deploy/compose/config.example.yaml
-git commit -m "feat(cmd): wire disable_scp into the gateway"
+git commit -m "feat(cmd): wire enable_scp into the gateway"
 ```
 
 ---
@@ -1247,7 +1307,8 @@ Replace with:
 ```
 `scp` works out of the box for any current OpenSSH client — it defaults to the SFTP protocol
 under the hood, served by the same real shell/SFTP path above. The legacy exec-based protocol
-(`scp -O`) is also supported, single file only (no `-r`).
+(`scp -O`) is also supported, single file only (no `-r`), but is opt-in — set `enable_scp: true`
+to turn it on (it adds an exec-channel surface, so it stays off by default).
 
 Not supported: `-R` remote/reverse forwarding, or X11 forwarding.
 ```
@@ -1335,7 +1396,17 @@ GW_PID=""
 cleanup() { [ -n "$GW_PID" ] && kill "$GW_PID" 2>/dev/null || true; wait 2>/dev/null || true; }
 trap cleanup EXIT
 
-"$GW_BIN" -config "$BASE_CONFIG" >"$WORKDIR/gateway.log" 2>&1 &
+# Legacy scp is opt-in (enable_scp, default OFF), and the shipped example
+# config leaves it off. Derive a config that turns it on for this test —
+# the whole point of the test is to exercise the legacy path, so it must be
+# enabled. A plain YAML append of a top-level key is sufficient (yaml.v3
+# takes the last value for a duplicated key, and the example config does not
+# set enable_scp at all, so there is no duplicate here anyway).
+TEST_CONFIG="$WORKDIR/config.yaml"
+cp "$BASE_CONFIG" "$TEST_CONFIG"
+printf '\nenable_scp: true\n' >> "$TEST_CONFIG"
+
+"$GW_BIN" -config "$TEST_CONFIG" >"$WORKDIR/gateway.log" 2>&1 &
 GW_PID=$!
 for i in $(seq 1 50); do
   if ! kill -0 "$GW_PID" 2>/dev/null; then
@@ -1517,8 +1588,9 @@ git commit -m "test: real scp -O interop check against the dev lab"
   reject pre-acceptance (Task 3, documented as a refinement in Global
   Constraints) ✓. Recording/evidence via `Detail: "scp"` (Task 3's test
   asserts it) ✓. Testing plan: codec unit tests (Task 2), upload/download
-  integration (Task 3), quarantine integration (Task 4), disable_scp
-  regression (Task 3), README fix (Task 6), real lab interop (Task 7) ✓.
+  integration (Task 3), quarantine integration (Task 4), scp opt-in
+  (enable_scp) default-off refusal regression (Task 3), README fix (Task 6),
+  real lab interop (Task 7) ✓.
   Out-of-scope items (`-r`, `-p` timestamp application, new discovery
   mechanism) — explicitly not implemented anywhere in this plan, matches
   spec.
