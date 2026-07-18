@@ -265,6 +265,12 @@ func (s *Server) runSCPTransfer(ctx, connCtx context.Context, channel ssh.Channe
 // any failure (a fatal status byte has already been sent to channel).
 func (s *Server) scpUpload(fs *remoteFS, channel ssh.Channel, remotePath string) bool {
 	r := bufio.NewReader(channel)
+	// Classic SCP sink handshake: send the initial 0x00 "ready" byte before
+	// the source sends anything. The real scp -O client (source) blocks in
+	// read() waiting for this; without it both sides deadlock.
+	if err := scpSendOK(channel); err != nil {
+		return false
+	}
 	cl, err := scpReadControlLine(r, channel)
 	if err != nil {
 		_ = scpSendFatal(channel, err.Error())
@@ -341,6 +347,12 @@ func (s *Server) scpDownload(fs *remoteFS, channel ssh.Channel, remotePath strin
 		}
 	}()
 	r := bufio.NewReader(channel)
+	// Classic SCP source handshake: the sink (client) sends an initial 0x00
+	// "ready" byte first; consume it before sending our C-line. Without this
+	// read the ack stream is off by one.
+	if err := scpReadAck(r); err != nil {
+		return false
+	}
 	cline := fmt.Sprintf("C0644 %d %s\n", info.Size(), path.Base(remotePath))
 	if _, err := channel.Write([]byte(cline)); err != nil {
 		return false

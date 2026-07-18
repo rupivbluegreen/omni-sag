@@ -166,6 +166,11 @@ func scpExecUpload(t *testing.T, sess *ssh.Session, cmd string, content []byte, 
 		return err
 	}
 	r := bufio.NewReader(stdout)
+	// The gateway (sink) sends an initial 0x00 ready byte first — read it
+	// before sending our control line, mirroring a real scp source.
+	if err := scpReadAck(r); err != nil {
+		return err
+	}
 	if _, err := fmt.Fprintf(stdin, "C0644 %d %s\n", len(content), name); err != nil {
 		return err
 	}
@@ -203,6 +208,11 @@ func scpExecDownload(t *testing.T, sess *ssh.Session, cmd string) []byte {
 		t.Fatalf("Start: %v", err)
 	}
 	r := bufio.NewReader(stdout)
+	// A real scp sink sends its initial 0x00 ready byte first; do the same so
+	// the gateway source's handshake read is satisfied.
+	if err := scpSendOK(stdin); err != nil {
+		t.Fatalf("send initial ready ack: %v", err)
+	}
 	cl, err := scpReadControlLine(r, stdin)
 	if err != nil {
 		t.Fatalf("scpExecDownload control line: %v", err)
