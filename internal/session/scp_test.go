@@ -18,11 +18,11 @@ import (
 
 func TestParseSCPCommand(t *testing.T) {
 	cases := []struct {
-		name    string
-		cmd     string
-		wantDir scpDirection
+		name     string
+		cmd      string
+		wantDir  scpDirection
 		wantPath string
-		wantErr string // substring, "" means no error expected
+		wantErr  string // substring, "" means no error expected
 	}{
 		{"upload", "scp -t /upload.txt", scpUpload, "/upload.txt", ""},
 		{"download", "scp -f /download.txt", scpDownload, "/download.txt", ""},
