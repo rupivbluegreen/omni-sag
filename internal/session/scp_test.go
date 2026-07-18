@@ -3,8 +3,15 @@ package session
 import (
 	"bufio"
 	"bytes"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
+
+	"github.com/rupivbluegreen/omni-sag/internal/evidence"
+	"github.com/rupivbluegreen/omni-sag/internal/policy"
 )
 
 func TestParseSCPCommand(t *testing.T) {
@@ -135,4 +142,160 @@ func TestScpReadControlLine(t *testing.T) {
 			t.Fatal("scpReadControlLine = nil error, want error on garbage input")
 		}
 	})
+}
+
+// scpExecUpload obtains sess's stdin/stdout pipes, starts cmd (an
+// exec-channel "scp -t <path>" invocation — pipes MUST be obtained before
+// Start(), per ssh.Session's contract: calling StdinPipe/StdoutPipe after
+// Start returns an error), then drives one client-side legacy-protocol
+// upload and returns any error the server signalled (nil on success). The
+// caller is responsible for sess.Wait() afterward.
+func scpExecUpload(t *testing.T, sess *ssh.Session, cmd string, content []byte, name string) error {
+	t.Helper()
+	stdin, err := sess.StdinPipe()
+	if err != nil {
+		t.Fatalf("StdinPipe: %v", err)
+	}
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+	if err := sess.Start(cmd); err != nil {
+		return err
+	}
+	r := bufio.NewReader(stdout)
+	if _, err := fmt.Fprintf(stdin, "C0644 %d %s\n", len(content), name); err != nil {
+		return err
+	}
+	if err := scpReadAck(r); err != nil {
+		return err
+	}
+	if _, err := stdin.Write(content); err != nil {
+		return err
+	}
+	if _, err := stdin.Write([]byte{0}); err != nil {
+		return err
+	}
+	if err := scpReadAck(r); err != nil {
+		return err
+	}
+	return stdin.Close()
+}
+
+// scpExecDownload obtains sess's stdin/stdout pipes, starts cmd (an
+// exec-channel "scp -f <path>" invocation — same before-Start ordering
+// constraint as scpExecUpload), then drives one client-side legacy-protocol
+// download and returns the received content. The caller is responsible for
+// sess.Wait() afterward.
+func scpExecDownload(t *testing.T, sess *ssh.Session, cmd string) []byte {
+	t.Helper()
+	stdin, err := sess.StdinPipe()
+	if err != nil {
+		t.Fatalf("StdinPipe: %v", err)
+	}
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+	if err := sess.Start(cmd); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	r := bufio.NewReader(stdout)
+	cl, err := scpReadControlLine(r, stdin)
+	if err != nil {
+		t.Fatalf("scpExecDownload control line: %v", err)
+	}
+	if err := scpSendOK(stdin); err != nil {
+		t.Fatalf("ack control line: %v", err)
+	}
+	buf := make([]byte, cl.Size)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if _, err := r.ReadByte(); err != nil { // trailing terminator
+		t.Fatalf("read trailer: %v", err)
+	}
+	if err := scpSendOK(stdin); err != nil {
+		t.Fatalf("send final ack: %v", err)
+	}
+	return buf
+}
+
+func TestRunSCP_UploadThenDownloadRoundTripsThroughRealTarget(t *testing.T) {
+	targetHost, targetOpts := wireFakeSFTPTarget(t, nil)
+	sink := evidence.NewMemSink()
+	opts := append([]Option{WithSCPEnabled(true)}, targetOpts...)
+	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, opts...)
+
+	client := sshClient(t, addr, "alice%"+targetHost)
+
+	uploadSess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession (upload): %v", err)
+	}
+	content := []byte("hello via legacy scp protocol\n")
+	if err := scpExecUpload(t, uploadSess, "scp -t /roundtrip.txt", content, "roundtrip.txt"); err != nil {
+		t.Fatalf("scpExecUpload: %v", err)
+	}
+	if err := uploadSess.Wait(); err != nil {
+		t.Fatalf("upload Wait: %v", err)
+	}
+	uploadSess.Close()
+
+	downloadSess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession (download): %v", err)
+	}
+	got := scpExecDownload(t, downloadSess, "scp -f /roundtrip.txt")
+	if err := downloadSess.Wait(); err != nil {
+		t.Fatalf("download Wait: %v", err)
+	}
+	downloadSess.Close()
+
+	if string(got) != string(content) {
+		t.Fatalf("round-tripped content = %q, want %q", got, content)
+	}
+
+	waitEvent(t, sink, func(e evidence.Event) bool {
+		return e.Type == evidence.TypeSessionStart && e.User == "alice" && e.Detail == "scp"
+	})
+}
+
+func TestRunSCP_DisabledByDefaultRefusesExec(t *testing.T) {
+	// No WithSCPEnabled option: legacy scp is opt-in and OFF by default, so
+	// the exec request must be refused even though policy would allow the
+	// target.
+	targetHost, targetOpts := wireFakeSFTPTarget(t, nil)
+	sink := evidence.NewMemSink()
+	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, targetOpts...)
+
+	client := sshClient(t, addr, "alice%"+targetHost)
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+	if err := sess.Start("scp -t /blocked.txt"); err == nil {
+		t.Fatal("Start = nil, want error: scp is opt-in and must be refused unless enable_scp is set")
+	}
+}
+
+func TestRunSCP_RecursiveFlagRefused(t *testing.T) {
+	targetHost, targetOpts := wireFakeSFTPTarget(t, nil)
+	sink := evidence.NewMemSink()
+	opts := append([]Option{WithSCPEnabled(true)}, targetOpts...)
+	addr := startServerWith(t, policy.Policy{}, dbaAuth(), sink, opts...)
+
+	client := sshClient(t, addr, "alice%"+targetHost)
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+	// scp IS enabled here, so this exercises the parser's -r rejection, not
+	// the enable gate: the exec request is refused because parseSCPCommand
+	// rejects -r, not because scp is off.
+	if err := sess.Start("scp -r -t /dir"); err == nil {
+		t.Fatal("Start = nil, want error: -r must be refused")
+	}
 }
