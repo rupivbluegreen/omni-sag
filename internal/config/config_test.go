@@ -98,12 +98,11 @@ evidence:
 disable_ssh: true
 disable_tunnel: true
 disable_sftp: true
-disable_scp: true
 policy:
   roles: []
 `
 	if _, err := Load(writeTemp(t, bad)); err == nil {
-		t.Fatal("expected error when disable_ssh, disable_tunnel, disable_sftp, and disable_scp are all true")
+		t.Fatal("expected error when disable_ssh, disable_tunnel, and disable_sftp are all true")
 	}
 }
 
@@ -129,29 +128,11 @@ policy:
 	}
 }
 
-func TestValidate_AllFourCapabilityTogglesTrueIsRejected(t *testing.T) {
-	bad := `
-listen: ":2222"
-evidence:
-  file: "evidence.jsonl"
-disable_ssh: true
-disable_tunnel: true
-disable_sftp: true
-disable_scp: true
-policy:
-  roles: []
-`
-	if _, err := Load(writeTemp(t, bad)); err == nil {
-		t.Fatal("expected error when disable_ssh, disable_tunnel, disable_sftp, and disable_scp are all true")
-	}
-}
-
-func TestValidate_DisableSCPAloneIsAccepted(t *testing.T) {
+func TestValidate_EnableSCPDefaultsOff(t *testing.T) {
 	ok := `
 listen: ":2222"
 evidence:
   file: "evidence.jsonl"
-disable_scp: true
 policy:
   roles: []
 `
@@ -159,11 +140,36 @@ policy:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !f.DisableSCP {
-		t.Fatal("disable_scp should be true")
+	if f.EnableSCP {
+		t.Fatal("enable_scp should default to false (legacy scp opt-in, off unless set)")
 	}
-	if f.DisableSSH || f.DisableTunnel || f.DisableSFTP {
-		t.Fatal("disable_ssh/disable_tunnel/disable_sftp should all be false (omitted)")
+}
+
+func TestValidate_EnableSCPWithAllOthersDisabledIsAccepted(t *testing.T) {
+	// enable_scp is opt-in and NOT part of the "at least one capability must
+	// stay enabled" rule: the gateway still serves scp here, but even so the
+	// three disable_* toggles govern that rule on their own. Disabling all
+	// three is still rejected regardless of enable_scp — asserted separately
+	// in TestValidate_AllCapabilitiesDisabledRejected. Here only sftp is
+	// disabled, so it must load fine with scp enabled.
+	ok := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+disable_sftp: true
+enable_scp: true
+policy:
+  roles: []
+`
+	f, err := Load(writeTemp(t, ok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !f.EnableSCP {
+		t.Fatal("enable_scp should be true")
+	}
+	if !f.DisableSFTP {
+		t.Fatal("disable_sftp should be true")
 	}
 }
 
