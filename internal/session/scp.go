@@ -73,7 +73,8 @@ func parseSCPCommand(cmd string) (scpDirection, string, error) {
 			return 0, "", fmt.Errorf("scp: unsupported flag %q", f)
 		default:
 			// Check path for bad characters before allowing multiple paths
-			if strings.ContainsAny(f, "'\"$`\\;|&<>*?[]{}~") {
+			if strings.ContainsAny(f, "'\"$`\\;|&<>*?[]{}~") ||
+				strings.IndexFunc(f, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
 				return 0, "", fmt.Errorf("scp: unsupported path")
 			}
 			if remotePath != "" {
@@ -325,6 +326,40 @@ func (s *Server) scpUpload(fs *remoteFS, channel ssh.Channel, remotePath string)
 	return true
 }
 
+// scpCopyBody streams exactly size bytes from rd (starting at offset 0) to w
+// in bounded chunks. It terminates on io.EOF and returns an error if the
+// source yields fewer than size bytes — a target that reports a larger Stat
+// size than it will serve (a truncation race or a buggy/hostile target) must
+// fail the transfer, never spin. Returns nil only when exactly size bytes
+// were written.
+func scpCopyBody(w io.Writer, rd io.ReaderAt, size int64) error {
+	buf := make([]byte, 32*1024)
+	var off int64
+	for off < size {
+		chunk := int64(len(buf))
+		if remaining := size - off; remaining < chunk {
+			chunk = remaining
+		}
+		n, rerr := rd.ReadAt(buf[:chunk], off)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			off += int64(n)
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
+	if off < size {
+		return fmt.Errorf("scp: target served %d of %d bytes", off, size)
+	}
+	return nil
+}
+
 // scpDownload sends one file to channel (classic SCP source role), read
 // via fs.Fileread — the SAME method pkg/sftp's FileGet handler calls (see
 // sftp.go:178-196), so downloads get the identical evidence.TypeTransfer
@@ -360,25 +395,9 @@ func (s *Server) scpDownload(fs *remoteFS, channel ssh.Channel, remotePath strin
 	if err := scpReadAck(r); err != nil {
 		return false
 	}
-	buf := make([]byte, 32*1024)
-	var off int64
-	for off < info.Size() {
-		remaining := info.Size() - off
-		chunk := int64(len(buf))
-		if remaining < chunk {
-			chunk = remaining
-		}
-		n, rerr := rd.ReadAt(buf[:chunk], off)
-		if n > 0 {
-			if _, werr := channel.Write(buf[:n]); werr != nil {
-				return false
-			}
-			off += int64(n)
-		}
-		if rerr != nil && rerr != io.EOF {
-			_ = scpSendFatal(channel, "scp: "+rerr.Error())
-			return false
-		}
+	if err := scpCopyBody(channel, rd, info.Size()); err != nil {
+		_ = scpSendFatal(channel, "scp: "+err.Error())
+		return false
 	}
 	if _, err := channel.Write([]byte{scpOK}); err != nil { // trailing terminator
 		return false

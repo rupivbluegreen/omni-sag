@@ -35,6 +35,7 @@ func TestParseSCPCommand(t *testing.T) {
 		{"unsupported flag", "scp -t -X /path", 0, "", "unsupported flag"},
 		{"path with space", "scp -t /path with space", 0, "", "multiple paths"},
 		{"path with quote", "scp -t /path'; rm -rf /", 0, "", "unsupported path"},
+		{"path with control char", "scp -t /pa\x1bth", 0, "", "unsupported path"},
 		{"no path", "scp -t", 0, "", "missing"},
 	}
 	for _, c := range cases {
@@ -142,6 +143,59 @@ func TestScpReadControlLine(t *testing.T) {
 		_, err := scpReadControlLine(r, &acked)
 		if err == nil {
 			t.Fatal("scpReadControlLine = nil error, want error on garbage input")
+		}
+	})
+}
+
+// shortReaderAt is an io.ReaderAt whose backing data is shorter than the
+// size a caller may declare — ReadAt returns (0, io.EOF) once real bytes are
+// exhausted, reproducing a target that reports a larger Stat size than it
+// actually serves (a truncation race or a buggy/hostile target).
+type shortReaderAt struct{ data []byte }
+
+func (s shortReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(s.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, s.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func TestScpCopyBody(t *testing.T) {
+	t.Run("normal case copies all bytes", func(t *testing.T) {
+		data := bytes.Repeat([]byte("x"), 100_000)
+		var out bytes.Buffer
+		if err := scpCopyBody(&out, bytes.NewReader(data), int64(len(data))); err != nil {
+			t.Fatalf("scpCopyBody: %v", err)
+		}
+		if !bytes.Equal(out.Bytes(), data) {
+			t.Fatalf("scpCopyBody wrote %d bytes, want %d", out.Len(), len(data))
+		}
+	})
+
+	t.Run("short read terminates with error instead of hanging", func(t *testing.T) {
+		short := shortReaderAt{data: []byte("only ten b")} // 10 bytes
+		declaredSize := int64(1000)                        // target claims 1000 bytes but only serves 10
+
+		var out bytes.Buffer
+		done := make(chan error, 1)
+		go func() {
+			done <- scpCopyBody(&out, short, declaredSize)
+		}()
+
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("scpCopyBody = nil error, want error for short read")
+			}
+			if !strings.Contains(err.Error(), "10 of 1000 bytes") {
+				t.Fatalf("scpCopyBody error = %q, want it to mention %q", err.Error(), "10 of 1000 bytes")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("scpCopyBody hung on a short read instead of returning an error — the busy-loop regressed")
 		}
 	})
 }
