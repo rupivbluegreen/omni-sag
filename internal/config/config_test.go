@@ -98,11 +98,12 @@ evidence:
 disable_ssh: true
 disable_tunnel: true
 disable_sftp: true
+disable_scp: true
 policy:
   roles: []
 `
 	if _, err := Load(writeTemp(t, bad)); err == nil {
-		t.Fatal("expected error when disable_ssh, disable_tunnel, and disable_sftp are all true")
+		t.Fatal("expected error when disable_ssh, disable_tunnel, disable_sftp, and disable_scp are all true")
 	}
 }
 
@@ -125,6 +126,44 @@ policy:
 	}
 	if f.DisableTunnel {
 		t.Fatal("disable_tunnel should be false (omitted)")
+	}
+}
+
+func TestValidate_AllFourCapabilityTogglesTrueIsRejected(t *testing.T) {
+	bad := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+disable_ssh: true
+disable_tunnel: true
+disable_sftp: true
+disable_scp: true
+policy:
+  roles: []
+`
+	if _, err := Load(writeTemp(t, bad)); err == nil {
+		t.Fatal("expected error when disable_ssh, disable_tunnel, disable_sftp, and disable_scp are all true")
+	}
+}
+
+func TestValidate_DisableSCPAloneIsAccepted(t *testing.T) {
+	ok := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+disable_scp: true
+policy:
+  roles: []
+`
+	f, err := Load(writeTemp(t, ok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !f.DisableSCP {
+		t.Fatal("disable_scp should be true")
+	}
+	if f.DisableSSH || f.DisableTunnel || f.DisableSFTP {
+		t.Fatal("disable_ssh/disable_tunnel/disable_sftp should all be false (omitted)")
 	}
 }
 

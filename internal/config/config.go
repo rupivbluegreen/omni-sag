@@ -37,10 +37,11 @@ type File struct {
 
 	// Capability toggles: any combination may be disabled independently. All
 	// default to false (enabled), so a config.yaml written before these
-	// fields existed keeps serving all three, unchanged.
+	// fields existed keeps serving all four, unchanged.
 	DisableSSH    bool `yaml:"disable_ssh"`    // reject interactive PTY shell ("shell" requests on session channels)
 	DisableTunnel bool `yaml:"disable_tunnel"` // reject -L port forwarding ("direct-tcpip" channels)
-	DisableSFTP   bool `yaml:"disable_sftp"`   // reject the SFTP subsystem ("subsystem"+"sftp" requests on session channels)
+	DisableSFTP   bool `yaml:"disable_sftp"`   // reject the SFTP subsystem ("subsystem"+"sftp" requests on session channels) — also blocks default-protocol scp, which rides the same subsystem
+	DisableSCP    bool `yaml:"disable_scp"`    // reject the legacy exec-based scp protocol ("exec" requests matching "scp -t/-f"); default-protocol scp is governed by disable_sftp instead, see its doc comment
 }
 
 // MetricsConfig configures the Prometheus metrics endpoint, served on its own
@@ -273,8 +274,8 @@ func (f *File) validate() error {
 	if f.HostKey == "" {
 		f.HostKey = "hostkey.pem"
 	}
-	if f.DisableSSH && f.DisableTunnel && f.DisableSFTP {
-		return fmt.Errorf("config: disable_ssh, disable_tunnel, and disable_sftp cannot all be true (the gateway would serve nothing)")
+	if f.DisableSSH && f.DisableTunnel && f.DisableSFTP && f.DisableSCP {
+		return fmt.Errorf("config: disable_ssh, disable_tunnel, disable_sftp, and disable_scp cannot all be true (the gateway would serve nothing)")
 	}
 	evCount := 0
 	if f.Evidence.File != "" {
