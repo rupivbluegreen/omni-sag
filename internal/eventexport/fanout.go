@@ -2,6 +2,7 @@ package eventexport
 
 import (
 	"context"
+	"sync"
 
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 )
@@ -48,14 +49,22 @@ func (f *Fanout) Wrap(inner evidence.Sink) evidence.Sink {
 	return &fanoutSink{fanout: f, inner: inner}
 }
 
-// Close cancels every exporter's context and waits (bounded, per exporter)
-// for it to drain its buffer, flush, and close its transport. Wrapped sinks'
-// own inners are NOT touched here — Fanout does not own them.
+// Close cancels every exporter's context, then waits for each to drain its
+// buffer, flush, and close its transport. The waits run CONCURRENTLY, so the
+// total is bounded by a single exporter's drain deadline regardless of how
+// many exporters there are — a serial wait would be O(N · drainTimeout) and,
+// with several dead SIEM destinations, could exceed a container's stop grace
+// (SIGKILL). Every exporter's context is already cancelled by f.cancel()
+// before the waits begin, so they drain in parallel. Wrapped sinks' own
+// inners are NOT touched here — Fanout does not own them.
 func (f *Fanout) Close() error {
 	f.cancel()
+	var wg sync.WaitGroup
 	for _, x := range f.exporters {
-		x.shutdown()
+		wg.Add(1)
+		go func(x *asyncExporter) { defer wg.Done(); x.shutdown() }(x)
 	}
+	wg.Wait()
 	return nil
 }
 

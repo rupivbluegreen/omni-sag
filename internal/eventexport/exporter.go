@@ -15,9 +15,13 @@ const defaultFlushInterval = time.Minute
 // drainTimeout bounds how long shutdown waits for buffered events to be
 // formatted+written and the transport flushed+closed, so a stuck
 // Transport.Write/Flush/Close (a dead destination) can't hang shutdown
-// forever. Must exceed the largest Transport's own per-op timeout
-// (httpRequestTimeout, 3s) so a normal in-flight Write completes during
-// shutdown rather than being abandoned mid-drain.
+// forever. It exceeds the largest Transport's own single-op timeout
+// (httpRequestTimeout, 3s) so a normal in-flight Write on a HEALTHY
+// connection completes during shutdown rather than being abandoned. Note it
+// does NOT cover a worst-case syslog redial (3s) + write (3s) = 6s on a
+// connection that broke right at shutdown; that case takes the
+// abandon-and-count-drops path, which is bounded and correct (buffered
+// best-effort events are dropped, the durable record is already written).
 const drainTimeout = 5 * time.Second
 
 // asyncExporter ties a Formatter and Transport together behind a bounded,

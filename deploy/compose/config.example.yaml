@@ -38,6 +38,9 @@ target_insecure_host_key: true
 # transport: file (for a filebeat/logbeat/vector tailer) | syslog (udp|tcp|tls,
 #            RFC 5424 + RFC 6587 octet-counting) | http (NDJSON batches, e.g.
 #            Elastic _bulk / HEC). Multiple exporters run concurrently.
+# Prefer syslog tcp/tls over udp when delivery matters: a "connected" UDP
+# socket's write succeeds locally even when the SIEM is black-holing, so the
+# omnisag_export_dropped_total metric cannot observe UDP delivery failures.
 # export:
 #   enabled: true
 #   exporters:
