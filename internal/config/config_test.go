@@ -513,3 +513,213 @@ func TestLoad_ComposeExampleConfigParses(t *testing.T) {
 		t.Fatalf("deploy/compose/config.example.yaml failed to load: %v", err)
 	}
 }
+
+const exportYAML = `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+export:
+  enabled: true
+  exporters:
+    - name: arcsight
+      format: cef
+      transport: syslog
+      buffer_size: 10000
+      syslog:
+        address: "arcsight:6514"
+        protocol: tls
+        facility: local0
+        tls:
+          ca: "ca.pem"
+          cert: "c.pem"
+          key: "k.pem"
+    - name: elastic-filebeat
+      format: ecs
+      transport: file
+      buffer_size: 10000
+      file:
+        path: "/var/log/omni-sag/events.ecs.jsonl"
+    - name: elastic-direct
+      format: ecs
+      transport: http
+      buffer_size: 10000
+      http:
+        url: "https://es:9200/_bulk"
+        batch_size: 100
+        flush_interval_seconds: 5
+        auth:
+          bearer_env: "ES_TOKEN"
+        tls:
+          ca: "es-ca.pem"
+`
+
+func TestExportConfig_ParsesMultiExporterYAML(t *testing.T) {
+	f, err := Load(writeTemp(t, exportYAML))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if f.Export == nil || !f.Export.Enabled {
+		t.Fatal("export.enabled should be true")
+	}
+	if got := len(f.Export.Exporters); got != 3 {
+		t.Fatalf("exporters = %d, want 3", got)
+	}
+
+	arcsight := f.Export.Exporters[0]
+	if arcsight.Name != "arcsight" || arcsight.Format != "cef" || arcsight.Transport != "syslog" {
+		t.Fatalf("arcsight exporter parsed wrong: %+v", arcsight)
+	}
+	if arcsight.Syslog == nil || arcsight.Syslog.Address != "arcsight:6514" || arcsight.Syslog.Protocol != "tls" {
+		t.Fatalf("arcsight syslog sub-config parsed wrong: %+v", arcsight.Syslog)
+	}
+	if arcsight.Syslog.TLS == nil || arcsight.Syslog.TLS.CA != "ca.pem" {
+		t.Fatalf("arcsight syslog tls sub-config parsed wrong: %+v", arcsight.Syslog.TLS)
+	}
+
+	filebeat := f.Export.Exporters[1]
+	if filebeat.File == nil || filebeat.File.Path != "/var/log/omni-sag/events.ecs.jsonl" {
+		t.Fatalf("filebeat file sub-config parsed wrong: %+v", filebeat.File)
+	}
+
+	direct := f.Export.Exporters[2]
+	if direct.HTTP == nil || direct.HTTP.URL != "https://es:9200/_bulk" || direct.HTTP.BatchSize != 100 {
+		t.Fatalf("direct http sub-config parsed wrong: %+v", direct.HTTP)
+	}
+	if direct.HTTP.Auth.BearerEnv != "ES_TOKEN" {
+		t.Fatalf("direct http auth parsed wrong: %+v", direct.HTTP.Auth)
+	}
+
+	// Mapping into the eventexport package's Config must carry every field
+	// through, including constructing the (package-private in eventexport)
+	// transport sub-configs via the exported mirror structs.
+	ee := f.Export.ToEventExport()
+	if !ee.Enabled || len(ee.Exporters) != 3 {
+		t.Fatalf("toEventExport: %+v", ee)
+	}
+	if ee.Exporters[0].Syslog == nil || ee.Exporters[0].Syslog.Address != "arcsight:6514" {
+		t.Fatalf("toEventExport arcsight syslog: %+v", ee.Exporters[0].Syslog)
+	}
+	if ee.Exporters[1].File == nil || ee.Exporters[1].File.Path != "/var/log/omni-sag/events.ecs.jsonl" {
+		t.Fatalf("toEventExport filebeat file: %+v", ee.Exporters[1].File)
+	}
+	if ee.Exporters[2].HTTP == nil || ee.Exporters[2].HTTP.URL != "https://es:9200/_bulk" {
+		t.Fatalf("toEventExport direct http: %+v", ee.Exporters[2].HTTP)
+	}
+}
+
+func TestExportConfig_DisabledOrAbsentIsNilOrDisabled(t *testing.T) {
+	f, err := Load(writeTemp(t, demoYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Export != nil {
+		t.Fatalf("export should be nil when absent from yaml, got %+v", f.Export)
+	}
+
+	withFalse := demoYAML + "export:\n  enabled: false\n"
+	f2, err := Load(writeTemp(t, withFalse))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f2.Export == nil || f2.Export.Enabled {
+		t.Fatalf("export.enabled: false should parse but stay disabled, got %+v", f2.Export)
+	}
+}
+
+func TestExportConfig_InvalidFormatRejected(t *testing.T) {
+	bad := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+export:
+  enabled: true
+  exporters:
+    - name: bad
+      format: xml
+      transport: file
+      file:
+        path: "e.jsonl"
+`
+	if _, err := Load(writeTemp(t, bad)); err == nil {
+		t.Fatal("expected error for invalid export format")
+	}
+}
+
+func TestExportConfig_InvalidTransportRejected(t *testing.T) {
+	bad := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+export:
+  enabled: true
+  exporters:
+    - name: bad
+      format: json
+      transport: carrier-pigeon
+`
+	if _, err := Load(writeTemp(t, bad)); err == nil {
+		t.Fatal("expected error for invalid export transport")
+	}
+}
+
+func TestExportConfig_MissingSubConfigRejected(t *testing.T) {
+	bad := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+export:
+  enabled: true
+  exporters:
+    - name: bad
+      format: cef
+      transport: syslog
+`
+	if _, err := Load(writeTemp(t, bad)); err == nil {
+		t.Fatal("expected error for export exporter missing its transport sub-config")
+	}
+}
+
+func TestExportConfig_EnabledTrueWithNoExportersRejected(t *testing.T) {
+	bad := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+export:
+  enabled: true
+`
+	if _, err := Load(writeTemp(t, bad)); err == nil {
+		t.Fatal("expected error for export.enabled true with no exporters")
+	}
+}
+
+func TestExportConfig_BufferSizeDefaultsInEventExport(t *testing.T) {
+	f, err := Load(writeTemp(t, demoYAML+`export:
+  enabled: true
+  exporters:
+    - name: a
+      format: json
+      transport: file
+      file:
+        path: "e.jsonl"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Export.Exporters[0].BufferSize != 0 {
+		t.Fatalf("buffer_size should be unset (0) when omitted from yaml, want the default to apply downstream in eventexport, got %d", f.Export.Exporters[0].BufferSize)
+	}
+	ee := f.Export.ToEventExport()
+	if got := ee.Exporters[0].BufferSize; got != 0 {
+		t.Fatalf("toEventExport should pass BufferSize through unmodified (eventexport itself defaults <=0), got %d", got)
+	}
+}

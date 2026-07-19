@@ -25,13 +25,13 @@ const httpRequestTimeout = 3 * time.Second
 // engine, a later task) can count it, but there is no retry queue.
 type httpTransport struct {
 	mu        sync.Mutex
-	cfg       httpConfig
+	cfg       HTTPConfig
 	batchSize int
 	client    *http.Client
 	buf       [][]byte
 }
 
-func newHTTPTransport(cfg httpConfig) (*httpTransport, error) {
+func newHTTPTransport(cfg HTTPConfig) (*httpTransport, error) {
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("eventexport: http transport: url required")
 	}
@@ -109,7 +109,7 @@ func (t *httpTransport) send() error {
 // setHTTPAuth reads credentials from the environment variables named in
 // auth — never from inline config values, so secrets never land in the
 // config file or logs.
-func setHTTPAuth(req *http.Request, auth httpAuthConfig) {
+func setHTTPAuth(req *http.Request, auth HTTPAuthConfig) {
 	if auth.BearerEnv != "" {
 		if tok := os.Getenv(auth.BearerEnv); tok != "" {
 			req.Header.Set("Authorization", "Bearer "+tok)

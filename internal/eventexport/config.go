@@ -28,9 +28,9 @@ type ExporterConfig struct {
 	Transport  string
 	BufferSize int
 
-	File   *fileConfig
-	Syslog *syslogConfig
-	HTTP   *httpConfig
+	File   *FileConfig
+	Syslog *SyslogConfig
+	HTTP   *HTTPConfig
 }
 
 // bufferSize returns the configured buffer size, defaulting to

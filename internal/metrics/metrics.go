@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"sync"
 	"sync/atomic"
 
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
@@ -30,7 +32,21 @@ type Metrics struct {
 	recordings, transfers            counter
 	evidenceEmitFailures             counter
 
+	// exportDropped counts events dropped by the (optional) SIEM export
+	// fan-out, keyed by exporter name. A map, not a fixed field like the
+	// counters above, because exporter names are config-driven (internal/
+	// eventexport), not a fixed known set.
+	exportDropped sync.Map // string -> *counter
+
 	activeFn func() int64
+}
+
+// IncExportDrop increments the drop counter for the named export
+// destination (internal/eventexport's onDrop callback). Safe to call
+// concurrently for any exporter name, including one seen for the first time.
+func (m *Metrics) IncExportDrop(exporter string) {
+	v, _ := m.exportDropped.LoadOrStore(exporter, &counter{})
+	v.(*counter).inc()
 }
 
 // New returns a Metrics with a zero active gauge.
@@ -139,4 +155,19 @@ func (m *Metrics) WriteText(w io.Writer) {
 	ctr("recordings_total", "Session recordings produced", m.recordings.get())
 	ctr("transfers_total", "SFTP transfers", m.transfers.get())
 	ctr("evidence_emit_failures_total", "Evidence emit failures", m.evidenceEmitFailures.get())
+
+	// exportDropped is a labeled counter (one series per exporter name), so
+	// it can't use the fixed-name ctr helper above; emit HELP/TYPE once then
+	// one line per exporter, sorted for stable output.
+	var names []string
+	m.exportDropped.Range(func(k, _ any) bool {
+		names = append(names, k.(string))
+		return true
+	})
+	sort.Strings(names)
+	fmt.Fprintf(w, "# HELP omnisag_eventexport_dropped_total Events dropped by a SIEM export destination\n# TYPE omnisag_eventexport_dropped_total counter\n")
+	for _, name := range names {
+		v, _ := m.exportDropped.Load(name)
+		fmt.Fprintf(w, "omnisag_eventexport_dropped_total{exporter=%q} %d\n", name, v.(*counter).get())
+	}
 }

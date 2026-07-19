@@ -19,40 +19,40 @@ type Transport interface {
 	Close() error
 }
 
-// fileConfig configures the file transport.
-type fileConfig struct {
+// FileConfig configures the file transport.
+type FileConfig struct {
 	Path string
 }
 
-// syslogConfig configures the syslog transport.
-type syslogConfig struct {
+// SyslogConfig configures the syslog transport.
+type SyslogConfig struct {
 	Address  string // host:port
 	Protocol string // udp | tcp | tls
 	Facility string // e.g. "local0"; defaults to local0
-	TLS      *tlsConfig
+	TLS      *TLSConfig
 }
 
-// httpAuthConfig names environment variables holding auth credentials —
+// HTTPAuthConfig names environment variables holding auth credentials —
 // never inline secrets in config.
-type httpAuthConfig struct {
+type HTTPAuthConfig struct {
 	BearerEnv string // env var holding a bearer token
 	UserEnv   string // env var holding basic-auth username
 	PassEnv   string // env var holding basic-auth password
 }
 
-// httpConfig configures the http transport.
-type httpConfig struct {
+// HTTPConfig configures the http transport.
+type HTTPConfig struct {
 	URL                  string
 	BatchSize            int
 	FlushIntervalSeconds int
-	Auth                 httpAuthConfig
-	TLS                  *tlsConfig
+	Auth                 HTTPAuthConfig
+	TLS                  *TLSConfig
 }
 
-// tlsConfig names PEM files for a client TLS connection: CA to verify the
+// TLSConfig names PEM files for a client TLS connection: CA to verify the
 // server (required for any real deployment — no InsecureSkipVerify here),
 // and an optional client Cert/Key for mutual TLS.
-type tlsConfig struct {
+type TLSConfig struct {
 	CA   string
 	Cert string
 	Key  string
@@ -61,7 +61,7 @@ type tlsConfig struct {
 // build loads the PEM files named in c into a *tls.Config suitable for a
 // client connection (syslog or http). A nil c yields the platform default
 // trust store with no client certificate.
-func (c *tlsConfig) build() (*tls.Config, error) {
+func (c *TLSConfig) build() (*tls.Config, error) {
 	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
 	if c == nil {
 		return cfg, nil

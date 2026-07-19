@@ -11,6 +11,12 @@ import (
 // to zero or more export destinations (SIEM/log-management). The durable
 // sink is authoritative: Emit's outcome is entirely determined by
 // inner.Emit — a slow or broken exporter can never stall or fail it.
+//
+// ForwardingSink is the single-sink case: one inner, one exporter set it
+// alone owns. When a deployment has multiple durable sinks that must share
+// ONE exporter set (e.g. a gateway's separate dialer/session sinks — see
+// Fanout), build a Fanout directly and Wrap each sink instead of calling New
+// per sink, which would otherwise open the SIEM connections twice.
 type ForwardingSink struct {
 	inner     evidence.Sink
 	exporters []*asyncExporter
@@ -29,23 +35,42 @@ type ForwardingSink struct {
 // On any build error, exporters already built (and started) for earlier
 // entries in cfg.Exporters are shut down before returning, so a partial
 // failure never leaks a goroutine or an open transport connection.
+//
+// New and NewFanout share the same build/validate logic (buildExporters);
+// New just keeps the resulting exporter set private to a single sink instead
+// of exposing it for reuse across sinks.
 func New(inner evidence.Sink, cfg Config, onDrop func(exporterName string)) (*ForwardingSink, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &ForwardingSink{inner: inner, ctx: ctx, cancel: cancel}
+	exporters, err := buildExporters(ctx, cfg, onDrop)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &ForwardingSink{inner: inner, exporters: exporters, ctx: ctx, cancel: cancel}, nil
+}
 
+// buildExporters builds and starts (under ctx) one asyncExporter per entry
+// in cfg.Exporters, in order. It is the single build/validate path shared by
+// New (one sink, private exporter set) and NewFanout (N sinks, one shared
+// exporter set) — an unknown format/transport, or a transport missing its
+// matching sub-config, is a boot error. On any error, exporters already
+// started for earlier entries are shut down before returning, so a partial
+// failure never leaks a goroutine or an open transport connection; the
+// caller does not need to (and must not) shut them down again.
+func buildExporters(ctx context.Context, cfg Config, onDrop func(exporterName string)) ([]*asyncExporter, error) {
+	var exporters []*asyncExporter
 	for _, ec := range cfg.Exporters {
 		x, err := buildExporter(ec, onDrop)
 		if err != nil {
-			for _, built := range s.exporters {
+			for _, built := range exporters {
 				built.shutdown()
 			}
-			cancel()
 			return nil, fmt.Errorf("eventexport: exporter %q: %w", ec.Name, err)
 		}
 		x.start(ctx)
-		s.exporters = append(s.exporters, x)
+		exporters = append(exporters, x)
 	}
-	return s, nil
+	return exporters, nil
 }
 
 func buildExporter(ec ExporterConfig, onDrop func(exporterName string)) (*asyncExporter, error) {

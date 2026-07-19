@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/rupivbluegreen/omni-sag/internal/eventexport"
 	"github.com/rupivbluegreen/omni-sag/internal/fips"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 	"gopkg.in/yaml.v3"
@@ -29,6 +30,7 @@ type File struct {
 	PolicySrc  *PolicySource     `yaml:"policy_source"` // optional; hot-reload policy from a file
 	Metrics    *MetricsConfig    `yaml:"metrics"`       // optional Prometheus /metrics listener (out-of-band)
 	FIPS       *FIPSConfig       `yaml:"fips"`          // optional FIPS-readiness posture (off|warn|enforce)
+	Export     *ExportConfig     `yaml:"export"`        // optional real-time event export to a SIEM (opt-in, default off)
 	DrainGrace int               `yaml:"drain_grace_seconds"`
 	Policy     PolicyConfig      `yaml:"policy"`
 
@@ -56,6 +58,131 @@ type File struct {
 // listener separate from the SSH data path.
 type MetricsConfig struct {
 	Listen string `yaml:"listen"` // e.g. ":9090"
+}
+
+// ExportConfig configures real-time event export to SIEM/log-management
+// destinations (internal/eventexport). Opt-in: nil, or Enabled: false,
+// leaves the gateway byte-for-byte as before this feature — no fan-out
+// wrapping, no exporter goroutines.
+type ExportConfig struct {
+	Enabled   bool           `yaml:"enabled"`
+	Exporters []ExporterSpec `yaml:"exporters"`
+}
+
+// ExporterSpec is one export destination: a format + transport pair plus
+// the transport sub-config matching Transport.
+type ExporterSpec struct {
+	Name       string `yaml:"name"`
+	Format     string `yaml:"format"`      // json | ecs | cef
+	Transport  string `yaml:"transport"`   // file | syslog | http
+	BufferSize int    `yaml:"buffer_size"` // <=0 (incl. unset) defaults in eventexport
+
+	File   *ExportFileConfig   `yaml:"file"`
+	Syslog *ExportSyslogConfig `yaml:"syslog"`
+	HTTP   *ExportHTTPConfig   `yaml:"http"`
+}
+
+// ExportFileConfig configures the file transport.
+type ExportFileConfig struct {
+	Path string `yaml:"path"`
+}
+
+// ExportSyslogConfig configures the syslog transport.
+type ExportSyslogConfig struct {
+	Address  string           `yaml:"address"`  // host:port
+	Protocol string           `yaml:"protocol"` // udp | tcp | tls
+	Facility string           `yaml:"facility"` // e.g. "local0"
+	TLS      *ExportTLSConfig `yaml:"tls"`
+}
+
+// ExportHTTPAuthConfig names environment variables holding auth
+// credentials — never inline secrets in config.
+type ExportHTTPAuthConfig struct {
+	BearerEnv string `yaml:"bearer_env"`
+	UserEnv   string `yaml:"user_env"`
+	PassEnv   string `yaml:"pass_env"`
+}
+
+// ExportHTTPConfig configures the http transport.
+type ExportHTTPConfig struct {
+	URL                  string               `yaml:"url"`
+	BatchSize            int                  `yaml:"batch_size"`
+	FlushIntervalSeconds int                  `yaml:"flush_interval_seconds"`
+	Auth                 ExportHTTPAuthConfig `yaml:"auth"`
+	TLS                  *ExportTLSConfig     `yaml:"tls"`
+}
+
+// ExportTLSConfig names PEM files for a client TLS connection.
+type ExportTLSConfig struct {
+	CA   string `yaml:"ca"`
+	Cert string `yaml:"cert"`
+	Key  string `yaml:"key"`
+}
+
+// ToEventExport maps ec (the config yaml shape) into eventexport.Config (the
+// package eventexport.NewFanout/eventexport.New are built from). A nil ec
+// yields a zero-value, disabled Config. Exported so cmd/omni-sag can call it
+// when wiring the gateway's evidence sinks through an eventexport.Fanout.
+func (ec *ExportConfig) ToEventExport() eventexport.Config {
+	if ec == nil {
+		return eventexport.Config{}
+	}
+	out := eventexport.Config{Enabled: ec.Enabled}
+	for _, e := range ec.Exporters {
+		out.Exporters = append(out.Exporters, eventexport.ExporterConfig{
+			Name:       e.Name,
+			Format:     e.Format,
+			Transport:  e.Transport,
+			BufferSize: e.BufferSize,
+			File:       e.File.toEventExport(),
+			Syslog:     e.Syslog.toEventExport(),
+			HTTP:       e.HTTP.toEventExport(),
+		})
+	}
+	return out
+}
+
+func (c *ExportFileConfig) toEventExport() *eventexport.FileConfig {
+	if c == nil {
+		return nil
+	}
+	return &eventexport.FileConfig{Path: c.Path}
+}
+
+func (c *ExportSyslogConfig) toEventExport() *eventexport.SyslogConfig {
+	if c == nil {
+		return nil
+	}
+	return &eventexport.SyslogConfig{
+		Address:  c.Address,
+		Protocol: c.Protocol,
+		Facility: c.Facility,
+		TLS:      c.TLS.toEventExport(),
+	}
+}
+
+func (c *ExportHTTPConfig) toEventExport() *eventexport.HTTPConfig {
+	if c == nil {
+		return nil
+	}
+	return &eventexport.HTTPConfig{
+		URL:                  c.URL,
+		BatchSize:            c.BatchSize,
+		FlushIntervalSeconds: c.FlushIntervalSeconds,
+		Auth: eventexport.HTTPAuthConfig{
+			BearerEnv: c.Auth.BearerEnv,
+			UserEnv:   c.Auth.UserEnv,
+			PassEnv:   c.Auth.PassEnv,
+		},
+		TLS: c.TLS.toEventExport(),
+	}
+}
+
+func (c *ExportTLSConfig) toEventExport() *eventexport.TLSConfig {
+	if c == nil {
+		return nil
+	}
+	return &eventexport.TLSConfig{CA: c.CA, Cert: c.Cert, Key: c.Key}
 }
 
 // DrainGraceSeconds returns the rolling-upgrade drain grace period (default 30s).
@@ -383,6 +510,50 @@ func (f *File) validate() error {
 	}
 	if err := f.validateFIPS(); err != nil {
 		return err
+	}
+	if ex := f.Export; ex != nil && ex.Enabled {
+		if err := validateExportConfig(ex); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateExportConfig rejects a semantically-invalid export block: an
+// enabled export with no exporters, an exporter with an unknown
+// format/transport, or a transport missing its matching sub-config. Only
+// runs when export.enabled is true — a disabled/absent block is never
+// validated, matching the opt-in posture (see other optional *.Enabled
+// blocks, e.g. Inspection).
+func validateExportConfig(ex *ExportConfig) error {
+	if len(ex.Exporters) == 0 {
+		return fmt.Errorf("config: export.enabled is true but export.exporters is empty")
+	}
+	for _, e := range ex.Exporters {
+		if e.Name == "" {
+			return fmt.Errorf("config: export exporter with empty name")
+		}
+		switch e.Format {
+		case "json", "ecs", "cef":
+		default:
+			return fmt.Errorf("config: export exporter %q has invalid format %q (want json|ecs|cef)", e.Name, e.Format)
+		}
+		switch e.Transport {
+		case "file":
+			if e.File == nil {
+				return fmt.Errorf("config: export exporter %q transport %q requires a file block", e.Name, e.Transport)
+			}
+		case "syslog":
+			if e.Syslog == nil {
+				return fmt.Errorf("config: export exporter %q transport %q requires a syslog block", e.Name, e.Transport)
+			}
+		case "http":
+			if e.HTTP == nil {
+				return fmt.Errorf("config: export exporter %q transport %q requires an http block", e.Name, e.Transport)
+			}
+		default:
+			return fmt.Errorf("config: export exporter %q has invalid transport %q (want file|syslog|http)", e.Name, e.Transport)
+		}
 	}
 	return nil
 }

@@ -51,14 +51,14 @@ func syslogFacilityNumber(name string) int {
 // and never panics.
 type syslogTransport struct {
 	mu       sync.Mutex
-	cfg      syslogConfig
+	cfg      SyslogConfig
 	tlsCfg   *tls.Config
 	pri      int
 	hostname string
 	conn     net.Conn
 }
 
-func newSyslogTransport(cfg syslogConfig) (*syslogTransport, error) {
+func newSyslogTransport(cfg SyslogConfig) (*syslogTransport, error) {
 	switch cfg.Protocol {
 	case "udp", "tcp", "tls":
 	default:

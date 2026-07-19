@@ -17,7 +17,7 @@ type fileTransport struct {
 	w  *bufio.Writer
 }
 
-func newFileTransport(cfg fileConfig) (*fileTransport, error) {
+func newFileTransport(cfg FileConfig) (*fileTransport, error) {
 	if cfg.Path == "" {
 		return nil, fmt.Errorf("eventexport: file transport: path required")
 	}

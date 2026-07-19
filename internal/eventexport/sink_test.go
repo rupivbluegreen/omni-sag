@@ -41,8 +41,8 @@ func TestForwardingSink_FanOutAndDurableAuthoritative(t *testing.T) {
 
 	inner := evidence.NewMemSink()
 	cfg := Config{Enabled: true, Exporters: []ExporterConfig{
-		{Name: "a", Format: "json", Transport: "file", File: &fileConfig{Path: fileA}},
-		{Name: "b", Format: "cef", Transport: "file", File: &fileConfig{Path: fileB}},
+		{Name: "a", Format: "json", Transport: "file", File: &FileConfig{Path: fileA}},
+		{Name: "b", Format: "cef", Transport: "file", File: &FileConfig{Path: fileB}},
 	}}
 	fs, err := New(inner, cfg, func(string) {})
 	if err != nil {
@@ -116,7 +116,7 @@ func TestForwardingSink_BrokenExporterNeverFailsEmit(t *testing.T) {
 func TestForwardingSink_New_UnknownFormat(t *testing.T) {
 	inner := evidence.NewMemSink()
 	cfg := Config{Exporters: []ExporterConfig{
-		{Name: "a", Format: "bogus", Transport: "file", File: &fileConfig{Path: filepath.Join(t.TempDir(), "e.jsonl")}},
+		{Name: "a", Format: "bogus", Transport: "file", File: &FileConfig{Path: filepath.Join(t.TempDir(), "e.jsonl")}},
 	}}
 	fs, err := New(inner, cfg, func(string) {})
 	if err == nil {
@@ -166,7 +166,7 @@ func TestForwardingSink_New_PartialBuildFailureDoesNotLeakOrPanic(t *testing.T) 
 	inner := evidence.NewMemSink()
 	goodPath := filepath.Join(t.TempDir(), "good.jsonl")
 	cfg := Config{Exporters: []ExporterConfig{
-		{Name: "good", Format: "json", Transport: "file", File: &fileConfig{Path: goodPath}},
+		{Name: "good", Format: "json", Transport: "file", File: &FileConfig{Path: goodPath}},
 		{Name: "bad", Format: "json", Transport: "syslog", Syslog: nil},
 	}}
 	fs, err := New(inner, cfg, func(string) {})
@@ -181,7 +181,7 @@ func TestForwardingSink_New_PartialBuildFailureDoesNotLeakOrPanic(t *testing.T) 
 func TestForwardingSink_Config_BufferSizeDefault(t *testing.T) {
 	inner := evidence.NewMemSink()
 	cfg := Config{Exporters: []ExporterConfig{
-		{Name: "a", Format: "json", Transport: "file", File: &fileConfig{Path: filepath.Join(t.TempDir(), "e.jsonl")}},
+		{Name: "a", Format: "json", Transport: "file", File: &FileConfig{Path: filepath.Join(t.TempDir(), "e.jsonl")}},
 	}}
 	fs, err := New(inner, cfg, func(string) {})
 	if err != nil {
@@ -200,7 +200,7 @@ func TestForwardingSink_Config_BufferSizeDefault(t *testing.T) {
 func TestForwardingSink_Config_BufferSizeExplicit(t *testing.T) {
 	inner := evidence.NewMemSink()
 	cfg := Config{Exporters: []ExporterConfig{
-		{Name: "a", Format: "json", Transport: "file", BufferSize: 5, File: &fileConfig{Path: filepath.Join(t.TempDir(), "e.jsonl")}},
+		{Name: "a", Format: "json", Transport: "file", BufferSize: 5, File: &FileConfig{Path: filepath.Join(t.TempDir(), "e.jsonl")}},
 	}}
 	fs, err := New(inner, cfg, func(string) {})
 	if err != nil {
