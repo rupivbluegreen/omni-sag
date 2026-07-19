@@ -251,6 +251,103 @@ func TestAuthenticate_Success(t *testing.T) {
 	}
 }
 
+// --- nested-group (LDAP_MATCHING_RULE_IN_CHAIN) fixtures ---
+//
+// The nested resolver sends an extensibleMatch filter — a shape the equality-
+// only serveFakeLDAPConn above does not answer — so it gets its own fake
+// server that distinguishes the two searches: the equality user lookup returns
+// the direct memberOf entry; the extensibleMatch in-chain search returns one
+// SearchResultEntry per transitive group (objectName = the group DN, which is
+// all nestedGroupCNs reads).
+
+func startFakeLDAPServerNested(t *testing.T, username, userDN string, direct, nestedDNs []string) string {
+	t.Helper()
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{fakeLDAPCert(t)}})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go serveFakeLDAPConnNested(conn, username, userDN, direct, nestedDNs)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func serveFakeLDAPConnNested(conn net.Conn, username, userDN string, direct, nestedDNs []string) {
+	defer conn.Close()
+	for {
+		req, err := ber.ReadPacket(conn)
+		if err != nil {
+			return
+		}
+		if len(req.Children) < 2 {
+			return
+		}
+		msgID := req.Children[0].Value.(int64)
+		op := req.Children[1]
+		switch op.Tag {
+		case ldap.ApplicationBindRequest:
+			writeBERPacket(conn, ldapResultEnvelope(msgID, ldap.ApplicationBindResponse))
+		case ldap.ApplicationSearchRequest:
+			if len(op.Children) >= 7 && op.Children[6].Tag == ber.Tag(ldap.FilterExtensibleMatch) {
+				// In-chain search: one entry per transitive group DN.
+				for _, gdn := range nestedDNs {
+					writeBERPacket(conn, searchResultEntryEnvelope(msgID, gdn, nil))
+				}
+			} else if searchFilterValue(op) == username {
+				// Equality user lookup: the user entry with its direct memberOf.
+				writeBERPacket(conn, searchResultEntryEnvelope(msgID, userDN, direct))
+			}
+			writeBERPacket(conn, ldapResultEnvelope(msgID, ldap.ApplicationSearchResultDone))
+		default:
+			return
+		}
+	}
+}
+
+// TestAuthenticate_NestedGroups contrasts the two resolution modes against the
+// same directory: direct memberOf sees only the global group, while
+// NestedGroups resolves the transitive set including domain-local groups a
+// user holds through nesting.
+func TestAuthenticate_NestedGroups(t *testing.T) {
+	const username, userDN = "alice", "CN=alice,DC=lab,DC=local"
+	direct := []string{"CN=global-team,OU=Groups,DC=lab,DC=local"}
+	nestedDNs := []string{
+		"CN=global-team,OU=Groups,DC=lab,DC=local",
+		"CN=local-db-admins,OU=Groups,DC=lab,DC=local",
+		"CN=local-ops,OU=Groups,DC=lab,DC=local",
+	}
+	addr := startFakeLDAPServerNested(t, username, userDN, direct, nestedDNs)
+	base := testLDAPConfig(addr)
+
+	// Direct memberOf only: the nested domain-local groups are invisible.
+	id, err := NewLDAP(base).Authenticate(context.Background(), username, "pw")
+	if err != nil {
+		t.Fatalf("Authenticate (direct): %v", err)
+	}
+	if want := []string{"global-team"}; !reflect.DeepEqual(id.Groups, want) {
+		t.Fatalf("direct: got %v, want %v", id.Groups, want)
+	}
+
+	// NestedGroups: transitive membership resolves the nested groups too.
+	nestedCfg := base
+	nestedCfg.NestedGroups = true
+	idn, err := NewLDAP(nestedCfg).Authenticate(context.Background(), username, "pw")
+	if err != nil {
+		t.Fatalf("Authenticate (nested): %v", err)
+	}
+	want := []string{"global-team", "local-db-admins", "local-ops"}
+	if !reflect.DeepEqual(idn.Groups, want) {
+		t.Fatalf("nested: got %v, want %v", idn.Groups, want)
+	}
+}
+
 // TestAuthenticate_DecoyBindOnUserNotFound guards the username-enumeration
 // countermeasure the refactor must not disturb: a nonexistent user must
 // still incur a second (decoy) bind, matching the round-trip count of a

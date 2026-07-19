@@ -227,6 +227,12 @@ type LDAPConfig struct {
 	BindPassword string `yaml:"bind_password"` // service account password
 	UserFilter   string `yaml:"user_filter"`   // e.g. (sAMAccountName=%s)
 	InsecureTLS  bool   `yaml:"insecure_tls"`  // dev only: skip cert verification
+	// NestedGroups resolves transitive/AGDLP-nested group membership via AD's
+	// LDAP_MATCHING_RULE_IN_CHAIN instead of reading the direct memberOf
+	// attribute only. Off by default; enable when roles bind to domain-local
+	// groups a user holds through nesting (what `id -nG` sees but a direct
+	// memberOf read does not).
+	NestedGroups bool `yaml:"nested_groups"`
 }
 
 // PolicyConfig is the YAML shape of the policy document.
