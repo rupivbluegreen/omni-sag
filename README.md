@@ -52,11 +52,16 @@ That's not a mockup — it's a real recorded run: **[▶ watch it live](https://
 Exact features, minimal fluff — every line below is backed by code, not a roadmap slide.
 
 **🔐 AD + MFA** — LDAPS bind against Active Directory, then RADIUS MS-CHAPv2 as a second factor
-(never PAP; interactive OTP fails closed over the SSH password path since it can't prompt).
+(never PAP; interactive OTP fails closed over the SSH password path since it can't prompt). Roles
+bind to AD groups; set `ldap.nested_groups` to resolve transitive (AGDLP-nested) membership via
+AD's `tokenGroups` — matching what `id -nG` sees rather than only a direct `memberOf` read, and
+cheap even for users in many groups (default off).
 ```yaml
 mfa:
   enabled: true
   radius: { server: "radius.corp.local:1812", secret: "...", nas_identifier: "omni-sag" }
+ldap:
+  nested_groups: true    # resolve transitive/AGDLP group membership (default off)
 ```
 
 **🖥️ Real shell & SFTP on the target** — `user%host` in the SSH username picks a real target; the
@@ -67,7 +72,9 @@ $ ssh 'alice%db1.lab.local'@gateway -p 2222
 $ sftp 'alice%db1.lab.local'@gateway -P 2222
 ```
 The matching policy rule must resolve to exactly one host and one port (ambiguous matches fail
-closed, not "pick one").
+closed, not "pick one"). When a host is reachable through more than one of your roles the match is
+ambiguous — add a `+pcode` selector (the policy role name) to choose which role the session runs
+under: `ssh 'alice+dba%db1.lab.local'@gateway`.
 
 **🚇 Port forwarding** — `-L` tunnels are policy-gated per host:port; `-D` dynamic SOCKS forwarding
 rides the same `direct-tcpip` channel, and `-J` ProxyJump works too (a jump is just another
@@ -77,6 +84,10 @@ $ ssh -L 5432:db1.lab.local:5432 alice@gateway
 $ ssh -D 1080 alice@gateway
 $ ssh -J alice@gateway alice@db1.lab.local
 ```
+Running `-L` without `-N` keeps the session open as a keeper window that announces each forward as
+it comes up (`tunnel open → host:port`) and reminds you to leave it open — close it to tear the
+tunnels down. The `+pcode` selector applies to tunnels too: `ssh -L … alice+dba@gateway`.
+
 `scp` works out of the box for any current OpenSSH client — it defaults to the SFTP protocol
 under the hood, served by the same real shell/SFTP path above. The legacy exec-based protocol
 (`scp -O`) is also supported, single file only (no `-r`), but is opt-in — set `enable_scp: true`
