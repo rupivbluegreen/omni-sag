@@ -13,9 +13,12 @@ import (
 const defaultFlushInterval = time.Minute
 
 // drainTimeout bounds how long shutdown waits for buffered events to be
-// formatted+written and the transport flushed, so a stuck Transport.Write
-// (a dead destination) can't hang shutdown forever.
-const drainTimeout = 2 * time.Second
+// formatted+written and the transport flushed+closed, so a stuck
+// Transport.Write/Flush/Close (a dead destination) can't hang shutdown
+// forever. Must exceed the largest Transport's own per-op timeout
+// (httpRequestTimeout, 3s) so a normal in-flight Write completes during
+// shutdown rather than being abandoned mid-drain.
+const drainTimeout = 5 * time.Second
 
 // asyncExporter ties a Formatter and Transport together behind a bounded,
 // non-blocking buffer, formatting and writing in its own goroutine so the
@@ -95,7 +98,6 @@ func (a *asyncExporter) run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			a.drainAndFlush(&loggedFormatErr, &loggedWriteErr)
-			_ = a.tr.Close()
 			return
 		case e := <-a.buf:
 			a.process(e, &loggedFormatErr, &loggedWriteErr)
@@ -127,11 +129,22 @@ func (a *asyncExporter) process(e evidence.Event, loggedFormatErr, loggedWriteEr
 	}
 }
 
-// drainAndFlush best-effort drains whatever is currently buffered and
-// flushes the transport, bounded by drainTimeout: the work runs in its own
-// goroutine so a Transport.Write stuck on a dead destination can't hang the
-// caller past the deadline — draining just stops there, and the transport
-// is still closed by the caller afterward.
+// drainAndFlush best-effort drains whatever is currently buffered, flushes,
+// and closes the transport — all inside one sub-goroutine raced against
+// drainTimeout, so a Transport.Write/Flush/Close stuck on a dead
+// destination can't hang the caller past the deadline. Running Close in the
+// same goroutine, after the drain loop and Flush, also means it never runs
+// concurrently with a still-in-flight Write/Flush from this exporter, which
+// could otherwise produce a duplicate/out-of-order request to the
+// destination.
+//
+// If the bound is hit, the sub-goroutine may still be stuck (and will run
+// to completion, including Close, whenever/if the transport call it's
+// blocked on returns — this is an accepted leak for a truly pathological
+// transport). Whatever's still sitting in a.buf at that point was never
+// handed to it, so it's drained here, non-blockingly, and counted as
+// dropped — otherwise the drop metric would silently undercount just
+// because the transport got abandoned.
 func (a *asyncExporter) drainAndFlush(loggedFormatErr, loggedWriteErr *bool) {
 	done := make(chan struct{})
 	go func() {
@@ -146,9 +159,18 @@ func (a *asyncExporter) drainAndFlush(loggedFormatErr, loggedWriteErr *bool) {
 			}
 		}
 		_ = a.tr.Flush()
+		_ = a.tr.Close()
 	}()
 	select {
 	case <-done:
 	case <-time.After(drainTimeout):
+		for {
+			select {
+			case <-a.buf:
+				a.onDrop()
+			default:
+				return
+			}
+		}
 	}
 }

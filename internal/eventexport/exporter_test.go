@@ -98,6 +98,53 @@ type errFormatter struct{}
 func (errFormatter) Format(evidence.Event) ([]byte, error) { return nil, errors.New("format boom") }
 func (errFormatter) ContentType() string                   { return "text/plain" }
 
+// slowWriteTransport's Write sleeps briefly before recording, simulating a
+// transport that's slow but comfortably within drainTimeout — used to prove
+// the drain budget tolerates a non-instant Write instead of abandoning it.
+type slowWriteTransport struct {
+	mu       sync.Mutex
+	delay    time.Duration
+	payloads [][]byte
+}
+
+func (s *slowWriteTransport) Write(p []byte) error {
+	time.Sleep(s.delay)
+	s.mu.Lock()
+	s.payloads = append(s.payloads, append([]byte(nil), p...))
+	s.mu.Unlock()
+	return nil
+}
+func (s *slowWriteTransport) Flush() error { return nil }
+func (s *slowWriteTransport) Close() error { return nil }
+func (s *slowWriteTransport) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.payloads)
+}
+
+// hangCloseTransport's Write/Flush succeed immediately; Close blocks
+// forever — used to prove a hung Close can't hang the drain past
+// drainTimeout now that Close runs inside the same bounded race as
+// Write/Flush.
+type hangCloseTransport struct {
+	mu       sync.Mutex
+	payloads [][]byte
+}
+
+func (h *hangCloseTransport) Write(p []byte) error {
+	h.mu.Lock()
+	h.payloads = append(h.payloads, append([]byte(nil), p...))
+	h.mu.Unlock()
+	return nil
+}
+func (h *hangCloseTransport) Flush() error { return nil }
+func (h *hangCloseTransport) Close() error { select {} }
+func (h *hangCloseTransport) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.payloads)
+}
+
 func waitFor(t *testing.T, d time.Duration, cond func() bool) {
 	t.Helper()
 	withTimeout(t, d, func() {
@@ -277,4 +324,77 @@ func TestAsyncExporter_CtxCancelAlsoDrainsAndCloses(t *testing.T) {
 	if !closed {
 		t.Fatal("transport not closed on ctx cancel")
 	}
+}
+
+// TestAsyncExporter_DrainAndFlushCompletesWriteWithinBudget and
+// TestAsyncExporter_DrainAndFlushCountsAbandonedBufferedEventsOnTimeout call
+// drainAndFlush directly instead of going through start/shutdown. Reaching
+// this exact scenario (an event already sitting in a.buf when the drain
+// races a slow-or-stuck Write) via the public API would be racy: run()'s
+// select doesn't guarantee whether a buffered event is picked up by the
+// normal per-event case or ends up in drainAndFlush's own loop, and only
+// the latter is what's under test here.
+
+func TestAsyncExporter_DrainAndFlushCompletesWriteWithinBudget(t *testing.T) {
+	tr := &slowWriteTransport{delay: 700 * time.Millisecond}
+	var drops int32
+	a := newAsyncExporter("t", jsonFormatter{}, tr, 10, time.Hour, func() { atomic.AddInt32(&drops, 1) })
+
+	a.buf <- evidence.Event{User: "slow"}
+
+	var loggedFormatErr, loggedWriteErr bool
+	withTimeout(t, drainTimeout+2*time.Second, func() {
+		a.drainAndFlush(&loggedFormatErr, &loggedWriteErr)
+	})
+
+	if got := tr.count(); got != 1 {
+		t.Fatalf("transport received %d payloads, want 1 (a Write well under drainTimeout must complete, not be abandoned)", got)
+	}
+	if got := atomic.LoadInt32(&drops); got != 0 {
+		t.Fatalf("drops = %d, want 0 (a completed Write must not be counted as dropped)", got)
+	}
+}
+
+func TestAsyncExporter_DrainAndFlushCountsAbandonedBufferedEventsOnTimeout(t *testing.T) {
+	tr := newBlockingTransport() // Write blocks forever: tr.unblock is never closed
+	var drops int32
+	a := newAsyncExporter("t", jsonFormatter{}, tr, 10, time.Hour, func() { atomic.AddInt32(&drops, 1) })
+
+	const n = 4
+	for i := 0; i < n; i++ {
+		a.buf <- evidence.Event{User: fmt.Sprintf("u%d", i)}
+	}
+
+	var loggedFormatErr, loggedWriteErr bool
+	withTimeout(t, drainTimeout+2*time.Second, func() {
+		a.drainAndFlush(&loggedFormatErr, &loggedWriteErr)
+	})
+
+	// Event 0 is picked up and stuck forever in Write; events 1-3 are still
+	// sitting in a.buf when drainTimeout fires and must be drained
+	// non-blockingly and counted as dropped rather than silently lost.
+	if got := atomic.LoadInt32(&drops); got != n-1 {
+		t.Fatalf("drops = %d, want %d (abandoned buffered events must be counted)", got, n-1)
+	}
+	if remaining := len(a.buf); remaining != 0 {
+		t.Fatalf("a.buf has %d items left, want 0 (timeout branch must drain whatever's buffered)", remaining)
+	}
+}
+
+func TestAsyncExporter_ShutdownBoundedWhenCloseHangs(t *testing.T) {
+	tr := &hangCloseTransport{}
+	a := newAsyncExporter("t", jsonFormatter{}, tr, 10, time.Hour, func() {})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.start(ctx)
+
+	a.offer(evidence.Event{User: "one"})
+	waitFor(t, 2*time.Second, func() bool { return tr.count() == 1 })
+
+	// tr.Close blocks forever; shutdown must still return within its bound
+	// instead of hanging on a stuck Close. This leaks the goroutine stuck
+	// in Close for the life of the test binary — an accepted trade-off,
+	// same as a Write that never returns (see package doc on
+	// drainAndFlush).
+	withTimeout(t, drainTimeout+2*time.Second, func() { a.shutdown() })
 }
