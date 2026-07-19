@@ -29,7 +29,26 @@ type LDAPConfig struct {
 	BindPassword string // service account password
 	UserFilter   string // printf with one %s for the username, e.g. (sAMAccountName=%s)
 	InsecureTLS  bool   // dev only: skip server certificate verification
+	NestedGroups bool   // resolve transitive/nested group membership (see resolveGroups)
 }
+
+// ldapMatchingRuleInChain is Active Directory's LDAP_MATCHING_RULE_IN_CHAIN
+// OID. Applied to the "member" attribute it walks nested group membership
+// transitively, so the gateway resolves the full chain of memberOf groups
+// rather than only a user's direct memberOf values. The result is a superset
+// of a direct memberOf read; note it still excludes the primaryGroupID-based
+// primary group (e.g. Domain Users), which SSSD's `id -nG` does include. Used
+// when NestedGroups is set; see resolveGroups.
+const ldapMatchingRuleInChain = "1.2.840.113556.1.4.1941"
+
+// maxNestedGroups is the server-side size-limit hint sent with the in-chain
+// group search (go-ldap leaves client-side EnforceSizeLimit off, so this is
+// not a hard client cap). It is set well above realistic heavy-user membership
+// — which runs to the hundreds — so it never denies a real user. Note real AD
+// also enforces its own MaxPageSize (default ~1000) on a non-paged search, so
+// the effective ceiling is min(this, ~1000); a directory returning more makes
+// Search error, failing the login closed rather than under-resolving groups.
+const maxNestedGroups = 4096
 
 // LDAPAuthenticator authenticates against Active Directory over LDAPS.
 //
@@ -81,8 +100,78 @@ func (a *LDAPAuthenticator) Authenticate(ctx context.Context, username, password
 		return Identity{}, fmt.Errorf("%w: user bind: %v", ErrAuth, err)
 	}
 
-	groups := groupCNsFromMemberOf(entry.GetAttributeValues("memberOf"))
+	groups, err := a.resolveGroups(ctx, conn, entry)
+	if err != nil {
+		return Identity{}, err
+	}
 	return Identity{User: username, Groups: groups}, nil
+}
+
+// resolveGroups returns the CNs of the groups the user (entry) belongs to.
+// Direct memberOf by default; with NestedGroups it instead runs an
+// LDAP_MATCHING_RULE_IN_CHAIN search on the user's DN so transitive/AGDLP
+// (e.g. domain-local) memberships resolve too. The chain result is a superset
+// of memberOf WITHIN BaseDN's domain, so it fully replaces the direct read
+// when enabled. Caveat for multi-domain forests: a foreign-security-principal
+// group rooted outside BaseDN can appear in a direct memberOf read but is not
+// returned by this BaseDN-scoped search; harmless for a single-domain directory.
+func (a *LDAPAuthenticator) resolveGroups(ctx context.Context, conn *ldap.Conn, entry *ldap.Entry) ([]string, error) {
+	if !a.cfg.NestedGroups {
+		return groupCNsFromMemberOf(entry.GetAttributeValues("memberOf")), nil
+	}
+	// The in-chain search needs directory read rights. In Authenticate the
+	// connection is currently bound as the (possibly low-privilege) user from
+	// the password check, so re-bind as the service account first; in Groups()
+	// it is already service-bound and this is a harmless no-op re-bind.
+	if err := conn.Bind(a.cfg.BindDN, a.cfg.BindPassword); err != nil {
+		return nil, fmt.Errorf("%w: service re-bind for nested groups: %v", ErrAuth, err)
+	}
+	return a.nestedGroupCNs(ctx, conn, entry.DN)
+}
+
+// nestedGroupCNs returns the CN of every group that has userDN as a member,
+// following nested membership via LDAP_MATCHING_RULE_IN_CHAIN. One extra
+// subtree search per login; only reached when NestedGroups is set.
+func (a *LDAPAuthenticator) nestedGroupCNs(ctx context.Context, conn *ldap.Conn, userDN string) ([]string, error) {
+	timeout := defaultLDAPTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(dl); remaining > 0 && remaining < timeout {
+			timeout = remaining
+		}
+	}
+	conn.SetTimeout(timeout)
+	searchSecs := int(timeout.Seconds())
+	if searchSecs < 1 {
+		searchSecs = 1
+	}
+
+	// Match groups whose (nested) member is this user. The DN is a filter
+	// assertion value, so it must be filter-escaped.
+	filter := fmt.Sprintf("(member:%s:=%s)", ldapMatchingRuleInChain, ldap.EscapeFilter(userDN))
+	req := ldap.NewSearchRequest(
+		a.cfg.BaseDN,
+		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, maxNestedGroups, searchSecs, false,
+		filter,
+		[]string{"cn"},
+		nil,
+	)
+	res, err := conn.Search(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: nested group search: %v", ErrAuth, err)
+	}
+	out := make([]string, 0, len(res.Entries))
+	for _, e := range res.Entries {
+		// Take the CN from the group's DN (RDN) so the value matches exactly
+		// what groupCNsFromMemberOf produces; fall back to the cn attribute.
+		if cns := groupCNsFromMemberOf([]string{e.DN}); len(cns) > 0 {
+			out = append(out, cns...)
+			continue
+		}
+		if cn := e.GetAttributeValue("cn"); cn != "" {
+			out = append(out, cn)
+		}
+	}
+	return out, nil
 }
 
 // lookupUser binds as the service account and searches for username,
@@ -151,7 +240,7 @@ func (a *LDAPAuthenticator) Groups(ctx context.Context, username string) ([]stri
 	if err != nil {
 		return nil, err
 	}
-	return groupCNsFromMemberOf(entry.GetAttributeValues("memberOf")), nil
+	return a.resolveGroups(ctx, conn, entry)
 }
 
 // groupCNsFromMemberOf extracts the CN component from each AD group DN in a
