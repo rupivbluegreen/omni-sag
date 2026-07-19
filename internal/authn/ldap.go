@@ -32,23 +32,11 @@ type LDAPConfig struct {
 	NestedGroups bool   // resolve transitive/nested group membership (see resolveGroups)
 }
 
-// ldapMatchingRuleInChain is Active Directory's LDAP_MATCHING_RULE_IN_CHAIN
-// OID. Applied to the "member" attribute it walks nested group membership
-// transitively, so the gateway resolves the full chain of memberOf groups
-// rather than only a user's direct memberOf values. The result is a superset
-// of a direct memberOf read; note it still excludes the primaryGroupID-based
-// primary group (e.g. Domain Users), which SSSD's `id -nG` does include. Used
-// when NestedGroups is set; see resolveGroups.
-const ldapMatchingRuleInChain = "1.2.840.113556.1.4.1941"
-
-// maxNestedGroups is the server-side size-limit hint sent with the in-chain
-// group search (go-ldap leaves client-side EnforceSizeLimit off, so this is
-// not a hard client cap). It is set well above realistic heavy-user membership
-// — which runs to the hundreds — so it never denies a real user. Note real AD
-// also enforces its own MaxPageSize (default ~1000) on a non-paged search, so
-// the effective ceiling is min(this, ~1000); a directory returning more makes
-// Search error, failing the login closed rather than under-resolving groups.
-const maxNestedGroups = 4096
+// sidResolveBatch bounds how many group SIDs are resolved to CNs per objectSid
+// search, so a heavily-grouped user (hundreds of SIDs) never builds one giant
+// OR filter. objectSid is indexed, so each batch is a fast lookup; a handful of
+// batches covers even the largest realistic membership.
+const sidResolveBatch = 200
 
 // LDAPAuthenticator authenticates against Active Directory over LDAPS.
 //
@@ -108,31 +96,104 @@ func (a *LDAPAuthenticator) Authenticate(ctx context.Context, username, password
 }
 
 // resolveGroups returns the CNs of the groups the user (entry) belongs to.
-// Direct memberOf by default; with NestedGroups it instead runs an
-// LDAP_MATCHING_RULE_IN_CHAIN search on the user's DN so transitive/AGDLP
-// (e.g. domain-local) memberships resolve too. The chain result is a superset
-// of memberOf WITHIN BaseDN's domain, so it fully replaces the direct read
-// when enabled. Caveat for multi-domain forests: a foreign-security-principal
-// group rooted outside BaseDN can appear in a direct memberOf read but is not
-// returned by this BaseDN-scoped search; harmless for a single-domain directory.
+// Direct memberOf by default; with NestedGroups it resolves the full transitive
+// (AGDLP-nested, e.g. domain-local) set via AD's constructed tokenGroups
+// attribute, which the DC precomputes — no expensive LDAP_MATCHING_RULE_IN_CHAIN
+// walk over the whole directory (that is O(groups-in-forest) and times out for
+// heavily-grouped users on a large AD). The tokenGroups set is a superset of
+// memberOf within the domain; foreign-security-principal groups rooted outside
+// BaseDN resolve only if reachable from BaseDN (harmless for single-domain).
 func (a *LDAPAuthenticator) resolveGroups(ctx context.Context, conn *ldap.Conn, entry *ldap.Entry) ([]string, error) {
 	if !a.cfg.NestedGroups {
 		return groupCNsFromMemberOf(entry.GetAttributeValues("memberOf")), nil
 	}
-	// The in-chain search needs directory read rights. In Authenticate the
-	// connection is currently bound as the (possibly low-privilege) user from
-	// the password check, so re-bind as the service account first; in Groups()
-	// it is already service-bound and this is a harmless no-op re-bind.
+	// The tokenGroups read and objectSid resolution need directory read rights.
+	// In Authenticate the connection is currently bound as the (possibly
+	// low-privilege) user from the password check, so re-bind as the service
+	// account first; in Groups() it is already service-bound (no-op re-bind).
 	if err := conn.Bind(a.cfg.BindDN, a.cfg.BindPassword); err != nil {
 		return nil, fmt.Errorf("%w: service re-bind for nested groups: %v", ErrAuth, err)
 	}
-	return a.nestedGroupCNs(ctx, conn, entry.DN)
+	return a.tokenGroupCNs(ctx, conn, entry.DN)
 }
 
-// nestedGroupCNs returns the CN of every group that has userDN as a member,
-// following nested membership via LDAP_MATCHING_RULE_IN_CHAIN. One extra
-// subtree search per login; only reached when NestedGroups is set.
-func (a *LDAPAuthenticator) nestedGroupCNs(ctx context.Context, conn *ldap.Conn, userDN string) ([]string, error) {
+// tokenGroupCNs resolves a user's full transitive group membership: it reads
+// the DC-computed tokenGroups (group SIDs) off the user object, then resolves
+// those SIDs to CNs with an indexed objectSid search (batched). Both steps are
+// cheap on any directory size, unlike the in-chain matching rule. Only reached
+// when NestedGroups is set.
+func (a *LDAPAuthenticator) tokenGroupCNs(ctx context.Context, conn *ldap.Conn, userDN string) ([]string, error) {
+	searchSecs := a.applyTimeout(ctx, conn)
+
+	// 1. Read the transitive group SIDs the DC already computed for this user.
+	tgReq := ldap.NewSearchRequest(
+		userDN,
+		ldap.ScopeBaseObject, ldap.NeverDerefAliases, 1, searchSecs, false,
+		"(objectClass=*)",
+		[]string{"tokenGroups"},
+		nil,
+	)
+	tgRes, err := conn.Search(tgReq)
+	if err != nil {
+		return nil, fmt.Errorf("%w: tokenGroups read: %v", ErrAuth, err)
+	}
+	if len(tgRes.Entries) != 1 {
+		return nil, fmt.Errorf("%w: tokenGroups read: user object not found", ErrAuth)
+	}
+	sids := tgRes.Entries[0].GetRawAttributeValues("tokenGroups")
+	if len(sids) == 0 {
+		return nil, nil
+	}
+
+	// 2. Resolve SIDs -> CNs via indexed objectSid, in bounded batches. SIDs
+	// that name well-known/builtin or out-of-domain groups simply return no
+	// entry and are skipped.
+	out := make([]string, 0, len(sids))
+	for start := 0; start < len(sids); start += sidResolveBatch {
+		end := start + sidResolveBatch
+		if end > len(sids) {
+			end = len(sids)
+		}
+		var filter strings.Builder
+		filter.WriteString("(|")
+		for _, sid := range sids[start:end] {
+			filter.WriteString("(objectSid=")
+			filter.WriteString(escapeBinaryFilter(sid))
+			filter.WriteString(")")
+		}
+		filter.WriteString(")")
+
+		req := ldap.NewSearchRequest(
+			a.cfg.BaseDN,
+			ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, sidResolveBatch, searchSecs, false,
+			filter.String(),
+			[]string{"cn"},
+			nil,
+		)
+		res, err := conn.Search(req)
+		if err != nil {
+			return nil, fmt.Errorf("%w: group SID resolution: %v", ErrAuth, err)
+		}
+		for _, e := range res.Entries {
+			// Prefer the CN from the group's DN (RDN) so the value matches what
+			// groupCNsFromMemberOf produces; fall back to the cn attribute.
+			if cns := groupCNsFromMemberOf([]string{e.DN}); len(cns) > 0 {
+				out = append(out, cns...)
+				continue
+			}
+			if cn := e.GetAttributeValue("cn"); cn != "" {
+				out = append(out, cn)
+			}
+		}
+	}
+	return out, nil
+}
+
+// applyTimeout bounds the connection's per-request deadline to the caller's
+// remaining context time (capped at defaultLDAPTimeout) and returns the
+// matching server-side time limit in whole seconds (>= 1). Shared by the
+// nested-group searches.
+func (a *LDAPAuthenticator) applyTimeout(ctx context.Context, conn *ldap.Conn) int {
 	timeout := defaultLDAPTimeout
 	if dl, ok := ctx.Deadline(); ok {
 		if remaining := time.Until(dl); remaining > 0 && remaining < timeout {
@@ -140,38 +201,26 @@ func (a *LDAPAuthenticator) nestedGroupCNs(ctx context.Context, conn *ldap.Conn,
 		}
 	}
 	conn.SetTimeout(timeout)
-	searchSecs := int(timeout.Seconds())
-	if searchSecs < 1 {
-		searchSecs = 1
+	secs := int(timeout.Seconds())
+	if secs < 1 {
+		secs = 1
 	}
+	return secs
+}
 
-	// Match groups whose (nested) member is this user. The DN is a filter
-	// assertion value, so it must be filter-escaped.
-	filter := fmt.Sprintf("(member:%s:=%s)", ldapMatchingRuleInChain, ldap.EscapeFilter(userDN))
-	req := ldap.NewSearchRequest(
-		a.cfg.BaseDN,
-		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, maxNestedGroups, searchSecs, false,
-		filter,
-		[]string{"cn"},
-		nil,
-	)
-	res, err := conn.Search(req)
-	if err != nil {
-		return nil, fmt.Errorf("%w: nested group search: %v", ErrAuth, err)
+// escapeBinaryFilter renders a raw byte value (e.g. a binary objectSid) as an
+// LDAP filter assertion value: every byte becomes a "\XX" hex escape, which is
+// always valid and unambiguous (RFC 4515).
+func escapeBinaryFilter(b []byte) string {
+	const hex = "0123456789abcdef"
+	var sb strings.Builder
+	sb.Grow(len(b) * 3)
+	for _, c := range b {
+		sb.WriteByte('\\')
+		sb.WriteByte(hex[c>>4])
+		sb.WriteByte(hex[c&0x0f])
 	}
-	out := make([]string, 0, len(res.Entries))
-	for _, e := range res.Entries {
-		// Take the CN from the group's DN (RDN) so the value matches exactly
-		// what groupCNsFromMemberOf produces; fall back to the cn attribute.
-		if cns := groupCNsFromMemberOf([]string{e.DN}); len(cns) > 0 {
-			out = append(out, cns...)
-			continue
-		}
-		if cn := e.GetAttributeValue("cn"); cn != "" {
-			out = append(out, cn)
-		}
-	}
-	return out, nil
+	return sb.String()
 }
 
 // lookupUser binds as the service account and searches for username,
