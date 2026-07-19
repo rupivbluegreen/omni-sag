@@ -53,7 +53,7 @@ type subsystemRequest struct{ Name string }
 // handleSession then waits on shellDone before returning, so the caller's
 // channel-slot/registry accounting (chSem, sessions.Registry) still reflects
 // the shell's real lifetime, not just the request loop's.
-func (s *Server) handleSession(ctx, connCtx context.Context, newCh ssh.NewChannel, pr policy.Principal, srcIP string, sconn ssh.Conn, tch *targetConnCache) {
+func (s *Server) handleSession(ctx, connCtx context.Context, newCh ssh.NewChannel, pr policy.Principal, srcIP string, sconn ssh.Conn, tch *targetConnCache, announcer *tunnelAnnouncer) {
 	channel, requests, err := newCh.Accept()
 	if err != nil {
 		return
@@ -84,12 +84,32 @@ func (s *Server) handleSession(ctx, connCtx context.Context, newCh ssh.NewChanne
 		case "auth-agent-req@openssh.com":
 			_ = req.Reply(true, nil)
 		case "shell":
-			if s.sshDisabled {
-				_ = req.Reply(false, nil) // interactive shell disabled by gateway configuration (disable_ssh)
-				continue
-			}
 			if shellDone != nil {
 				_ = req.Reply(false, nil) // a shell was already dispatched on this channel
+				continue
+			}
+			// No target host selected: if tunneling is enabled, hold this
+			// session open as a tunnel keeper (a plain "ssh -L … user@gw" with
+			// no -N) so the user sees their forwards come up and has a window to
+			// keep open. This is a tunnel affordance, not a target shell, so it
+			// is allowed even when interactive shells (disable_ssh) are off; it
+			// dials no target and records nothing.
+			if pr.TargetHost == "" && !s.tunnelDisabled {
+				_ = req.Reply(true, nil)
+				shellDone = make(chan struct{})
+				go func() {
+					defer close(shellDone)
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("omni-sag: recovered panic in tunnel-keeper goroutine (user=%s): %v", pr.User, r)
+						}
+					}()
+					s.runTunnelKeeper(ctx, channel, pr, srcIP, announcer)
+				}()
+				continue
+			}
+			if s.sshDisabled {
+				_ = req.Reply(false, nil) // interactive shell disabled by gateway configuration (disable_ssh)
 				continue
 			}
 			_ = req.Reply(true, nil)

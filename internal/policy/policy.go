@@ -31,6 +31,16 @@ type Principal struct {
 	// them — they ride along on Principal the same way Groups does.
 	TargetHost        string
 	TargetSecretToken string
+
+	// SelectedRole optionally scopes every decision for this principal to a
+	// single role (a pcode), set from the "+pcode" selector in the SSH auth
+	// username (see session parsing). Empty ⇒ evaluate against all roles the
+	// principal holds — the default union. Threaded from the auth layer like
+	// TargetHost; when set, selectRoles narrows to the one matching role, and a
+	// selector that names no role the principal holds denies generically. It
+	// lets a user disambiguate a host reachable via several pcodes, which
+	// DecideHost otherwise refuses as ambiguous.
+	SelectedRole string
 }
 
 // RecordMode is the recording posture required for a target (PRD FR-10).
@@ -148,6 +158,32 @@ func (p Policy) rolesFor(pr Principal) []Role {
 	return out
 }
 
+// selectorDeniedReason is the single, deliberately non-committal deny message
+// used when the "+pcode" selector names no role the principal holds. It must
+// not reveal whether the pcode does not exist or the principal simply is not a
+// member — either way access is denied, and distinguishing them would leak the
+// set of valid pcodes (anti-enumeration, matching the gateway's posture).
+const selectorDeniedReason = "access denied: the selected pcode is not available for this session"
+
+// selectRoles applies the optional "+pcode" username selector
+// (pr.SelectedRole) to the roles the principal holds. With no selector it
+// returns every held role (the default union). With a selector it returns only
+// the held role whose name matches it case-insensitively; if the principal
+// holds no such role it returns selectorSatisfied=false, so the caller denies
+// with selectorDeniedReason rather than falling through to the union.
+func (p Policy) selectRoles(pr Principal) (roles []Role, selectorSatisfied bool) {
+	held := p.rolesFor(pr)
+	if pr.SelectedRole == "" {
+		return held, true
+	}
+	for _, r := range held {
+		if strings.EqualFold(r.Name, pr.SelectedRole) {
+			return []Role{r}, true
+		}
+	}
+	return nil, false
+}
+
 // intersectGroups returns the elements of principalGroups that case-
 // insensitively match an entry in roleGroups, preserving the principal's own
 // casing (not the role's) since that's what a later live LDAP group-lookup
@@ -189,7 +225,10 @@ func (r Rule) matches(t Target) bool {
 // it returns Allow only if some role the principal holds permits the target.
 // Default is deny.
 func (p Policy) Decide(pr Principal, t Target, resolve ResolverFunc) Decision {
-	roles := p.rolesFor(pr)
+	roles, ok := p.selectRoles(pr)
+	if !ok {
+		return Decision{Allow: false, RecordMode: RecordNone, Reason: selectorDeniedReason}
+	}
 	if len(roles) == 0 {
 		return Decision{Allow: false, RecordMode: RecordNone, Reason: "no role: principal holds no role granting any access"}
 	}
@@ -336,7 +375,10 @@ func allIn(ips []net.IP, n *net.IPNet) bool {
 // A rule meant for this flow should therefore name exactly one host and
 // exactly one port.
 func (p Policy) DecideHost(pr Principal, host string, resolve ResolverFunc) Decision {
-	roles := p.rolesFor(pr)
+	roles, ok := p.selectRoles(pr)
+	if !ok {
+		return Decision{Allow: false, RecordMode: RecordNone, Reason: selectorDeniedReason}
+	}
 	if len(roles) == 0 {
 		return Decision{Allow: false, RecordMode: RecordNone, Reason: "no role: principal holds no role granting any access"}
 	}
@@ -378,7 +420,20 @@ func (p Policy) DecideHost(pr Principal, host string, resolve ResolverFunc) Deci
 	case len(matches) == 0:
 		return Decision{Allow: false, RecordMode: RecordNone, Reason: fmt.Sprintf("no rule in roles %s permits host %s", roleNames(roles), host)}
 	case len(matches) > 1:
-		return Decision{Allow: false, RecordMode: RecordNone, Reason: fmt.Sprintf("ambiguous: %d rules match host %s for the real-target shell/SFTP flow — each host must resolve to exactly one rule with exactly one port", len(matches), host)}
+		// Distinct pcodes (roles) among the matches, in first-seen order, so
+		// the user knows exactly which "+pcode" selector to reconnect with.
+		seen := make(map[string]bool, len(matches))
+		var pcodes []string
+		for _, m := range matches {
+			if !seen[m.role.Name] {
+				seen[m.role.Name] = true
+				pcodes = append(pcodes, m.role.Name)
+			}
+		}
+		if len(pcodes) > 1 {
+			return Decision{Allow: false, RecordMode: RecordNone, Reason: fmt.Sprintf("ambiguous: host %s is permitted by multiple pcodes (%s) — reconnect as <user>+<pcode>%%%s to select one", host, strings.Join(pcodes, ", "), host)}
+		}
+		return Decision{Allow: false, RecordMode: RecordNone, Reason: fmt.Sprintf("ambiguous: %d rules in pcode %s match host %s — a rule for the shell/SFTP flow must name exactly one host and one port", len(matches), pcodes[0], host)}
 	}
 	m := matches[0]
 	if len(m.rule.Ports) != 1 {
