@@ -77,15 +77,21 @@ $ ssh -L 5432:db1.lab.local:5432 alice@gateway
 $ ssh -D 1080 alice@gateway
 $ ssh -J alice@gateway alice@db1.lab.local
 ```
-Not supported: `-R` remote/reverse forwarding, X11 forwarding, or `scp` (no `exec` channel —
-use `sftp`).
+`scp` works out of the box for any current OpenSSH client — it defaults to the SFTP protocol
+under the hood, served by the same real shell/SFTP path above. The legacy exec-based protocol
+(`scp -O`) is also supported, single file only (no `-r`), but is opt-in — set `enable_scp: true`
+to turn it on (it adds an exec-channel surface, so it stays off by default).
+
+Not supported: `-R` remote/reverse forwarding, or X11 forwarding.
 
 **🎛️ Capability kill switches** — disable whole classes of access at the gateway, independent of
-policy (at least one must stay on).
+policy (at least one of the three must stay on). `enable_scp` is the opposite sense — opt-in,
+off by default.
 ```yaml
 disable_ssh: true      # no interactive shells
 disable_tunnel: true   # no -L/-D forwarding
-disable_sftp: true     # no SFTP subsystem
+disable_sftp: true     # no SFTP subsystem (also blocks default-protocol scp)
+enable_scp: true       # opt-in: serve legacy scp -O (off by default)
 ```
 
 **🧭 Policy** — AD-group-bound roles; each rule sets the allowed host+ports plus a recording

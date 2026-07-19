@@ -90,6 +90,7 @@ type Server struct {
 	sshDisabled    bool // opt-in: rejects "shell" requests on session channels; see WithSSHDisabled
 	tunnelDisabled bool // opt-in: rejects "direct-tcpip" channels (-L port forwarding); see WithTunnelDisabled
 	sftpDisabled   bool // opt-in: rejects "subsystem"+"sftp" requests on session channels; see WithSFTPDisabled
+	scpEnabled     bool // opt-IN (default false = OFF): only when true are "exec" requests matching "scp -t/-f" (legacy protocol) served; see WithSCPEnabled
 }
 
 // WithRegistry registers each authenticated connection in reg so the
@@ -134,6 +135,18 @@ func WithTunnelDisabled(disabled bool) Option {
 // separately governs which hosts/ports SFTP may reach.
 func WithSFTPDisabled(disabled bool) Option {
 	return func(s *Server) { s.sftpDisabled = disabled }
+}
+
+// WithSCPEnabled turns ON the legacy exec-based scp protocol ("exec"
+// requests matching "scp -t"/"scp -f"). Unlike the three WithXDisabled
+// options, this is opt-IN: false (the default) rejects every scp exec
+// request outright, since the legacy protocol adds an exec-channel surface
+// that stays off unless an operator explicitly enables it. Default-protocol
+// scp (modern clients, no -O flag) is unaffected either way — it rides the
+// "subsystem"+"sftp" path governed by WithSFTPDisabled. When enabled, policy
+// still separately governs which hosts/ports scp may reach.
+func WithSCPEnabled(enabled bool) Option {
+	return func(s *Server) { s.scpEnabled = enabled }
 }
 
 // WithMFA gates every successful primary authentication behind a second

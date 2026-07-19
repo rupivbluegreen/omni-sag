@@ -172,6 +172,7 @@ func run(cfgPath string, debug bool) error {
 	opts = append(opts, session.WithSSHDisabled(cfg.DisableSSH))
 	opts = append(opts, session.WithTunnelDisabled(cfg.DisableTunnel))
 	opts = append(opts, session.WithSFTPDisabled(cfg.DisableSFTP))
+	opts = append(opts, session.WithSCPEnabled(cfg.EnableSCP))
 	if cfg.DisableSSH {
 		log.Printf("omni-sag: interactive shell disabled (disable_ssh)")
 	}
@@ -179,7 +180,10 @@ func run(cfgPath string, debug bool) error {
 		log.Printf("omni-sag: -L port forwarding disabled (disable_tunnel)")
 	}
 	if cfg.DisableSFTP {
-		log.Printf("omni-sag: SFTP disabled (disable_sftp)")
+		log.Printf("omni-sag: SFTP disabled (disable_sftp) — also disables default-protocol scp, which rides the same subsystem")
+	}
+	if cfg.EnableSCP {
+		log.Printf("omni-sag: legacy-protocol scp (-O) ENABLED (enable_scp) — extra exec-channel surface is live")
 	}
 	opts = append(opts, sessOpts...)
 	if cfg.MFA.Enabled {

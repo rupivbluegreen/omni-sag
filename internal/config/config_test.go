@@ -128,6 +128,51 @@ policy:
 	}
 }
 
+func TestValidate_EnableSCPDefaultsOff(t *testing.T) {
+	ok := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+`
+	f, err := Load(writeTemp(t, ok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.EnableSCP {
+		t.Fatal("enable_scp should default to false (legacy scp opt-in, off unless set)")
+	}
+}
+
+func TestValidate_EnableSCPWithAllOthersDisabledIsAccepted(t *testing.T) {
+	// enable_scp is opt-in and NOT part of the "at least one capability must
+	// stay enabled" rule: the gateway still serves scp here, but even so the
+	// three disable_* toggles govern that rule on their own. Disabling all
+	// three is still rejected regardless of enable_scp — asserted separately
+	// in TestValidate_AllCapabilitiesDisabledRejected. Here only sftp is
+	// disabled, so it must load fine with scp enabled.
+	ok := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+disable_sftp: true
+enable_scp: true
+policy:
+  roles: []
+`
+	f, err := Load(writeTemp(t, ok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !f.EnableSCP {
+		t.Fatal("enable_scp should be true")
+	}
+	if !f.DisableSFTP {
+		t.Fatal("disable_sftp should be true")
+	}
+}
+
 func TestValidate_PipelineEvidence(t *testing.T) {
 	ok := `
 listen: ":2222"
