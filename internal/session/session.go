@@ -533,6 +533,12 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 	tch := &targetConnCache{}
 	defer tch.close()
 
+	// announcer relays "tunnel open" notices from this connection's -L handlers
+	// to a tunnel-keeper session, when the client opens one (a plain
+	// "ssh -L … user@gw" with no -N and no target). Per-connection, shared
+	// across every channel opened on it.
+	announcer := &tunnelAnnouncer{}
+
 	// connCtx is cancelled either when the caller's ctx is (gateway
 	// shutdown/drain) or when this specific client connection goes away
 	// (sconn.Wait returns), whichever comes first. It exists for SFTP's
@@ -591,9 +597,9 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 			}()
 			switch ct {
 			case "direct-tcpip":
-				s.handleDirectTCPIP(ctx, newCh, pr, srcIP)
+				s.handleDirectTCPIP(ctx, newCh, pr, srcIP, announcer)
 			case "session":
-				s.handleSession(ctx, connCtx, newCh, pr, srcIP, sconn, tch)
+				s.handleSession(ctx, connCtx, newCh, pr, srcIP, sconn, tch, announcer)
 			}
 		}(newCh, ct)
 	}
@@ -607,7 +613,7 @@ type directTCPIP struct {
 	OriginatorPort uint32
 }
 
-func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr policy.Principal, srcIP string) {
+func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr policy.Principal, srcIP string, announcer *tunnelAnnouncer) {
 	var d directTCPIP
 	if err := ssh.Unmarshal(newCh.ExtraData(), &d); err != nil {
 		_ = newCh.Reject(ssh.Prohibited, "malformed forwarding request")
@@ -635,6 +641,12 @@ func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr
 	if err != nil {
 		_ = conn.Close()
 		return
+	}
+	// Tunnel is authorized and connected: tell the keeper session (if the
+	// client opened one) so the user sees it succeed. Best-effort, never blocks
+	// the splice below.
+	if announcer != nil {
+		announcer.announce(tunnelOpenNotice(pr.User, d.HostToConnect, int(d.PortToConnect)))
 	}
 	go ssh.DiscardRequests(chReqs)
 	dialer.Splice(ch, conn)
