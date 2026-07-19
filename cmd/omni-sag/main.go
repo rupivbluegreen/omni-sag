@@ -90,6 +90,7 @@ func run(cfgPath string, debug bool) error {
 		BindPassword: cfg.LDAP.BindPassword,
 		UserFilter:   cfg.LDAP.UserFilter,
 		InsecureTLS:  cfg.LDAP.InsecureTLS,
+		NestedGroups: cfg.LDAP.NestedGroups,
 	})
 
 	var dopts []dialer.Option

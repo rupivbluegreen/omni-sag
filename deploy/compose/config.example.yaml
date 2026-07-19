@@ -47,6 +47,12 @@ ldap:
   bind_password: "LabAdminPass123!"
   user_filter: "(sAMAccountName=%s)"
   insecure_tls: true # dev only: samba-AD self-signed cert
+  # nested_groups: resolve transitive/AGDLP-nested membership via AD's
+  # LDAP_MATCHING_RULE_IN_CHAIN instead of reading direct memberOf only. Enable
+  # when roles bind to domain-local groups a user holds through nesting — i.e.
+  # nested groups a plain memberOf read misses (a superset of memberOf; still
+  # excludes the primary group, e.g. Domain Users). Off by default.
+  # nested_groups: true
 
 # MFA (Slice 2): second factor after LDAPS primary. Disabled by default so the
 # Slice 1 demo still runs. Enable to gate logins behind RADIUS MS-CHAPv2.
