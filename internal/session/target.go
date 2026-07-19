@@ -62,11 +62,11 @@ func (s *Server) emitTargetCredential(pr policy.Principal, srcIP, targetHost str
 // offers (inject and prompt modes): the SSH "password" method AND the
 // "keyboard-interactive" method, both answered with the same secret. Offering
 // both is required because "password" and "keyboard-interactive" are distinct
-// SSH auth methods and a target advertises only one of them — BoKS / PAM-MFA
-// hosts (e.g. clrv0000332537) disable "password" and accept only
+// SSH auth methods and a target advertises only one of them — some PAM-MFA
+// hosts (e.g. bastion.example.net) disable "password" and accept only
 // "keyboard-interactive", so a password-only config fails the handshake with
 // "attempted methods [none]". The keyboard-interactive callback answers every
-// prompt in the challenge with the secret (a BoKS host sends a single
+// prompt in the challenge with the secret (such a host sends a single
 // echo-off password prompt; a zero-prompt info message — e.g. an MFA push
 // notice — yields an empty answer set and simply proceeds).
 //
