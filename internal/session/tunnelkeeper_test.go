@@ -96,6 +96,40 @@ func TestRunTunnelKeeper_BannerAnnounceAndClose(t *testing.T) {
 	}
 }
 
+// TestRunTunnelKeeper_CtrlCEnds proves Ctrl-C (ETX, forwarded as a byte under a
+// PTY) ends the keeper — otherwise the user has no in-band way to close it.
+func TestRunTunnelKeeper_CtrlCEnds(t *testing.T) {
+	s := &Server{sink: noopSink{}}
+	a := newTunnelAnnouncer()
+	gwConn, clientConn := net.Pipe()
+	gwSide := &fakeChannel{Reader: gwConn, Writer: gwConn}
+
+	// Drain the banner so the keeper's writes don't block on net.Pipe.
+	go func() {
+		b := make([]byte, 256)
+		for {
+			if _, err := clientConn.Read(b); err != nil {
+				return
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		s.runTunnelKeeper(context.Background(), gwSide, policy.Principal{User: "alice"}, "", a)
+		close(done)
+	}()
+
+	if _, err := clientConn.Write([]byte{0x03}); err != nil { // Ctrl-C
+		t.Fatalf("write ctrl-c: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("keeper did not end on Ctrl-C")
+	}
+}
+
 func waitForContains(t *testing.T, mu *sync.Mutex, buf *bytes.Buffer, want string) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)

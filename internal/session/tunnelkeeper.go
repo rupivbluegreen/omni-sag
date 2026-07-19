@@ -70,7 +70,7 @@ func (s *Server) runTunnelKeeper(ctx context.Context, channel ssh.Channel, pr po
 
 	fmt.Fprint(channel, "omni-sag: no shell target selected — holding this session open for your -L tunnel(s).\r\n")
 	fmt.Fprint(channel, "omni-sag: (for an interactive shell instead, reconnect as user%host@gateway)\r\n")
-	fmt.Fprintf(channel, "omni-sag: %s — keep this window open; closing it ends your tunnel(s).\r\n", pr.User)
+	fmt.Fprintf(channel, "omni-sag: %s — keep this window open; press Ctrl-C (or close it) to end your tunnel(s).\r\n", pr.User)
 
 	// Close the channel on gateway drain so a keeper blocked writing to a
 	// client that paused its terminal unblocks and returns promptly. stop ends
@@ -86,11 +86,26 @@ func (s *Server) runTunnelKeeper(ctx context.Context, channel ssh.Channel, pr po
 	}()
 
 	// The keeper carries no shell input of its own; draining the channel's
-	// reads lets a client closing the window (channel EOF) end the keeper.
+	// reads lets a client closing the window (channel EOF) end the keeper. With
+	// a PTY the client forwards Ctrl-C (ETX) and Ctrl-D (EOT) as bytes rather
+	// than closing the channel, so treat either as "quit" too — otherwise the
+	// user has no in-band way to end the session (plain io.Discard would just
+	// swallow them).
 	clientGone := make(chan struct{})
 	go func() {
 		defer close(clientGone)
-		_, _ = io.Copy(io.Discard, channel)
+		buf := make([]byte, 256)
+		for {
+			n, err := channel.Read(buf)
+			for _, b := range buf[:n] {
+				if b == 0x03 || b == 0x04 { // Ctrl-C / Ctrl-D
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
 	}()
 
 	// Drain notices to the client here, in the keeper's own goroutine: the
