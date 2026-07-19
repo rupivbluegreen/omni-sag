@@ -54,8 +54,8 @@ Exact features, minimal fluff — every line below is backed by code, not a road
 **🔐 AD + MFA** — LDAPS bind against Active Directory, then RADIUS MS-CHAPv2 as a second factor
 (never PAP; interactive OTP fails closed over the SSH password path since it can't prompt). Roles
 bind to AD groups; set `ldap.nested_groups` to resolve transitive (AGDLP-nested) membership via
-`LDAP_MATCHING_RULE_IN_CHAIN` — matching what `id -nG` sees rather than only a direct `memberOf`
-read (default off).
+AD's `tokenGroups` — matching what `id -nG` sees rather than only a direct `memberOf` read, and
+cheap even for users in many groups (default off).
 ```yaml
 mfa:
   enabled: true
