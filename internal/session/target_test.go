@@ -43,6 +43,22 @@ func TestSplitTargetUser(t *testing.T) {
 	}
 }
 
+func TestSplitPcodeSelector(t *testing.T) {
+	cases := []struct{ raw, wantUser, wantPcode string }{
+		{"alice", "alice", ""},
+		{"alice+pcodeA", "alice", "pcodeA"},
+		{"alice+pcodeA+x", "alice", "pcodeA+x"}, // only the first + splits
+		{"+pcodeA", "", "pcodeA"},
+		{"alice+", "alice", ""},
+	}
+	for _, c := range cases {
+		u, p := splitPcodeSelector(c.raw)
+		if u != c.wantUser || p != c.wantPcode {
+			t.Errorf("splitPcodeSelector(%q) = (%q, %q), want (%q, %q)", c.raw, u, p, c.wantUser, c.wantPcode)
+		}
+	}
+}
+
 // startFakeTarget runs a minimal SSH server on an in-memory pipe that accepts
 // only the given password, and returns the client-side net.Conn to dial.
 // It runs until the test ends (t.Cleanup closes both ends).

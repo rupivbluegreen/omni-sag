@@ -308,6 +308,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		// victim out permanently.
 		if ok, retry := s.bfLimiter.Allow(srcIP); !ok {
 			loginUser, _, _ := splitTargetUser(meta.User())
+			loginUser, _ = splitPcodeSelector(loginUser)
 			s.emit(evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeAuth,
 				User: loginUser, SourceIP: srcIP,
@@ -323,6 +324,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		defer cancel()
 
 		loginUser, targetHost, hasTarget := splitTargetUser(meta.User())
+		loginUser, pcode := splitPcodeSelector(loginUser)
 		id, err := auth.Authenticate(ctx, loginUser, string(password))
 		if err != nil {
 			s.bfLimiter.RecordFailure(srcIP)
@@ -383,7 +385,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 			// Decide — see policy.Policy.DecideHost's doc comment. Only
 			// CredentialMode is consulted here; the resolved Decision.Port is
 			// used later, by interactive.go/sftp.go, to dial the real target.
-			decision := s.dialerPeek(policy.Principal{User: id.User, Groups: id.Groups}, targetHost)
+			decision := s.dialerPeek(policy.Principal{User: id.User, Groups: id.Groups, SelectedRole: pcode}, targetHost)
 			if credential.Mode(decision.CredentialMode).Normalize() == credential.ModePrompt {
 				groups := strings.Join(id.Groups, groupSep)
 				return nil, &ssh.PartialSuccessError{Next: ssh.ServerAuthCallbacks{
@@ -401,6 +403,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 							"groups":              groups,
 							"target_host":         targetHost,
 							"target_secret_token": token,
+							"selected_pcode":      pcode,
 						}}, nil
 					},
 				}}
@@ -413,6 +416,9 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		}}
 		if hasTarget {
 			perms.Extensions["target_host"] = targetHost
+		}
+		if pcode != "" {
+			perms.Extensions["selected_pcode"] = pcode
 		}
 		return perms, nil
 	}
@@ -527,6 +533,13 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 	tch := &targetConnCache{}
 	defer tch.close()
 
+	// announcer relays "tunnel open" notices from this connection's -L handlers
+	// to a tunnel-keeper session, when the client opens one (a plain
+	// "ssh -L … user@gw" with no -N and no target). Per-connection, shared
+	// across every channel opened on it; announce is non-blocking (see
+	// tunnelAnnouncer), so it never stalls the tunnel data path.
+	announcer := newTunnelAnnouncer()
+
 	// connCtx is cancelled either when the caller's ctx is (gateway
 	// shutdown/drain) or when this specific client connection goes away
 	// (sconn.Wait returns), whichever comes first. It exists for SFTP's
@@ -585,9 +598,9 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 			}()
 			switch ct {
 			case "direct-tcpip":
-				s.handleDirectTCPIP(ctx, newCh, pr, srcIP)
+				s.handleDirectTCPIP(ctx, newCh, pr, srcIP, announcer)
 			case "session":
-				s.handleSession(ctx, connCtx, newCh, pr, srcIP, sconn, tch)
+				s.handleSession(ctx, connCtx, newCh, pr, srcIP, sconn, tch, announcer)
 			}
 		}(newCh, ct)
 	}
@@ -601,7 +614,7 @@ type directTCPIP struct {
 	OriginatorPort uint32
 }
 
-func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr policy.Principal, srcIP string) {
+func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr policy.Principal, srcIP string, announcer *tunnelAnnouncer) {
 	var d directTCPIP
 	if err := ssh.Unmarshal(newCh.ExtraData(), &d); err != nil {
 		_ = newCh.Reject(ssh.Prohibited, "malformed forwarding request")
@@ -630,6 +643,12 @@ func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr
 		_ = conn.Close()
 		return
 	}
+	// Tunnel is authorized and connected: tell the keeper session (if the
+	// client opened one) so the user sees it succeed. announce is non-blocking
+	// and drops when no keeper is draining, so it never stalls the splice below.
+	if announcer != nil {
+		announcer.announce(tunnelOpenNotice(pr.User, d.HostToConnect, int(d.PortToConnect)))
+	}
 	go ssh.DiscardRequests(chReqs)
 	dialer.Splice(ch, conn)
 }
@@ -647,6 +666,7 @@ func principalFrom(perms *ssh.Permissions) policy.Principal {
 		Groups:            groups,
 		TargetHost:        perms.Extensions["target_host"],
 		TargetSecretToken: perms.Extensions["target_secret_token"],
+		SelectedRole:      perms.Extensions["selected_pcode"],
 	}
 }
 
