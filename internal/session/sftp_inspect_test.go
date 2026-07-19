@@ -90,7 +90,7 @@ func startInspectingServer(t *testing.T, sink evidence.Sink) (addr, targetHost s
 	hostKey, _ := NewEphemeralHostKey()
 	auth := fakeAuth{users: map[string][]string{"alice": {"dba"}}}
 	d := dialer.New(policy.Policy{}, sink)
-	opts := append([]Option{WithInspection(gate), WithApprovals(store, 5*time.Second), WithReleases(releases, 6*time.Hour)}, targetOpts...)
+	opts := append([]Option{WithInspection(gate), WithApprovals(store, 5*time.Second), WithReleases(releases, 6*time.Hour), WithSCPEnabled(true)}, targetOpts...)
 	srv := New(hostKey, auth, d, sink, opts...)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

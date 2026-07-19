@@ -35,12 +35,21 @@ type File struct {
 	TargetKnownHosts      string `yaml:"target_known_hosts"`       // OpenSSH known_hosts path verifying real-target host keys
 	TargetInsecureHostKey bool   `yaml:"target_insecure_host_key"` // dev-lab only: explicitly disable target host-key verification; see WithInsecureTargetHostKey
 
-	// Capability toggles: any combination may be disabled independently. All
-	// default to false (enabled), so a config.yaml written before these
-	// fields existed keeps serving all three, unchanged.
+	// Capability toggles: shell, -L forwarding, and SFTP default to false
+	// (enabled); a config.yaml written before these fields existed keeps
+	// serving all three, unchanged.
 	DisableSSH    bool `yaml:"disable_ssh"`    // reject interactive PTY shell ("shell" requests on session channels)
 	DisableTunnel bool `yaml:"disable_tunnel"` // reject -L port forwarding ("direct-tcpip" channels)
-	DisableSFTP   bool `yaml:"disable_sftp"`   // reject the SFTP subsystem ("subsystem"+"sftp" requests on session channels)
+	DisableSFTP   bool `yaml:"disable_sftp"`   // reject the SFTP subsystem ("subsystem"+"sftp" requests on session channels) — also blocks default-protocol scp, which rides the same subsystem
+
+	// EnableSCP is opt-IN (default false = disabled), unlike the three
+	// disable_* toggles above: the legacy exec-based scp protocol ("exec"
+	// requests matching "scp -t/-f") adds an exec-channel surface that stays
+	// off unless an operator explicitly turns it on. Default-protocol scp
+	// (modern clients) is unaffected — it rides the SFTP subsystem and is
+	// governed by disable_sftp instead. Not part of the "at least one
+	// capability must stay enabled" rule below, since it is off by default.
+	EnableSCP bool `yaml:"enable_scp"`
 }
 
 // MetricsConfig configures the Prometheus metrics endpoint, served on its own

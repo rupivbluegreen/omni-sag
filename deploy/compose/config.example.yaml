@@ -26,12 +26,19 @@ target_insecure_host_key: true
 # metrics:
 #   listen: ":9090"
 
-# Capability toggles (all default false = enabled). Any combination may be
-# disabled independently; at least one must stay enabled. Uncomment to
-# restrict this gateway to, e.g., tunnel-only:
+# Capability toggles. The three disable_* below default false (enabled); any
+# combination may be disabled independently, but at least one must stay
+# enabled. Uncomment to restrict this gateway to, e.g., tunnel-only:
 # disable_ssh: true      # reject interactive PTY shell
 # disable_tunnel: true   # reject -L port forwarding
-# disable_sftp: true     # reject the SFTP subsystem
+# disable_sftp: true     # reject the SFTP subsystem (also disables default-
+#                        # protocol scp, which rides the same subsystem)
+#
+# enable_scp is the OPPOSITE sense — opt-in, default OFF. The legacy
+# exec-based scp protocol (OpenSSH's "-O" flag) stays disabled unless you set
+# this. Modern scp clients need nothing here — they use the SFTP subsystem
+# above. Only enable for old clients that force the legacy protocol:
+# enable_scp: true       # serve legacy-protocol scp ("-O" flag)
 
 ldap:
   url: "ldaps://127.0.0.1:636"

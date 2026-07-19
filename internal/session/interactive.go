@@ -128,6 +128,28 @@ func (s *Server) handleSession(ctx, connCtx context.Context, newCh ssh.NewChanne
 				return
 			}
 			_ = req.Reply(false, nil)
+		case "exec":
+			if shellDone != nil {
+				_ = req.Reply(false, nil) // a shell was already dispatched on this channel
+				continue
+			}
+			if !s.scpEnabled {
+				_ = req.Reply(false, nil) // legacy scp is opt-in and disabled (enable_scp not set)
+				continue
+			}
+			var e execRequest
+			if ssh.Unmarshal(req.Payload, &e) != nil {
+				_ = req.Reply(false, nil)
+				continue
+			}
+			dir, remotePath, perr := parseSCPCommand(e.Command)
+			if perr != nil {
+				_ = req.Reply(false, nil) // not a supported scp invocation
+				continue
+			}
+			_ = req.Reply(true, nil)
+			s.runSCP(ctx, connCtx, channel, pr, srcIP, sconn, tch, dir, remotePath)
+			return
 		default:
 			_ = req.Reply(false, nil)
 		}
