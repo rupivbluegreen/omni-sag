@@ -32,6 +32,22 @@ func splitTargetUser(raw string) (loginUser, targetHost string, hasTarget bool) 
 	return raw[:i], raw[i+1:], true
 }
 
+// splitPcodeSelector splits the login-user portion of an SSH auth username on
+// its first "+" into the actual login user and an optional pcode selector:
+// "alice+p1234" -> ("alice", "p1234"). Like "%", "+" cannot appear in an AD
+// sAMAccountName, so it is an unambiguous delimiter that never collides with a
+// real username. No "+" ⇒ ("alice", ""). Only the FIRST "+" splits. Callers
+// pass the part BEFORE the "%" host split (splitTargetUser runs first), so the
+// selector applies connection-wide — to both the shell/SFTP target and any -L
+// tunnels opened on the connection.
+func splitPcodeSelector(loginUser string) (user, pcode string) {
+	i := strings.IndexByte(loginUser, '+')
+	if i < 0 {
+		return loginUser, ""
+	}
+	return loginUser[:i], loginUser[i+1:]
+}
+
 // dialNet is the single dial seam for the target's second SSH leg. A package
 // variable solely so tests can substitute a fake transport (mirrors
 // internal/dialer's netDial pattern); production always uses net.DialTimeout.

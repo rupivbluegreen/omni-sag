@@ -3,8 +3,65 @@ package policy
 import (
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 )
+
+// twoPcodePolicy models two pcodes whose subnets overlap on the same host — the
+// shared-network case where DecideHost is otherwise ambiguous. Each pcode is a
+// distinct role; a member of both reaches the shared host via either, which the
+// "+pcode" selector (Principal.SelectedRole) disambiguates. Documentation-range
+// IP (RFC 5737) and synthetic names keep this free of any real infrastructure.
+func twoPcodePolicy() Policy {
+	return Policy{Roles: []Role{
+		{Name: "pcodeA", Groups: []string{"grp-a"}, Allow: []Rule{{Host: "192.0.2.10", Ports: []int{22}, Credential: "prompt"}}},
+		{Name: "pcodeB", Groups: []string{"grp-b"}, Allow: []Rule{{Host: "192.0.2.10", Ports: []int{22}, Credential: "prompt"}}},
+	}}
+}
+
+func TestDecideHost_AmbiguousAcrossPcodesNamesThem(t *testing.T) {
+	pr := Principal{User: "alice", Groups: []string{"grp-a", "grp-b"}}
+	d := twoPcodePolicy().DecideHost(pr, "192.0.2.10", nil)
+	if d.Allow {
+		t.Fatal("a host permitted by two pcodes without a selector must be refused as ambiguous")
+	}
+	if !strings.Contains(d.Reason, "ambiguous") || !strings.Contains(d.Reason, "pcodeA") || !strings.Contains(d.Reason, "pcodeB") {
+		t.Fatalf("reason should say ambiguous and name both pcodes, got %q", d.Reason)
+	}
+}
+
+func TestDecideHost_SelectorResolvesAmbiguity(t *testing.T) {
+	pr := Principal{User: "alice", Groups: []string{"grp-a", "grp-b"}, SelectedRole: "pcodeB"}
+	d := twoPcodePolicy().DecideHost(pr, "192.0.2.10", nil)
+	if !d.Allow || d.MatchedRole != "pcodeB" || d.Port != 22 {
+		t.Fatalf("want allow via pcodeB on port 22, got allow=%v role=%q port=%d reason=%q", d.Allow, d.MatchedRole, d.Port, d.Reason)
+	}
+}
+
+func TestDecideHost_SelectorCaseInsensitive(t *testing.T) {
+	pr := Principal{User: "alice", Groups: []string{"grp-a", "grp-b"}, SelectedRole: "PCODEB"}
+	if d := twoPcodePolicy().DecideHost(pr, "192.0.2.10", nil); !d.Allow || d.MatchedRole != "pcodeB" {
+		t.Fatalf("selector should match role name case-insensitively, got allow=%v role=%q", d.Allow, d.MatchedRole)
+	}
+}
+
+func TestDecide_SelectorNotHeldDeniesGenerically(t *testing.T) {
+	pr := Principal{User: "alice", Groups: []string{"grp-a"}, SelectedRole: "pcodeB"} // holds A, selects B
+	if dh := twoPcodePolicy().DecideHost(pr, "192.0.2.10", nil); dh.Allow || dh.Reason != selectorDeniedReason {
+		t.Fatalf("DecideHost with unheld selector: want generic deny, got allow=%v reason=%q", dh.Allow, dh.Reason)
+	}
+	// The -L tunnel path (Decide, with a port) must deny identically.
+	if d := twoPcodePolicy().Decide(pr, Target{Host: "192.0.2.10", Port: 22}, nil); d.Allow || d.Reason != selectorDeniedReason {
+		t.Fatalf("Decide with unheld selector: want generic deny, got allow=%v reason=%q", d.Allow, d.Reason)
+	}
+}
+
+func TestDecide_SelectorScopesTunnelDecision(t *testing.T) {
+	pr := Principal{User: "alice", Groups: []string{"grp-a", "grp-b"}, SelectedRole: "pcodeA"}
+	if d := twoPcodePolicy().Decide(pr, Target{Host: "192.0.2.10", Port: 22}, nil); !d.Allow || d.MatchedRole != "pcodeA" {
+		t.Fatalf("want -L decision scoped to pcodeA, got allow=%v role=%q", d.Allow, d.MatchedRole)
+	}
+}
 
 // demoPolicy mirrors the Slice 1 demo: a "dba" role granting the DB host, keyed
 // off the "dba" AD group.

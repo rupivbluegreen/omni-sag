@@ -308,6 +308,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		// victim out permanently.
 		if ok, retry := s.bfLimiter.Allow(srcIP); !ok {
 			loginUser, _, _ := splitTargetUser(meta.User())
+			loginUser, _ = splitPcodeSelector(loginUser)
 			s.emit(evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeAuth,
 				User: loginUser, SourceIP: srcIP,
@@ -323,6 +324,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		defer cancel()
 
 		loginUser, targetHost, hasTarget := splitTargetUser(meta.User())
+		loginUser, pcode := splitPcodeSelector(loginUser)
 		id, err := auth.Authenticate(ctx, loginUser, string(password))
 		if err != nil {
 			s.bfLimiter.RecordFailure(srcIP)
@@ -383,7 +385,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 			// Decide — see policy.Policy.DecideHost's doc comment. Only
 			// CredentialMode is consulted here; the resolved Decision.Port is
 			// used later, by interactive.go/sftp.go, to dial the real target.
-			decision := s.dialerPeek(policy.Principal{User: id.User, Groups: id.Groups}, targetHost)
+			decision := s.dialerPeek(policy.Principal{User: id.User, Groups: id.Groups, SelectedRole: pcode}, targetHost)
 			if credential.Mode(decision.CredentialMode).Normalize() == credential.ModePrompt {
 				groups := strings.Join(id.Groups, groupSep)
 				return nil, &ssh.PartialSuccessError{Next: ssh.ServerAuthCallbacks{
@@ -401,6 +403,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 							"groups":              groups,
 							"target_host":         targetHost,
 							"target_secret_token": token,
+							"selected_pcode":      pcode,
 						}}, nil
 					},
 				}}
@@ -413,6 +416,9 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		}}
 		if hasTarget {
 			perms.Extensions["target_host"] = targetHost
+		}
+		if pcode != "" {
+			perms.Extensions["selected_pcode"] = pcode
 		}
 		return perms, nil
 	}
@@ -647,6 +653,7 @@ func principalFrom(perms *ssh.Permissions) policy.Principal {
 		Groups:            groups,
 		TargetHost:        perms.Extensions["target_host"],
 		TargetSecretToken: perms.Extensions["target_secret_token"],
+		SelectedRole:      perms.Extensions["selected_pcode"],
 	}
 }
 
