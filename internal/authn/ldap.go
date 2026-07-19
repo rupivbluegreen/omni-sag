@@ -41,10 +41,13 @@ type LDAPConfig struct {
 // when NestedGroups is set; see resolveGroups.
 const ldapMatchingRuleInChain = "1.2.840.113556.1.4.1941"
 
-// maxNestedGroups bounds the in-chain group search. Set well above realistic
-// heavy-user membership (which runs to the hundreds) so it never denies a real
-// user, while still capping an unbounded search against a misconfigured or
-// pathological directory. Exceeding it fails the login closed.
+// maxNestedGroups is the server-side size-limit hint sent with the in-chain
+// group search (go-ldap leaves client-side EnforceSizeLimit off, so this is
+// not a hard client cap). It is set well above realistic heavy-user membership
+// — which runs to the hundreds — so it never denies a real user. Note real AD
+// also enforces its own MaxPageSize (default ~1000) on a non-paged search, so
+// the effective ceiling is min(this, ~1000); a directory returning more makes
+// Search error, failing the login closed rather than under-resolving groups.
 const maxNestedGroups = 4096
 
 // LDAPAuthenticator authenticates against Active Directory over LDAPS.
@@ -107,8 +110,11 @@ func (a *LDAPAuthenticator) Authenticate(ctx context.Context, username, password
 // resolveGroups returns the CNs of the groups the user (entry) belongs to.
 // Direct memberOf by default; with NestedGroups it instead runs an
 // LDAP_MATCHING_RULE_IN_CHAIN search on the user's DN so transitive/AGDLP
-// (e.g. domain-local) memberships resolve too. The chain result is a
-// superset of memberOf, so it fully replaces the direct read when enabled.
+// (e.g. domain-local) memberships resolve too. The chain result is a superset
+// of memberOf WITHIN BaseDN's domain, so it fully replaces the direct read
+// when enabled. Caveat for multi-domain forests: a foreign-security-principal
+// group rooted outside BaseDN can appear in a direct memberOf read but is not
+// returned by this BaseDN-scoped search; harmless for a single-domain directory.
 func (a *LDAPAuthenticator) resolveGroups(ctx context.Context, conn *ldap.Conn, entry *ldap.Entry) ([]string, error) {
 	if !a.cfg.NestedGroups {
 		return groupCNsFromMemberOf(entry.GetAttributeValues("memberOf")), nil
