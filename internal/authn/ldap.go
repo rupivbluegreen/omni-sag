@@ -34,10 +34,18 @@ type LDAPConfig struct {
 
 // ldapMatchingRuleInChain is Active Directory's LDAP_MATCHING_RULE_IN_CHAIN
 // OID. Applied to the "member" attribute it walks nested group membership
-// transitively, so the gateway resolves the same groups as `id -nG` (SSSD)
-// rather than only a user's direct memberOf values. Used when NestedGroups is
-// set; see resolveGroups.
+// transitively, so the gateway resolves the full chain of memberOf groups
+// rather than only a user's direct memberOf values. The result is a superset
+// of a direct memberOf read; note it still excludes the primaryGroupID-based
+// primary group (e.g. Domain Users), which SSSD's `id -nG` does include. Used
+// when NestedGroups is set; see resolveGroups.
 const ldapMatchingRuleInChain = "1.2.840.113556.1.4.1941"
+
+// maxNestedGroups bounds the in-chain group search. Set well above realistic
+// heavy-user membership (which runs to the hundreds) so it never denies a real
+// user, while still capping an unbounded search against a misconfigured or
+// pathological directory. Exceeding it fails the login closed.
+const maxNestedGroups = 4096
 
 // LDAPAuthenticator authenticates against Active Directory over LDAPS.
 //
@@ -136,7 +144,7 @@ func (a *LDAPAuthenticator) nestedGroupCNs(ctx context.Context, conn *ldap.Conn,
 	filter := fmt.Sprintf("(member:%s:=%s)", ldapMatchingRuleInChain, ldap.EscapeFilter(userDN))
 	req := ldap.NewSearchRequest(
 		a.cfg.BaseDN,
-		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, searchSecs, false,
+		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, maxNestedGroups, searchSecs, false,
 		filter,
 		[]string{"cn"},
 		nil,

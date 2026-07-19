@@ -230,8 +230,10 @@ type LDAPConfig struct {
 	// NestedGroups resolves transitive/AGDLP-nested group membership via AD's
 	// LDAP_MATCHING_RULE_IN_CHAIN instead of reading the direct memberOf
 	// attribute only. Off by default; enable when roles bind to domain-local
-	// groups a user holds through nesting (what `id -nG` sees but a direct
-	// memberOf read does not).
+	// groups a user holds through nesting — visible to the nested lookup but
+	// not to a plain memberOf read. (It resolves a superset of memberOf, but
+	// still excludes the primaryGroupID-based primary group such as Domain
+	// Users, which a plain memberOf read also omits.)
 	NestedGroups bool `yaml:"nested_groups"`
 }
 
