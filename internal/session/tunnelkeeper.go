@@ -69,7 +69,7 @@ func (s *Server) runTunnelKeeper(ctx context.Context, channel ssh.Channel, pr po
 	})
 
 	fmt.Fprint(channel, "omni-sag: no shell target selected — holding this session open for your -L tunnel(s).\r\n")
-	fmt.Fprint(channel, "omni-sag: (for an interactive shell instead, reconnect as user%host@gateway)\r\n")
+	fmt.Fprint(channel, "omni-sag: (for an interactive shell instead, reconnect as user%host@gateway — or user+pcode%host to scope to one role)\r\n")
 	fmt.Fprintf(channel, "omni-sag: %s — keep this window open; press Ctrl-C (or close it) to end your tunnel(s).\r\n", pr.User)
 
 	// Close the channel on gateway drain so a keeper blocked writing to a
