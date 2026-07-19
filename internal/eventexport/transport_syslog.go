@@ -97,7 +97,11 @@ func (t *syslogTransport) redialLocked() error {
 	case "tcp":
 		conn, err = net.DialTimeout("tcp", t.cfg.Address, syslogDialTimeout)
 	case "tls":
-		d := &net.Dialer{Timeout: syslogDialTimeout}
+		// omni-sag:integration-dial — dials the operator-configured SIEM
+		// syslog endpoint (t.cfg.Address), an integration client like the ICAP
+		// client, NOT a session target; the single-target-dialer invariant
+		// (internal/dialer) is unaffected.
+		d := &net.Dialer{Timeout: syslogDialTimeout} // omni-sag:integration-dial
 		conn, err = tls.DialWithDialer(d, "tcp", t.cfg.Address, t.tlsCfg)
 	}
 	if err != nil {
