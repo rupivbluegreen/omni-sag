@@ -77,8 +77,8 @@ func startFakeTarget(t *testing.T, wantPassword string) net.Conn {
 // startFakeTargetKbdOnly runs a minimal SSH server that accepts ONLY the
 // "keyboard-interactive" auth method (no PasswordCallback, so the SSH
 // "password" method is not advertised) and authenticates by challenging the
-// client for a single password prompt. This models a BoKS / PAM-MFA target
-// like clrv0000332537, whose sshd offers only keyboard-interactive — the case
+// client for a single password prompt. This models a PAM-MFA target
+// like bastion.example.net, whose sshd offers only keyboard-interactive — the case
 // a password-only dial config fails with "attempted methods [none]".
 func startFakeTargetKbdOnly(t *testing.T, wantPassword string) net.Conn {
 	t.Helper()
@@ -382,7 +382,7 @@ func TestDialTarget_PromptSucceeds(t *testing.T) {
 
 // TestDialTarget_PromptSucceedsKeyboardInteractiveOnly is the regression test
 // for the keyboard-interactive gap: a target that advertises ONLY
-// keyboard-interactive (BoKS / PAM-MFA, e.g. clrv0000332537) must still
+// keyboard-interactive (PAM-MFA, e.g. bastion.example.net) must still
 // authenticate. Before passwordAuthMethods offered keyboard-interactive
 // alongside password, this failed with "unable to authenticate, attempted
 // methods [none], no supported methods remain".
