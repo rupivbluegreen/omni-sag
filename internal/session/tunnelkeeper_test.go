@@ -12,42 +12,28 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 )
 
-func TestTunnelAnnouncer_BufferReplayDetach(t *testing.T) {
-	a := &tunnelAnnouncer{}
-
-	// Announced before any keeper attaches → buffered, then replayed on attach.
+func TestTunnelAnnouncer_BuffersUntilDrained(t *testing.T) {
+	a := newTunnelAnnouncer()
+	// Announced before a keeper drains → buffered in order, drained FIFO.
 	a.announce("one\r\n")
 	a.announce("two\r\n")
-	var buf bytes.Buffer
-	a.attach(&buf)
-	if buf.String() != "one\r\ntwo\r\n" {
-		t.Fatalf("pending notices not replayed on attach: %q", buf.String())
+	if got := <-a.notices; got != "one\r\n" {
+		t.Fatalf("first drained notice = %q, want %q", got, "one\r\n")
 	}
-
-	// While attached → written straight through.
-	buf.Reset()
-	a.announce("three\r\n")
-	if buf.String() != "three\r\n" {
-		t.Fatalf("post-attach announce not written through: %q", buf.String())
-	}
-
-	// After detach → buffered again, replayed on the next attach.
-	a.detach()
-	a.announce("four\r\n")
-	var buf2 bytes.Buffer
-	a.attach(&buf2)
-	if buf2.String() != "four\r\n" {
-		t.Fatalf("post-detach announce not re-buffered/replayed: %q", buf2.String())
+	if got := <-a.notices; got != "two\r\n" {
+		t.Fatalf("second drained notice = %q, want %q", got, "two\r\n")
 	}
 }
 
-func TestTunnelAnnouncer_PendingBounded(t *testing.T) {
-	a := &tunnelAnnouncer{}
+func TestTunnelAnnouncer_NonBlockingAndBounded(t *testing.T) {
+	a := newTunnelAnnouncer()
+	// No keeper is draining. Announcing far past capacity must neither block
+	// (this test would hang) nor grow beyond the buffer — excess is dropped.
 	for i := 0; i < maxPendingTunnelNotices*3; i++ {
 		a.announce("x\r\n")
 	}
-	if len(a.pending) != maxPendingTunnelNotices {
-		t.Fatalf("pending should cap at %d, got %d", maxPendingTunnelNotices, len(a.pending))
+	if got := len(a.notices); got != maxPendingTunnelNotices {
+		t.Fatalf("buffered notices should cap at %d, got %d", maxPendingTunnelNotices, got)
 	}
 }
 
@@ -64,7 +50,7 @@ func TestTunnelOpenNotice(t *testing.T) {
 func TestRunTunnelKeeper_BannerAnnounceAndClose(t *testing.T) {
 	s := &Server{sink: noopSink{}}
 	pr := policy.Principal{User: "alice"}
-	a := &tunnelAnnouncer{}
+	a := newTunnelAnnouncer()
 
 	gwConn, clientConn := net.Pipe()
 	gwSide := &fakeChannel{Reader: gwConn, Writer: gwConn}

@@ -536,8 +536,9 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 	// announcer relays "tunnel open" notices from this connection's -L handlers
 	// to a tunnel-keeper session, when the client opens one (a plain
 	// "ssh -L … user@gw" with no -N and no target). Per-connection, shared
-	// across every channel opened on it.
-	announcer := &tunnelAnnouncer{}
+	// across every channel opened on it; announce is non-blocking (see
+	// tunnelAnnouncer), so it never stalls the tunnel data path.
+	announcer := newTunnelAnnouncer()
 
 	// connCtx is cancelled either when the caller's ctx is (gateway
 	// shutdown/drain) or when this specific client connection goes away
@@ -643,8 +644,8 @@ func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr
 		return
 	}
 	// Tunnel is authorized and connected: tell the keeper session (if the
-	// client opened one) so the user sees it succeed. Best-effort, never blocks
-	// the splice below.
+	// client opened one) so the user sees it succeed. announce is non-blocking
+	// and drops when no keeper is draining, so it never stalls the splice below.
 	if announcer != nil {
 		announcer.announce(tunnelOpenNotice(pr.User, d.HostToConnect, int(d.PortToConnect)))
 	}

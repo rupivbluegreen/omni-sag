@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sync"
 	"time"
 
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
@@ -12,56 +11,38 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// maxPendingTunnelNotices bounds notices buffered before a keeper attaches, so
-// a connection that opens tunnels but never a keeper session (a -N client)
-// cannot accumulate notices without limit.
+// maxPendingTunnelNotices bounds notices buffered for a keeper that is not
+// draining yet — a tunnel that authorized before the keeper session opened, or
+// a -N client that opens no keeper at all. Beyond this, notices are dropped
+// rather than exerting any backpressure on the tunnel data path.
 const maxPendingTunnelNotices = 32
 
-// tunnelAnnouncer relays human-readable "tunnel open" notices from a
-// connection's direct-tcpip handlers to a tunnel-keeper session — a shell
-// session opened with no target host, held open only to carry the client's -L
-// forwards (see runTunnelKeeper). It is per-connection: at most one keeper
-// attaches, any number of tunnels announce. A -N client opens no session, so
-// no keeper attaches and buffered notices are simply discarded on connection
-// teardown. All methods are safe for concurrent use.
+// tunnelAnnouncer carries best-effort "tunnel open" notices from a
+// connection's direct-tcpip handlers to a tunnel-keeper session (a targetless
+// shell held open to carry -L forwards; see runTunnelKeeper).
+//
+// It is a bounded, non-blocking channel by design: announce() NEVER blocks the
+// caller — the tunnel data path — and drops notices when no keeper is draining
+// or the buffer is full. The actual (possibly blocking) write to the client's
+// channel happens only in the keeper's own goroutine, so a client that has
+// paused its terminal can never stall a tunnel or another connection. One
+// announcer per connection; the design assumes at most one keeper drains it
+// (two would merely split notices between them — harmless, never wedged).
 type tunnelAnnouncer struct {
-	mu      sync.Mutex
-	w       io.Writer // the attached keeper channel; nil until/unless one attaches
-	pending []string  // notices seen before a keeper attached, replayed on attach (bounded)
+	notices chan string
 }
 
-// attach binds the keeper's channel as the notice sink and flushes anything
-// that a tunnel announced before the keeper session opened.
-func (a *tunnelAnnouncer) attach(w io.Writer) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.w = w
-	for _, line := range a.pending {
-		_, _ = io.WriteString(w, line)
-	}
-	a.pending = nil
+func newTunnelAnnouncer() *tunnelAnnouncer {
+	return &tunnelAnnouncer{notices: make(chan string, maxPendingTunnelNotices)}
 }
 
-// detach unbinds the keeper (its session is ending); later announcements are
-// buffered again rather than written to a closing channel.
-func (a *tunnelAnnouncer) detach() {
-	a.mu.Lock()
-	a.w = nil
-	a.mu.Unlock()
-}
-
-// announce delivers one notice to the attached keeper, or buffers it (bounded)
-// if no keeper session has opened yet. Best-effort: it never blocks the tunnel
-// data path and never errors.
+// announce queues a notice for the keeper without ever blocking. If no keeper
+// is draining, or the buffer is full, the notice is dropped — it is
+// best-effort UX, never a backpressure point on the tunnel it describes.
 func (a *tunnelAnnouncer) announce(line string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.w != nil {
-		_, _ = io.WriteString(a.w, line)
-		return
-	}
-	if len(a.pending) < maxPendingTunnelNotices {
-		a.pending = append(a.pending, line)
+	select {
+	case a.notices <- line:
+	default: // no keeper draining, or buffer full — drop
 	}
 }
 
@@ -72,12 +53,13 @@ func tunnelOpenNotice(user, host string, port int) string {
 }
 
 // runTunnelKeeper holds a targetless "session" channel open so a client's -L
-// forwards have a live session to ride on, printing a banner and then a line as
-// each tunnel authorizes. It is reached only when a shell is requested with no
-// "%host" target selected AND tunneling is enabled — the case a plain
+// forwards have a live session to ride on, printing a banner and then a line
+// as each tunnel authorizes. It is reached only when a shell is requested with
+// no "%host" target selected AND tunneling is enabled — the case a plain
 // "ssh -L … user@gw" (no -N, no target) would otherwise hit as a bare "no
-// target selected" refusal. It returns when the client closes the session
-// (closing the window) or the gateway drains, whichever comes first.
+// target selected" refusal. It dials no target and records nothing. It returns
+// when the client closes the session (closing the window) or the gateway
+// drains, whichever comes first.
 func (s *Server) runTunnelKeeper(ctx context.Context, channel ssh.Channel, pr policy.Principal, srcIP string, announcer *tunnelAnnouncer) {
 	defer channel.Close()
 
@@ -87,22 +69,42 @@ func (s *Server) runTunnelKeeper(ctx context.Context, channel ssh.Channel, pr po
 	})
 
 	fmt.Fprint(channel, "omni-sag: no shell target selected — holding this session open for your -L tunnel(s).\r\n")
+	fmt.Fprint(channel, "omni-sag: (for an interactive shell instead, reconnect as user%host@gateway)\r\n")
 	fmt.Fprintf(channel, "omni-sag: %s — keep this window open; closing it ends your tunnel(s).\r\n", pr.User)
 
-	announcer.attach(channel)
-	defer announcer.detach()
-
-	// A keeper carries no shell I/O of its own: drain the channel so a client
-	// closing the window (channel EOF) is noticed, and also unblock on gateway
-	// drain (ctx). Either path falls through to the deferred channel.Close().
-	done := make(chan struct{})
+	// Close the channel on gateway drain so a keeper blocked writing to a
+	// client that paused its terminal unblocks and returns promptly. stop ends
+	// this watcher when the keeper exits for any other reason.
+	stop := make(chan struct{})
+	defer close(stop)
 	go func() {
-		defer close(done)
+		select {
+		case <-ctx.Done():
+			_ = channel.Close()
+		case <-stop:
+		}
+	}()
+
+	// The keeper carries no shell input of its own; draining the channel's
+	// reads lets a client closing the window (channel EOF) end the keeper.
+	clientGone := make(chan struct{})
+	go func() {
+		defer close(clientGone)
 		_, _ = io.Copy(io.Discard, channel)
 	}()
-	select {
-	case <-done:
-	case <-ctx.Done():
+
+	// Drain notices to the client here, in the keeper's own goroutine: the
+	// write may block if the client is not reading, but that only ever stalls
+	// THIS goroutine — never the tunnel data path (announce is non-blocking).
+	for keep := true; keep; {
+		select {
+		case line := <-announcer.notices:
+			if _, err := io.WriteString(channel, line); err != nil {
+				keep = false // channel closed/broken
+			}
+		case <-clientGone:
+			keep = false
+		}
 	}
 
 	s.emit(evidence.Event{
