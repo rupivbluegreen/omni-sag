@@ -161,7 +161,9 @@ func run(cfgPath string, debug bool) error {
 	// (see buildEvidence); wrap it once and reuse the wrapped sink for both,
 	// so an event is never offered to an exporter twice.
 	if cfg.Export != nil && cfg.Export.Enabled {
-		fanout, err := eventexport.NewFanout(cfg.Export.ToEventExport(), met.IncExportDrop)
+		ecfg := cfg.Export.ToEventExport()
+		ecfg.Mode = cfg.FIPSMode()
+		fanout, err := eventexport.NewFanout(ecfg, met.IncExportDrop)
 		if err != nil {
 			return err
 		}
