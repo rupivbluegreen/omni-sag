@@ -348,16 +348,16 @@ func startAPIServer(ctx context.Context, cfg *config.APIConfig, mode fips.Mode, 
 		Authorizer: authz,
 		Approvals:  approvals,
 	})
+	tlsCfg, err := apiTLSConfig(cfg, mode)
+	if err != nil {
+		return err
+	}
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return err
 	}
 	httpSrv := &http.Server{Handler: apiSrv.Handler(), ReadHeaderTimeout: 10 * time.Second}
 
-	tlsCfg, err := apiTLSConfig(cfg, mode)
-	if err != nil {
-		return err
-	}
 	go func() {
 		<-ctx.Done()
 		_ = httpSrv.Close()
