@@ -312,7 +312,7 @@ those reviews caught real bugs. That's the point.
 *Shipped* means it's in the feature list above, backed by code. *Next* means designed or wanted,
 not yet built.
 
-- **Shipped (v1 → v1.6):** SSH + SFTP, real shell/SFTP target proxy, AD + MFA, single-dialer
+- **Shipped (v1 → v1.7):** SSH + SFTP, real shell/SFTP target proxy, AD + MFA, single-dialer
   SSRF/rebind guard, hash-chained Ed25519-signed evidence, session recording, ICAP inspection +
   Object-Locked quarantine, CyberArk CCP injection, four-eyes (session tunnels + group-scoped
   quarantine-release) with pull-download, per-capability kill switches, CIDR policy rules, nested
