@@ -390,7 +390,16 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 				groups := strings.Join(id.Groups, groupSep)
 				return nil, &ssh.PartialSuccessError{Next: ssh.ServerAuthCallbacks{
 					KeyboardInteractiveCallback: func(_ ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
-						answers, err := challenge("", "", []string{"Target password: "}, []bool{false})
+						// Name the actual target account@host (the "%host" the client
+						// asked for) rather than a generic "Target", so the user knows
+						// which credential is being requested. TargetUser defaults to
+						// the gateway login user when the rule does not override it.
+						targetUser := decision.TargetUser
+						if targetUser == "" {
+							targetUser = id.User
+						}
+						prompt := fmt.Sprintf("%s@%s password: ", targetUser, targetHost)
+						answers, err := challenge("", "", []string{prompt}, []bool{false})
 						if err != nil {
 							return nil, errors.New("authentication failed")
 						}
