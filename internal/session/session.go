@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -325,6 +326,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 
 		loginUser, targetHost, hasTarget := splitTargetUser(meta.User())
 		loginUser, pcode := splitPcodeSelector(loginUser)
+		targetHost, targetPort := splitTargetHostPort(targetHost)
 		id, err := auth.Authenticate(ctx, loginUser, string(password))
 		if err != nil {
 			s.bfLimiter.RecordFailure(srcIP)
@@ -385,7 +387,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 			// Decide — see policy.Policy.DecideHost's doc comment. Only
 			// CredentialMode is consulted here; the resolved Decision.Port is
 			// used later, by interactive.go/sftp.go, to dial the real target.
-			decision := s.dialerPeek(policy.Principal{User: id.User, Groups: id.Groups, SelectedRole: pcode}, targetHost)
+			decision := s.dialerPeek(policy.Principal{User: id.User, Groups: id.Groups, SelectedRole: pcode, TargetPort: targetPort}, targetHost)
 			if credential.Mode(decision.CredentialMode).Normalize() == credential.ModePrompt {
 				groups := strings.Join(id.Groups, groupSep)
 				return nil, &ssh.PartialSuccessError{Next: ssh.ServerAuthCallbacks{
@@ -402,6 +404,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 							"user":                id.User,
 							"groups":              groups,
 							"target_host":         targetHost,
+							"target_port":         strconv.Itoa(targetPort),
 							"target_secret_token": token,
 							"selected_pcode":      pcode,
 						}}, nil
@@ -416,6 +419,9 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		}}
 		if hasTarget {
 			perms.Extensions["target_host"] = targetHost
+		}
+		if targetPort > 0 {
+			perms.Extensions["target_port"] = strconv.Itoa(targetPort)
 		}
 		if pcode != "" {
 			perms.Extensions["selected_pcode"] = pcode
@@ -661,10 +667,12 @@ func principalFrom(perms *ssh.Permissions) policy.Principal {
 	if g := perms.Extensions["groups"]; g != "" {
 		groups = strings.Split(g, groupSep)
 	}
+	targetPort, _ := strconv.Atoi(perms.Extensions["target_port"])
 	return policy.Principal{
 		User:              perms.Extensions["user"],
 		Groups:            groups,
 		TargetHost:        perms.Extensions["target_host"],
+		TargetPort:        targetPort,
 		TargetSecretToken: perms.Extensions["target_secret_token"],
 		SelectedRole:      perms.Extensions["selected_pcode"],
 	}
