@@ -108,7 +108,7 @@ def run(cmd, gw_pw, tgt_pw, deadline_s):
 
     if wait_for("password:", deadline):
         os.write(fd, (gw_pw + "\n").encode())
-        if wait_for("Target password:", time.time() + 10):
+        if wait_for("svc_db1@", time.time() + 10):
             os.write(fd, (tgt_pw + "\n").encode())
     end = time.time() + 20
     while time.time() < end:
