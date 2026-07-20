@@ -1,0 +1,17 @@
+# Ground-truth OTel Collector for the OTLP export feature: proves spans
+# (and, when otel.logs.enabled, logs) actually arrive over the wire at a
+# real collector — not just this repo's own in-memory SpanRecorder tests.
+# Uses the contrib distribution for its `file` exporter, which makes the
+# arrival machine-checkable (internal/otelexport/interop_test.go), in
+# addition to the `debug` exporter for a human-readable eyeball check via
+# `docker compose logs`.
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./collector-config.yaml:/etc/otel-collector-config.yaml:ro
+      - ./output:/output
+    ports:
+      - "127.0.0.1:4317:4317" # OTLP gRPC
+      - "127.0.0.1:4318:4318" # OTLP HTTP

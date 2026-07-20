@@ -54,6 +54,9 @@ type subsystemRequest struct{ Name string }
 // channel-slot/registry accounting (chSem, sessions.Registry) still reflects
 // the shell's real lifetime, not just the request loop's.
 func (s *Server) handleSession(ctx, connCtx context.Context, newCh ssh.NewChannel, pr policy.Principal, srcIP string, sconn ssh.Conn, tch *targetConnCache, announcer *tunnelAnnouncer) {
+	ctx, sessSpan := tracer.Start(ctx, "omnisag.session")
+	defer sessSpan.End()
+
 	channel, requests, err := newCh.Accept()
 	if err != nil {
 		return
@@ -205,15 +208,17 @@ func (s *Server) handleSession(ctx, connCtx context.Context, newCh ssh.NewChanne
 // forwarded here to the target session.
 func (s *Server) runRecordedShell(ctx context.Context, channel ssh.Channel, cols, rows int, pr policy.Principal, srcIP string, sconn ssh.Conn, tch *targetConnCache, targetHost string, resizeCh <-chan [2]int) {
 	defer channel.Close()
+	ctx, shellSpan := tracer.Start(ctx, "omnisag.shell")
+	defer shellSpan.End()
 
-	s.emit(evidence.Event{
+	s.emit(ctx, evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeSessionStart,
 		User: pr.User, SourceIP: srcIP, Detail: "interactive shell",
 	})
 
 	if targetHost == "" {
 		_, _ = channel.Write([]byte("session refused: no target selected — connect as user%host@gateway\r\n"))
-		s.emit(evidence.Event{
+		s.emit(ctx, evidence.Event{
 			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
 			User: pr.User, SourceIP: srcIP, Detail: "refused: no target selected",
 		})
@@ -238,7 +243,7 @@ func (s *Server) runRecordedShell(ctx context.Context, channel ssh.Channel, cols
 			reason = "no policy decision available for this target"
 		}
 		_, _ = channel.Write([]byte(fmt.Sprintf("session refused: %s\r\n", reason)))
-		s.emit(evidence.Event{
+		s.emit(ctx, evidence.Event{
 			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
 			User: pr.User, SourceIP: srcIP, Detail: "refused: " + reason,
 		})
@@ -256,7 +261,7 @@ func (s *Server) runRecordedShell(ctx context.Context, channel ssh.Channel, cols
 	})
 	if err != nil {
 		_, _ = channel.Write([]byte(fmt.Sprintf("session refused: %s\r\n", err)))
-		s.emit(evidence.Event{
+		s.emit(ctx, evidence.Event{
 			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
 			User: pr.User, SourceIP: srcIP, Detail: "refused: " + err.Error(),
 		})
@@ -266,7 +271,7 @@ func (s *Server) runRecordedShell(ctx context.Context, channel ssh.Channel, cols
 	targetSession, err := targetClient.NewSession()
 	if err != nil {
 		_, _ = channel.Write([]byte(fmt.Sprintf("session refused: target session: %s\r\n", err)))
-		s.emit(evidence.Event{
+		s.emit(ctx, evidence.Event{
 			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
 			User: pr.User, SourceIP: srcIP, Detail: "refused: target session: " + err.Error(),
 		})
@@ -318,14 +323,14 @@ func (s *Server) runRecordedShell(ctx context.Context, channel ssh.Channel, cols
 			}
 		}
 		if derr != nil {
-			s.emit(evidence.Event{
+			s.emit(ctx, evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeRecording,
 				User: pr.User, SourceIP: srcIP, ObjectKey: recKey,
 				Allow: evidence.BoolPtr(false), Reason: "recording unavailable",
 				Detail: "recording start failed: " + derr.Error(),
 			})
 			_, _ = channel.Write([]byte("session refused: recording unavailable\r\n"))
-			s.emit(evidence.Event{
+			s.emit(ctx, evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
 				User: pr.User, SourceIP: srcIP, Detail: "refused: recording unavailable",
 			})
@@ -385,7 +390,7 @@ func (s *Server) runRecordedShell(ctx context.Context, channel ssh.Channel, cols
 
 	if rec != nil {
 		if m, cerr := rec.Close(); cerr == nil {
-			s.emit(evidence.Event{
+			s.emit(ctx, evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeRecording,
 				User: pr.User, SourceIP: srcIP,
 				ObjectKey: m.Key, SHA256: m.SHA256, Bytes: m.Bytes,
@@ -393,7 +398,7 @@ func (s *Server) runRecordedShell(ctx context.Context, channel ssh.Channel, cols
 				Detail:     fmt.Sprintf("asciicast duration=%s", m.Duration.Round(time.Millisecond)),
 			})
 		} else {
-			s.emit(evidence.Event{
+			s.emit(ctx, evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeRecording,
 				User: pr.User, SourceIP: srcIP, ObjectKey: recKey,
 				Detail: "recording finalize failed: " + cerr.Error(),
@@ -401,7 +406,7 @@ func (s *Server) runRecordedShell(ctx context.Context, channel ssh.Channel, cols
 		}
 	}
 
-	s.emit(evidence.Event{
+	s.emit(ctx, evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
 		User: pr.User, SourceIP: srcIP,
 	})

@@ -217,6 +217,16 @@ export:
     - { name: elastic,  format: ecs, transport: file,   file:   { path: "/var/log/omni-sag/events.jsonl" } }
 ```
 
+**📈 OpenTelemetry (OTLP)** — opt-in, default off. Distributed traces over the connection
+lifecycle (accept → auth → policy → approval → dial → splice), correlated to evidence IDs;
+optional OTLP metrics *coexist with* Prometheus (never replace it); experimental evidence-as-
+OTLP-logs as a 4th `export` transport. A dead/slow collector never blocks or slows a session.
+```yaml
+otel:
+  enabled: true
+  endpoint: "otel-collector:4317"
+```
+
 **🛰️ Control plane** — an HTTP API on its own listener (mTLS or bearer tokens), a CLI, and a
 Bubble Tea TUI. Kill the API and SSH keeps serving — it's genuinely out-of-band.
 ```console

@@ -19,10 +19,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rupivbluegreen/omni-sag/internal/approval"
 	"github.com/rupivbluegreen/omni-sag/internal/credential"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ErrDenied is returned when policy denies a target. Callers (the SSH session)
@@ -152,8 +156,14 @@ func WithHostnameResolutionDisabled() Option {
 
 // emit sends an evidence event, logging (never swallowing) any sink error,
 // and — when debug is enabled — also prints the event itself to stdout so a
-// live tail of decisions doesn't require reading evidence.jsonl.
-func (d *Dialer) emit(e evidence.Event) {
+// live tail of decisions doesn't require reading evidence.jsonl. It assigns
+// e.ID up front (rather than leaving it to the sink) and returns the emitted
+// event so callers can correlate a trace span to the exact evidence record
+// via its ID.
+func (d *Dialer) emit(e evidence.Event) evidence.Event {
+	if e.ID == "" {
+		e.ID = uuid.NewString()
+	}
 	if d.debug {
 		allow := "?"
 		if e.Allow != nil {
@@ -164,6 +174,7 @@ func (d *Dialer) emit(e evidence.Event) {
 	if err := d.sink.Emit(e); err != nil {
 		log.Printf("omni-sag: evidence emit failed (type=%s user=%s target=%s): %v", e.Type, e.User, e.Target, err)
 	}
+	return e
 }
 
 // New returns a Dialer bound to a policy and an evidence sink. A credential
@@ -217,6 +228,7 @@ func WithCyberArk(p CyberArkParams) (Option, error) {
 // Non-forwarding uses (e.g. an SFTP or interactive session layered on the
 // target) pass forwarding=false.
 func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP string, target policy.Target, forwarding bool) (net.Conn, error) {
+	_, decSpan := tracer.Start(ctx, "omnisag.policy.decide")
 	decision := d.currentPolicy().Decide(pr, target, d.resolver)
 
 	forwardRefused := decision.Allow && forwarding && !decision.ForwardingAllowed()
@@ -230,7 +242,7 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 	// must not silently drop the record: surface it, but the decision stands.
 	// Slice 3 will decide whether an un-recordable allow should fail closed;
 	// for now the failure is logged so a degraded sink is observable.
-	d.emit(evidence.Event{
+	evt := d.emit(evidence.Event{
 		Time:        time.Now().UTC(),
 		Type:        evidence.TypeTunnelDecision,
 		User:        pr.User,
@@ -241,6 +253,11 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 		MatchedRole: decision.MatchedRole,
 		RecordMode:  string(decision.RecordMode),
 	})
+	decSpan.SetAttributes(omnisagPolicyMatchedRole(decision.MatchedRole), omnisagEvidenceID(evt.ID))
+	if !effectiveAllow {
+		decSpan.SetStatus(codes.Error, reason)
+	}
+	decSpan.End()
 
 	if !decision.Allow {
 		return nil, fmt.Errorf("%w: %s", ErrDenied, decision.Reason)
@@ -263,6 +280,10 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 		return nil, err
 	}
 
+	_, dialSpan := tracer.Start(ctx, "omnisag.dial", trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(semconv.ServerAddress(target.Host), semconv.ServerPort(target.Port)))
+	defer dialSpan.End()
+
 	dialCtx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
 	control := d.dialControl
@@ -277,8 +298,10 @@ func (d *Dialer) DialTarget(ctx context.Context, pr policy.Principal, sourceIP s
 	}
 	conn, err := netDial(dialCtx, "tcp", target.String(), control)
 	if err != nil {
+		dialSpan.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("dialer: dial %s: %w", target, err)
 	}
+	dialSpan.SetAttributes(semconv.NetworkPeerAddress(peerAddress(conn.RemoteAddr())))
 	return conn, nil
 }
 
@@ -304,8 +327,11 @@ func (d *Dialer) PeekHost(pr policy.Principal, host string) policy.Decision {
 // cancellation, it returns ErrApprovalRefused and no socket is opened. Both the
 // request and the outcome are evidenced (never a secret).
 func (d *Dialer) gateApproval(ctx context.Context, pr policy.Principal, sourceIP string, target policy.Target) error {
+	ctx, span := tracer.Start(ctx, "omnisag.approval")
+	defer span.End()
 	if d.approvals == nil {
 		// Target requires approval but no store is wired: refuse, do not admit.
+		span.SetStatus(codes.Error, "approval required but no approval store configured")
 		return fmt.Errorf("%w: approval required but no approval store configured", ErrApprovalRefused)
 	}
 	req, err := d.approvals.Create(approval.Request{
@@ -315,24 +341,30 @@ func (d *Dialer) gateApproval(ctx context.Context, pr policy.Principal, sourceIP
 		Reason:    "session access to an approval-gated target",
 	}, d.approvalTTL)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("%w: %v", ErrApprovalRefused, err)
 	}
 	d.emitApproval(pr, sourceIP, target, req.ID, "requested", "pending")
 
 	final, werr := d.approvals.Wait(ctx, req.ID)
 	if werr != nil { // ctx cancelled etc.
-		d.emitApproval(pr, sourceIP, target, req.ID, "refused", string(final.Status))
+		evt := d.emitApproval(pr, sourceIP, target, req.ID, "refused", string(final.Status))
+		span.SetAttributes(omnisagApprovalOutcome("refused"), omnisagEvidenceID(evt.ID))
+		span.SetStatus(codes.Error, werr.Error())
 		return fmt.Errorf("%w: %v", ErrApprovalRefused, werr)
 	}
 	if !final.Approved(time.Now()) {
-		d.emitApproval(pr, sourceIP, target, req.ID, "refused", string(final.EffectiveStatus(time.Now())))
+		evt := d.emitApproval(pr, sourceIP, target, req.ID, "refused", string(final.EffectiveStatus(time.Now())))
+		span.SetAttributes(omnisagApprovalOutcome("refused"), omnisagEvidenceID(evt.ID))
+		span.SetStatus(codes.Error, "approval "+string(final.EffectiveStatus(time.Now())))
 		return fmt.Errorf("%w: request %s is %s", ErrApprovalRefused, req.ID, final.EffectiveStatus(time.Now()))
 	}
-	d.emitApproval(pr, sourceIP, target, req.ID, "granted", string(approval.StatusApproved))
+	evt := d.emitApproval(pr, sourceIP, target, req.ID, "granted", string(approval.StatusApproved))
+	span.SetAttributes(omnisagApprovalOutcome("granted"), omnisagEvidenceID(evt.ID))
 	return nil
 }
 
-func (d *Dialer) emitApproval(pr policy.Principal, sourceIP string, target policy.Target, reqID, outcome, status string) {
+func (d *Dialer) emitApproval(pr policy.Principal, sourceIP string, target policy.Target, reqID, outcome, status string) evidence.Event {
 	// Allow is left nil (unset) for "requested": a pending request is neither
 	// an allow nor a deny yet, unlike "granted"/"refused" which are a final
 	// outcome. Mirrors session.go's quarantine-release approval events,
@@ -344,7 +376,7 @@ func (d *Dialer) emitApproval(pr policy.Principal, sourceIP string, target polic
 	case "refused":
 		allow = evidence.BoolPtr(false)
 	}
-	d.emit(evidence.Event{
+	return d.emit(evidence.Event{
 		Time:      time.Now().UTC(),
 		Type:      evidence.TypeApproval,
 		User:      pr.User,
@@ -364,10 +396,13 @@ func (d *Dialer) emitApproval(pr policy.Principal, sourceIP string, target polic
 // secret is used just-in-time and zeroized (the real target-auth leg is stubbed
 // at the current gateway-terminated boundary — see ADR-0002).
 func (d *Dialer) resolveCredential(ctx context.Context, pr policy.Principal, sourceIP string, target policy.Target, decision policy.Decision) error {
+	_, span := tracer.Start(ctx, "omnisag.credential.resolve")
+	defer span.End()
 	if d.cred == nil {
 		return nil
 	}
 	mode := credential.Mode(decision.CredentialMode).Normalize()
+	span.SetAttributes(omnisagCredentialMode(string(mode)))
 	if mode == credential.ModePassthrough {
 		// The default: the gateway injects nothing and the caller's own
 		// connection is used. Nothing to resolve or record.
@@ -389,7 +424,7 @@ func (d *Dialer) resolveCredential(ctx context.Context, pr policy.Principal, sou
 			outcome = "fail_closed"
 		}
 	}
-	d.emit(evidence.Event{
+	evt := d.emit(evidence.Event{
 		Time:           time.Now().UTC(),
 		Type:           evidence.TypeCredential,
 		User:           pr.User,
@@ -400,8 +435,10 @@ func (d *Dialer) resolveCredential(ctx context.Context, pr policy.Principal, sou
 		Outcome:        outcome,
 		Reason:         reason,
 	})
+	span.SetAttributes(omnisagEvidenceID(evt.ID))
 
 	if cerr != nil {
+		span.SetStatus(codes.Error, reason)
 		return fmt.Errorf("%w: %v", ErrCredentialRefused, cerr)
 	}
 	if res.Secret != nil {

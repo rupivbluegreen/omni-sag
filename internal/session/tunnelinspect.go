@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"sync"
@@ -111,7 +112,7 @@ const tunnelSettle = 20 * time.Millisecond
 // the dry-run path (global enforce: false): decideEnforce may report a
 // would-block, logged as Allow=false with "dry-run" in Detail, but the
 // splice is never gated — only real enforce (holdAndClassify) can do that.
-func (s *Server) classifyAndEmit(taps *tunnelTaps, pr policy.Principal, srcIP, target string, expect []string) {
+func (s *Server) classifyAndEmit(ctx context.Context, taps *tunnelTaps, pr policy.Principal, srcIP, target string, expect []string) {
 	select {
 	case <-taps.sig:
 		time.Sleep(tunnelSettle)
@@ -128,7 +129,7 @@ func (s *Server) classifyAndEmit(taps *tunnelTaps, pr policy.Principal, srcIP, t
 			detail = "dry-run: " + detail
 		}
 	}
-	s.emit(evidence.Event{
+	s.emit(ctx, evidence.Event{
 		Type:     evidence.TypeTunnelProtocol,
 		User:     pr.User,
 		SourceIP: srcIP,
@@ -296,13 +297,13 @@ func (c *holdConn) CloseWrite() error {
 // either allows (replaying the held bytes into a normal splice) or, on
 // mismatch/unknown-deny, terminates the tunnel without ever forwarding the
 // held bytes to either side.
-func (s *Server) enforceTunnel(ch io.ReadWriteCloser, conn io.ReadWriteCloser, pr policy.Principal, srcIP, target string, expect []string) {
+func (s *Server) enforceTunnel(ctx context.Context, ch io.ReadWriteCloser, conn io.ReadWriteCloser, pr policy.Principal, srcIP, target string, expect []string) {
 	budget := s.tunnelInspect.MaxPrefixBytes
 	clientAR := newAsyncReader(ch)
 	serverAR := newAsyncReader(conn)
 	res := holdAndClassify(clientAR, serverAR, budget, s.tunnelInspect.ClassifyTimeout)
 	allow, reason := decideEnforce(res, expect, s.tunnelInspect.UnknownDeny)
-	s.emit(evidence.Event{
+	s.emit(ctx, evidence.Event{
 		Type:     evidence.TypeTunnelProtocol,
 		User:     pr.User,
 		SourceIP: srcIP,

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"io"
 	"runtime"
 	"sync"
@@ -85,7 +86,7 @@ func TestEnforceTunnel_DenyPathDoesNotLeakAsyncReaderGoroutines(t *testing.T) {
 	run := func() {
 		ch := newDenyProbeConn()
 		conn := newDenyProbeConn()
-		srv.enforceTunnel(ch, conn, pr, "127.0.0.1", "target:1", []string{"postgres"})
+		srv.enforceTunnel(context.Background(), ch, conn, pr, "127.0.0.1", "target:1", []string{"postgres"})
 	}
 
 	for i := 0; i < 3; i++ { // warm-up

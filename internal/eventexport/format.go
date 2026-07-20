@@ -1,7 +1,7 @@
 // Package eventexport renders evidence.Event records for external
-// SIEM/log-management systems. It is a leaf package: it imports only
-// internal/evidence and stdlib, so it stays free of import cycles with
-// internal/session and internal/dialer.
+// SIEM/log-management systems. It imports only internal/evidence, stdlib,
+// and (for the experimental "otlp" transport) internal/otelexport, so it
+// stays free of import cycles with internal/session and internal/dialer.
 package eventexport
 
 import (
