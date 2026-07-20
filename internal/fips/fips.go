@@ -12,8 +12,8 @@
 // signing, SHA-256 hashing). TLS-parameter conformance for LDAPS / CyberArk CCP
 // / the control-plane API is NOT part of Check; it is provided by the exported
 // ValidateTLSConfig / ApprovedTLSConfig helpers for callers to apply, and the
-// LDAPS insecure_tls escape hatch is separately rejected under fips.mode=enforce
-// by config validation.
+// LDAPS insecure_tls escape hatch and a cleartext control-plane API are
+// separately rejected under fips.mode=enforce by config validation.
 //
 // Default builds are unaffected: with no GODEBUG the runtime is not in FIPS
 // mode, Mode defaults to Off, and Check is a no-op that always succeeds.
@@ -275,6 +275,26 @@ func ApprovedTLSConfig() *tls.Config {
 		MinVersion:   tls.VersionTLS12,
 		CipherSuites: ApprovedCipherSuites(),
 	}
+}
+
+// Harden applies FIPS-approved TLS parameters to c in place, according to
+// mode. ModeOff leaves c untouched. ModeWarn and ModeEnforce raise MinVersion
+// to TLS 1.2 (never lowering an already-higher value) and pin CipherSuites to
+// the approved set. ModeEnforce additionally validates the result and fails
+// closed (returns the validation error) if it is still not FIPS-acceptable. A
+// nil config is a no-op.
+func Harden(c *tls.Config, mode Mode) error {
+	if mode == ModeOff || c == nil {
+		return nil
+	}
+	if c.MinVersion < tls.VersionTLS12 {
+		c.MinVersion = tls.VersionTLS12
+	}
+	c.CipherSuites = ApprovedCipherSuites()
+	if mode == ModeEnforce {
+		return ValidateTLSConfig(c)
+	}
+	return nil
 }
 
 func tlsVersionName(v uint16) string {
