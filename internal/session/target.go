@@ -48,6 +48,25 @@ func splitPcodeSelector(loginUser string) (user, pcode string) {
 	return loginUser[:i], loginUser[i+1:]
 }
 
+// splitTargetHostPort splits an optional trailing ":port" off the target host
+// from the "%host[:port]" grammar: "10.0.0.5:22" -> ("10.0.0.5", 22),
+// "10.0.0.5" -> ("10.0.0.5", 0), "[2001:db8::1]:22" -> ("2001:db8::1", 22).
+// A bare host — including a bare IPv6 literal without brackets — yields port 0
+// (host-only); only a bracketed IPv6 or a host with a valid 1..65535 numeric
+// suffix is treated as carrying a port. Port 0 means "no port given", which the
+// policy layer resolves from the matched rule instead.
+func splitTargetHostPort(hostspec string) (host string, port int) {
+	h, p, err := net.SplitHostPort(hostspec)
+	if err != nil {
+		return hostspec, 0
+	}
+	n, err := strconv.Atoi(p)
+	if err != nil || n < 1 || n > 65535 {
+		return hostspec, 0
+	}
+	return h, n
+}
+
 // dialNet is the single dial seam for the target's second SSH leg. A package
 // variable solely so tests can substitute a fake transport (mirrors
 // internal/dialer's netDial pattern); production always uses net.DialTimeout.

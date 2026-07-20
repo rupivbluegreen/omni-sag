@@ -56,6 +56,37 @@ func TestDecide_SelectorNotHeldDeniesGenerically(t *testing.T) {
 	}
 }
 
+func TestDecideHost_ExplicitPortMatchesAnyPortRule(t *testing.T) {
+	// A rule with omitted ports (any) is "0 configured ports" for the host-only
+	// path, but with an explicit client port ("%host:port") it authorizes
+	// host+port and dials the client's port.
+	p := Policy{Roles: []Role{{Name: "r", Groups: []string{"g"}, Allow: []Rule{{Host: "192.0.2.10", Credential: "prompt"}}}}}
+	pr := Principal{User: "alice", Groups: []string{"g"}, TargetPort: 2222}
+	d := p.DecideHost(pr, "192.0.2.10", nil)
+	if !d.Allow || d.Port != 2222 || d.CredentialMode != "prompt" {
+		t.Fatalf("explicit port vs any-port rule: allow=%v port=%d cred=%q reason=%q", d.Allow, d.Port, d.CredentialMode, d.Reason)
+	}
+}
+
+func TestDecideHost_ExplicitPortGatedByRulePorts(t *testing.T) {
+	p := Policy{Roles: []Role{{Name: "r", Groups: []string{"g"}, Allow: []Rule{{Host: "192.0.2.10", Ports: []int{22}}}}}}
+	if d := p.DecideHost(Principal{User: "a", Groups: []string{"g"}, TargetPort: 22}, "192.0.2.10", nil); !d.Allow || d.Port != 22 {
+		t.Fatalf("port 22 in [22]: allow=%v port=%d", d.Allow, d.Port)
+	}
+	if d := p.DecideHost(Principal{User: "a", Groups: []string{"g"}, TargetPort: 2345}, "192.0.2.10", nil); d.Allow {
+		t.Fatalf("port 2345 not in [22] must deny, got allow")
+	}
+}
+
+func TestDecideHost_HostOnlyStillRequiresExactlyOnePort(t *testing.T) {
+	// No TargetPort → the existing "matched rule must name exactly one port"
+	// requirement is unchanged (a 0-port rule is ambiguous).
+	p := Policy{Roles: []Role{{Name: "r", Groups: []string{"g"}, Allow: []Rule{{Host: "192.0.2.10"}}}}}
+	if d := p.DecideHost(Principal{User: "a", Groups: []string{"g"}}, "192.0.2.10", nil); d.Allow {
+		t.Fatalf("host-only vs 0-port rule must deny as ambiguous, got allow (reason=%q)", d.Reason)
+	}
+}
+
 func TestDecide_SelectorScopesTunnelDecision(t *testing.T) {
 	pr := Principal{User: "alice", Groups: []string{"grp-a", "grp-b"}, SelectedRole: "pcodeA"}
 	if d := twoPcodePolicy().Decide(pr, Target{Host: "192.0.2.10", Port: 22}, nil); !d.Allow || d.MatchedRole != "pcodeA" {

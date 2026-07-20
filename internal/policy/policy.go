@@ -32,6 +32,14 @@ type Principal struct {
 	TargetHost        string
 	TargetSecretToken string
 
+	// TargetPort is the real-target port the client explicitly requested via
+	// the "%host:port" auth-username grammar (0 when it wrote only "%host").
+	// When >0, DecideHost authorizes host+port like the -L path — any rule
+	// permitting that host+port grants it and the dial uses this port — instead
+	// of requiring the matched rule to name exactly one port. Carrier field,
+	// threaded from the auth layer like TargetHost.
+	TargetPort int
+
 	// SelectedRole optionally scopes every decision for this principal to a
 	// single role (a pcode), set from the "+pcode" selector in the SSH auth
 	// username (see session parsing). Empty ⇒ evaluate against all roles the
@@ -347,14 +355,15 @@ func allIn(ips []net.IP, n *net.IPNet) bool {
 // DecideHost is Decide's host-only counterpart for the gateway's real-target
 // second SSH leg (interactive shell / SFTP over a "session" channel). Unlike
 // -L forwarding — where the client's direct-tcpip request always carries a
-// real destination port, so Decide/Target.Port/Rule.matches can enforce it
-// exactly — the real-target flow's client auth username encodes only
-// "user%host" (splitTargetUser), never a port. There is therefore no port to
-// match against until AFTER a rule is chosen, which is exactly what this
-// method resolves: it matches by host alone, then reports the matched rule's
-// intended real-target port via Decision.Port.
+// real destination port — the real-target flow's client auth username MAY omit
+// the port ("user%host"). When a port IS given ("user%host:port", so
+// Principal.TargetPort > 0) this authorizes host+port exactly like the -L path
+// and dials that port (see the early return in the body). The rest of this
+// method handles the host-only case, where there is no port to match against
+// until AFTER a rule is chosen: it matches by host alone, then reports the
+// matched rule's intended real-target port via Decision.Port.
 //
-// Because there is no port to disambiguate on, DecideHost requires the host
+// In the host-only case, because there is no port to disambiguate on, DecideHost requires the host
 // to resolve UNAMBIGUOUSLY: exactly one rule (across every role the
 // principal holds) matches the host, and that rule names exactly one port.
 // Any other outcome fails closed (Allow: false, with a Reason explaining
@@ -381,6 +390,18 @@ func (p Policy) DecideHost(pr Principal, host string, resolve ResolverFunc) Deci
 	}
 	if len(roles) == 0 {
 		return Decision{Allow: false, RecordMode: RecordNone, Reason: "no role: principal holds no role granting any access"}
+	}
+	// If the client explicitly named a port ("%host:port"), authorize host+port
+	// exactly like the -L path — any rule permitting that host+port grants it,
+	// and the dial uses the client's port. This lifts the "matched rule must
+	// name exactly one port" requirement below, which exists only because a
+	// bare "%host" carries no port to resolve.
+	if pr.TargetPort > 0 {
+		d := p.Decide(pr, Target{Host: host, Port: pr.TargetPort}, resolve)
+		if d.Allow {
+			d.Port = pr.TargetPort
+		}
+		return d
 	}
 	type hostMatch struct {
 		role Role
