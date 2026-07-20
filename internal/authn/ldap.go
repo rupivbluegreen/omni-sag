@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/go-ldap/ldap/v3"
+
+	"github.com/rupivbluegreen/omni-sag/internal/fips"
 )
 
 // errUserNotFound distinguishes "the search found zero or multiple entries"
@@ -23,13 +25,14 @@ const defaultLDAPTimeout = 10 * time.Second
 
 // LDAPConfig configures an Active Directory LDAPS authenticator.
 type LDAPConfig struct {
-	URL          string // ldaps://dc1.lab.local:636
-	BaseDN       string // DC=lab,DC=local
-	BindDN       string // service account DN used for the user lookup
-	BindPassword string // service account password
-	UserFilter   string // printf with one %s for the username, e.g. (sAMAccountName=%s)
-	InsecureTLS  bool   // dev only: skip server certificate verification
-	NestedGroups bool   // resolve transitive/nested group membership (see resolveGroups)
+	URL          string    // ldaps://dc1.lab.local:636
+	BaseDN       string    // DC=lab,DC=local
+	BindDN       string    // service account DN used for the user lookup
+	BindPassword string    // service account password
+	UserFilter   string    // printf with one %s for the username, e.g. (sAMAccountName=%s)
+	InsecureTLS  bool      // dev only: skip server certificate verification
+	NestedGroups bool      // resolve transitive/nested group membership (see resolveGroups)
+	Mode         fips.Mode // FIPS TLS posture; warn/enforce harden the LDAPS TLS config
 }
 
 // sidResolveBatch bounds how many group SIDs are resolved to CNs per objectSid
@@ -263,9 +266,13 @@ func (a *LDAPAuthenticator) lookupUser(ctx context.Context, conn *ldap.Conn, use
 }
 
 func (a *LDAPAuthenticator) dial() (*ldap.Conn, error) {
-	conn, err := ldap.DialURL(a.cfg.URL, ldap.DialWithTLSConfig(&tls.Config{
+	tlsCfg := &tls.Config{
 		InsecureSkipVerify: a.cfg.InsecureTLS, //nolint:gosec // dev-only opt-in; rejected under fips.mode=enforce by config validation
-	}))
+	}
+	if err := fips.Harden(tlsCfg, a.cfg.Mode); err != nil {
+		return nil, fmt.Errorf("%w: fips: %v", ErrAuth, err)
+	}
+	conn, err := ldap.DialURL(a.cfg.URL, ldap.DialWithTLSConfig(tlsCfg))
 	if err != nil {
 		return nil, fmt.Errorf("%w: connect: %v", ErrAuth, err)
 	}

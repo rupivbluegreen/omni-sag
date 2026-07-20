@@ -1,6 +1,10 @@
 package eventexport
 
-import "time"
+import (
+	"time"
+
+	"github.com/rupivbluegreen/omni-sag/internal/fips"
+)
 
 // defaultBufferSize is used when an ExporterConfig doesn't set BufferSize
 // (or sets a non-positive value).
@@ -17,6 +21,7 @@ const defaultSinkFlushInterval = time.Second
 type Config struct {
 	Enabled   bool
 	Exporters []ExporterConfig
+	Mode      fips.Mode // FIPS TLS posture for transports that dial out (syslog-tls, http); warn/enforce harden the egress TLS config
 }
 
 // ExporterConfig describes one export destination: a Formatter + Transport

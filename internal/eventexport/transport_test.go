@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rupivbluegreen/omni-sag/internal/fips"
 )
 
 // withTimeout runs fn in a goroutine and fails the test loudly instead of
@@ -131,7 +133,7 @@ func TestSyslogTransport_FramesAndReconnects(t *testing.T) {
 	}
 	defer ln.Close()
 
-	tr, err := newSyslogTransport(SyslogConfig{Address: ln.Addr().String(), Protocol: "tcp"})
+	tr, err := newSyslogTransport(SyslogConfig{Address: ln.Addr().String(), Protocol: "tcp"}, fips.ModeOff)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +222,7 @@ func TestSyslogTransport_FramesAndReconnects(t *testing.T) {
 func TestSyslogTransport_DeadDestinationDoesNotBlock(t *testing.T) {
 	// A destination nobody is listening on: UDP never errors synchronously
 	// on Write, TCP would refuse — either way this must return promptly.
-	tr, err := newSyslogTransport(SyslogConfig{Address: "127.0.0.1:1", Protocol: "tcp"})
+	tr, err := newSyslogTransport(SyslogConfig{Address: "127.0.0.1:1", Protocol: "tcp"}, fips.ModeOff)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +246,7 @@ func TestHTTPTransport_BatchesAndFlushes(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tr, err := newHTTPTransport(HTTPConfig{URL: srv.URL, BatchSize: 3})
+	tr, err := newHTTPTransport(HTTPConfig{URL: srv.URL, BatchSize: 3}, fips.ModeOff)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +305,7 @@ func TestHTTPTransport_BestEffortOn500(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tr, err := newHTTPTransport(HTTPConfig{URL: srv.URL, BatchSize: 1})
+	tr, err := newHTTPTransport(HTTPConfig{URL: srv.URL, BatchSize: 1}, fips.ModeOff)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +319,7 @@ func TestHTTPTransport_BestEffortOn500(t *testing.T) {
 }
 
 func TestHTTPTransport_DeadServerDoesNotBlock(t *testing.T) {
-	tr, err := newHTTPTransport(HTTPConfig{URL: "http://127.0.0.1:1/no-such-server", BatchSize: 1})
+	tr, err := newHTTPTransport(HTTPConfig{URL: "http://127.0.0.1:1/no-such-server", BatchSize: 1}, fips.ModeOff)
 	if err != nil {
 		t.Fatal(err)
 	}

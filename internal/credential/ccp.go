@@ -12,6 +12,8 @@ import (
 	"os"
 	"time"
 	"unicode/utf8"
+
+	"github.com/rupivbluegreen/omni-sag/internal/fips"
 )
 
 // Query identifies the account to fetch from CyberArk.
@@ -28,6 +30,7 @@ type CCPConfig struct {
 	ClientKeyPath  string // PEM client key
 	CACertPath     string // PEM CA that must sign the CCP server cert (no InsecureSkipVerify)
 	Timeout        time.Duration
+	Mode           fips.Mode // FIPS TLS posture; warn/enforce harden the client TLS config
 }
 
 // CCPClient fetches secrets from CyberArk CCP over HTTPS with mutual TLS. The
@@ -62,17 +65,19 @@ func NewCCPClient(cfg CCPConfig) (*CCPClient, error) {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      pool,
+		MinVersion:   tls.VersionTLS12,
+	}
+	if err := fips.Harden(tlsCfg, cfg.Mode); err != nil {
+		return nil, fmt.Errorf("ccp: %w", err)
+	}
 	return &CCPClient{
 		base: cfg.BaseURL,
 		client: &http.Client{
-			Timeout: timeout,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					Certificates: []tls.Certificate{cert},
-					RootCAs:      pool,
-					MinVersion:   tls.VersionTLS12,
-				},
-			},
+			Timeout:   timeout,
+			Transport: &http.Transport{TLSClientConfig: tlsCfg},
 		},
 	}, nil
 }

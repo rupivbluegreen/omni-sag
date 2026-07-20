@@ -9,6 +9,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/rupivbluegreen/omni-sag/internal/fips"
 )
 
 const httpRequestTimeout = 3 * time.Second
@@ -31,7 +33,7 @@ type httpTransport struct {
 	buf       [][]byte
 }
 
-func newHTTPTransport(cfg HTTPConfig) (*httpTransport, error) {
+func newHTTPTransport(cfg HTTPConfig, mode fips.Mode) (*httpTransport, error) {
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("eventexport: http transport: url required")
 	}
@@ -39,7 +41,7 @@ func newHTTPTransport(cfg HTTPConfig) (*httpTransport, error) {
 	if batchSize <= 0 {
 		batchSize = 1
 	}
-	tlsCfg, err := cfg.TLS.build()
+	tlsCfg, err := cfg.TLS.build(mode)
 	if err != nil {
 		return nil, err
 	}

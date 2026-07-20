@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/rupivbluegreen/omni-sag/internal/fips"
 )
 
 const (
@@ -58,7 +60,7 @@ type syslogTransport struct {
 	conn     net.Conn
 }
 
-func newSyslogTransport(cfg SyslogConfig) (*syslogTransport, error) {
+func newSyslogTransport(cfg SyslogConfig, mode fips.Mode) (*syslogTransport, error) {
 	switch cfg.Protocol {
 	case "udp", "tcp", "tls":
 	default:
@@ -70,7 +72,7 @@ func newSyslogTransport(cfg SyslogConfig) (*syslogTransport, error) {
 	var tlsCfg *tls.Config
 	if cfg.Protocol == "tls" {
 		var err error
-		tlsCfg, err = cfg.TLS.build()
+		tlsCfg, err = cfg.TLS.build(mode)
 		if err != nil {
 			return nil, err
 		}
