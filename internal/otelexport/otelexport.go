@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	logglobal "go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -140,6 +141,19 @@ func Setup(ctx context.Context, cfg Config) (*Providers, error) {
 		}
 		otel.SetMeterProvider(mp)
 		shutdowns = append(shutdowns, mp.Shutdown)
+	}
+
+	// EXPERIMENTAL: the OTel logs SDK is pre-GA (see logmap.go/otlplog.go).
+	// LoggerProvider registration is via go.opentelemetry.io/otel/log/global,
+	// not the stable otel package — that global itself will be deprecated
+	// once logs graduate; isolated here rather than in the stable path above.
+	if cfg.Logs.Enabled {
+		lp, err := buildLoggerProvider(ctx, cfg, res)
+		if err != nil {
+			return nil, err
+		}
+		logglobal.SetLoggerProvider(lp)
+		shutdowns = append(shutdowns, lp.Shutdown)
 	}
 
 	p.shutdown = func(ctx context.Context) error {

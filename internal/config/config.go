@@ -75,7 +75,7 @@ type ExportConfig struct {
 type ExporterSpec struct {
 	Name       string `yaml:"name"`
 	Format     string `yaml:"format"`      // json | ecs | cef
-	Transport  string `yaml:"transport"`   // file | syslog | http
+	Transport  string `yaml:"transport"`   // file | syslog | http | otlp (experimental; requires format json)
 	BufferSize int    `yaml:"buffer_size"` // <=0 (incl. unset) defaults in eventexport
 
 	File   *ExportFileConfig   `yaml:"file"`
@@ -714,8 +714,15 @@ func validateExportConfig(ex *ExportConfig) error {
 			if e.HTTP == nil {
 				return fmt.Errorf("config: export exporter %q transport %q requires an http block", e.Name, e.Transport)
 			}
+		case "otlp":
+			// EXPERIMENTAL: ships events as OTLP LogRecords (internal/otelexport);
+			// no sub-config of its own, but it only makes sense paired with
+			// format json (see eventexport.buildTransport).
+			if e.Format != "json" {
+				return fmt.Errorf("config: export exporter %q transport %q requires format json", e.Name, e.Transport)
+			}
 		default:
-			return fmt.Errorf("config: export exporter %q has invalid transport %q (want file|syslog|http)", e.Name, e.Transport)
+			return fmt.Errorf("config: export exporter %q has invalid transport %q (want file|syslog|http|otlp)", e.Name, e.Transport)
 		}
 	}
 	return nil

@@ -800,3 +800,45 @@ otel:
 		t.Fatal("expected validation error for otel.enabled with no endpoint")
 	}
 }
+
+func TestExportConfig_OTLPTransportRequiresJSONFormat(t *testing.T) {
+	y := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+export:
+  enabled: true
+  exporters:
+    - name: otel-logs
+      format: ecs
+      transport: otlp
+`
+	if _, err := Load(writeTemp(t, y)); err == nil {
+		t.Fatal("expected error: otlp transport requires format json")
+	}
+}
+
+func TestExportConfig_OTLPTransportWithJSONFormatAccepted(t *testing.T) {
+	y := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+export:
+  enabled: true
+  exporters:
+    - name: otel-logs
+      format: json
+      transport: otlp
+`
+	f, err := Load(writeTemp(t, y))
+	if err != nil {
+		t.Fatalf("otlp transport with format json should be accepted: %v", err)
+	}
+	if f.Export.Exporters[0].Transport != "otlp" {
+		t.Fatalf("transport = %q, want otlp", f.Export.Exporters[0].Transport)
+	}
+}

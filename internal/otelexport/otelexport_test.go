@@ -71,3 +71,27 @@ func TestSetup_BadProtocolErrors(t *testing.T) {
 		t.Fatal("expected an error for an unknown protocol")
 	}
 }
+
+func TestSetup_LogsEnabledNonBlockingAgainstDeadCollector(t *testing.T) {
+	p, err := Setup(context.Background(), Config{
+		Enabled:  true,
+		Endpoint: "127.0.0.1:4319",
+		Protocol: "grpc",
+		Insecure: true,
+		Logs:     LogsConfig{Enabled: true},
+	})
+	if err != nil {
+		t.Fatalf("Setup(logs enabled): %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		done <- p.Shutdown(ctx)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown did not return promptly against a dead collector")
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
+	"github.com/rupivbluegreen/omni-sag/internal/otelexport"
 )
 
 // ForwardingSink decorates a durable evidence.Sink with best-effort fan-out
@@ -103,6 +104,17 @@ func buildTransport(ec ExporterConfig) (Transport, error) {
 			return nil, fmt.Errorf("transport %q: missing http config", ec.Transport)
 		}
 		return newHTTPTransport(*ec.HTTP)
+	case "otlp":
+		// EXPERIMENTAL (see internal/otelexport's design doc): ships evidence
+		// events as OTLP LogRecords via the OTel logs SDK's own bounded
+		// BatchProcessor, reusing this package's fan-out/drop engine rather
+		// than a second pump. Requires Format: "json" — LogTransport decodes
+		// the same shape jsonFormatter produces (including the additive
+		// trace_id/span_id fields) back into an evidence.Event.
+		if ec.Format != "json" {
+			return nil, fmt.Errorf("transport %q requires format \"json\"", ec.Transport)
+		}
+		return otelexport.NewLogTransport(ec.Name), nil
 	default:
 		return nil, fmt.Errorf("unknown transport %q", ec.Transport)
 	}
