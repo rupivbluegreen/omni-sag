@@ -247,6 +247,20 @@ func run(cfgPath string, debug bool) error {
 		opts = append(opts, session.WithInspection(gate))
 		log.Printf("omni-sag: SFTP content inspection enabled (ICAP %s/%s)", cfg.Inspection.ICAP.Endpoint, cfg.Inspection.ICAP.Service)
 	}
+	if ti := cfg.TunnelInspection; ti != nil && ti.Enabled {
+		opts = append(opts, session.WithTunnelInspection(session.TunnelInspectConfig{
+			Enabled:         true,
+			MaxPrefixBytes:  ti.MaxPrefixBytes,
+			ClassifyTimeout: time.Duration(ti.ClassifyTimeoutSeconds) * time.Second,
+			Enforce:         ti.Enforce,
+			UnknownDeny:     ti.UnknownAction == "deny",
+		}))
+		mode := "observe"
+		if ti.Enforce {
+			mode = "enforce"
+		}
+		log.Printf("omni-sag: tunnel protocol identification enabled (%s mode)", mode)
+	}
 	if cfg.Approval != nil {
 		relStore, err := release.NewFileStore(filepath.Join(filepath.Dir(cfg.Approval.StorePath), "releases.json"))
 		if err != nil {
