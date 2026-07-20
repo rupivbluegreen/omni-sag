@@ -68,6 +68,12 @@ type Event struct {
 
 	// Freeform detail for anything not yet promoted to a field.
 	Detail string `json:"detail,omitempty"`
+
+	// Trace correlation (optional, additive): the OTel trace/span that was
+	// active when this event was emitted, if any. Empty when OTel is
+	// disabled or no span was active — never populated retroactively.
+	TraceID string `json:"trace_id,omitempty"`
+	SpanID  string `json:"span_id,omitempty"`
 }
 
 // Sink is a destination for evidence events. Implementations must be safe for

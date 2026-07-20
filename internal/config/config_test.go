@@ -724,6 +724,125 @@ func TestExportConfig_BufferSizeDefaultsInEventExport(t *testing.T) {
 	}
 }
 
+func TestLoad_OTelDefaultsWhenBlockPresent(t *testing.T) {
+	y := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+otel:
+  enabled: true
+  endpoint: "collector:4317"
+`
+	f, err := Load(writeTemp(t, y))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.OTel == nil || !f.OTel.Enabled {
+		t.Fatal("otel should be enabled")
+	}
+	if f.OTel.Protocol() != "grpc" {
+		t.Fatalf("default protocol = %q, want grpc", f.OTel.Protocol())
+	}
+	if f.OTel.Sampler() != "parentbased_always_on" {
+		t.Fatalf("default sampler = %q", f.OTel.Sampler())
+	}
+	// traces default ON when otel enabled; metrics/logs default OFF
+	if !f.OTel.TracesEnabled() {
+		t.Fatal("traces should default enabled")
+	}
+	if f.OTel.MetricsEnabled() || f.OTel.LogsEnabled() {
+		t.Fatal("metrics and logs should default disabled")
+	}
+}
+
+func TestLoad_OTelAbsentIsNil(t *testing.T) {
+	y := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+`
+	f, err := Load(writeTemp(t, y))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.OTel != nil {
+		t.Fatal("absent otel block must be nil (feature off)")
+	}
+}
+
+func TestLoad_OTelRejectsBadProtocolAndSampler(t *testing.T) {
+	for _, bad := range []string{
+		"otel:\n  enabled: true\n  protocol: carrier-pigeon\n",
+		"otel:\n  enabled: true\n  traces:\n    sampler: sometimes\n",
+	} {
+		y := "listen: \":2222\"\nevidence:\n  file: \"e.jsonl\"\npolicy:\n  roles: []\n" + bad
+		if _, err := Load(writeTemp(t, y)); err == nil {
+			t.Fatalf("expected validation error for %q", bad)
+		}
+	}
+}
+
+func TestLoad_OTelRequiresEndpointWhenEnabled(t *testing.T) {
+	y := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+otel:
+  enabled: true
+`
+	if _, err := Load(writeTemp(t, y)); err == nil {
+		t.Fatal("expected validation error for otel.enabled with no endpoint")
+	}
+}
+
+func TestExportConfig_OTLPTransportRequiresJSONFormat(t *testing.T) {
+	y := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+export:
+  enabled: true
+  exporters:
+    - name: otel-logs
+      format: ecs
+      transport: otlp
+`
+	if _, err := Load(writeTemp(t, y)); err == nil {
+		t.Fatal("expected error: otlp transport requires format json")
+	}
+}
+
+func TestExportConfig_OTLPTransportWithJSONFormatAccepted(t *testing.T) {
+	y := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+export:
+  enabled: true
+  exporters:
+    - name: otel-logs
+      format: json
+      transport: otlp
+`
+	f, err := Load(writeTemp(t, y))
+	if err != nil {
+		t.Fatalf("otlp transport with format json should be accepted: %v", err)
+	}
+	if f.Export.Exporters[0].Transport != "otlp" {
+		t.Fatalf("transport = %q, want otlp", f.Export.Exporters[0].Transport)
+	}
+}
+
 func TestValidate_TunnelInspectionDefaults(t *testing.T) {
 	ok := `
 listen: ":2222"

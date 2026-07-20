@@ -21,6 +21,8 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 	"github.com/rupivbluegreen/omni-sag/internal/release"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -50,13 +52,16 @@ import (
 // in Close(), returns — the two are circular, so external cancellation is
 // the only way out short of the TTL.
 func (s *Server) runSFTP(ctx, connCtx context.Context, channel ssh.Channel, pr policy.Principal, srcIP string, sconn ssh.Conn, tch *targetConnCache) {
-	s.emit(evidence.Event{
+	ctx, sftpSpan := tracer.Start(ctx, "omnisag.sftp")
+	defer sftpSpan.End()
+
+	s.emit(ctx, evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeSessionStart,
 		User: pr.User, SourceIP: srcIP, Detail: "sftp",
 	})
 	if pr.TargetHost == "" {
 		_ = channel.Close()
-		s.emit(evidence.Event{
+		s.emit(ctx, evidence.Event{
 			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
 			User: pr.User, SourceIP: srcIP, Detail: "sftp refused: no target selected",
 		})
@@ -75,7 +80,7 @@ func (s *Server) runSFTP(ctx, connCtx context.Context, channel ssh.Channel, pr p
 		if reason == "" {
 			reason = "no policy decision available for this target"
 		}
-		s.emit(evidence.Event{
+		s.emit(ctx, evidence.Event{
 			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
 			User: pr.User, SourceIP: srcIP, Detail: "sftp refused: " + reason,
 		})
@@ -93,7 +98,7 @@ func (s *Server) runSFTP(ctx, connCtx context.Context, channel ssh.Channel, pr p
 	})
 	if err != nil {
 		_ = channel.Close()
-		s.emit(evidence.Event{
+		s.emit(ctx, evidence.Event{
 			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
 			User: pr.User, SourceIP: srcIP, Detail: "sftp refused: " + err.Error(),
 		})
@@ -102,7 +107,7 @@ func (s *Server) runSFTP(ctx, connCtx context.Context, channel ssh.Channel, pr p
 	sftpClient, err := sftp.NewClient(targetClient)
 	if err != nil {
 		_ = channel.Close()
-		s.emit(evidence.Event{
+		s.emit(ctx, evidence.Event{
 			Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
 			User: pr.User, SourceIP: srcIP, Detail: "sftp refused: target sftp client: " + err.Error(),
 		})
@@ -111,7 +116,7 @@ func (s *Server) runSFTP(ctx, connCtx context.Context, channel ssh.Channel, pr p
 	defer sftpClient.Close()
 
 	fs := &remoteFS{
-		client: sftpClient, gate: s.inspect, srv: s, user: pr.User, srcIP: srcIP, ctx: connCtx,
+		client: sftpClient, gate: s.inspect, srv: s, user: pr.User, srcIP: srcIP, ctx: connCtx, traceCtx: ctx,
 		matchedGroups: decision.MatchedGroups, releases: s.releases, releaseTTL: s.releaseTTL,
 	}
 	server := sftp.NewRequestServer(channel, sftp.Handlers{
@@ -123,7 +128,7 @@ func (s *Server) runSFTP(ctx, connCtx context.Context, channel ssh.Channel, pr p
 	_ = server.Serve()
 	_ = server.Close()
 	_ = channel.Close()
-	s.emit(evidence.Event{
+	s.emit(ctx, evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
 		User: pr.User, SourceIP: srcIP,
 	})
@@ -155,12 +160,17 @@ func releaseIDFrom(p string) string {
 // approves its release from quarantine, then records a release for the
 // uploader to pull down themselves (Task 6).
 type remoteFS struct {
-	client        *sftp.Client
-	gate          *inspectgate.Gate // set when inspection is configured; used by Filewrite
-	srv           *Server           // for approvals/evidence; nil only in Task 9's read-only tests
-	user          string
-	srcIP         string // source IP of the client connection; threaded into every evidence event Close() emits
-	ctx           context.Context
+	client *sftp.Client
+	gate   *inspectgate.Gate // set when inspection is configured; used by Filewrite
+	srv    *Server           // for approvals/evidence; nil only in Task 9's read-only tests
+	user   string
+	srcIP  string // source IP of the client connection; threaded into every evidence event Close() emits
+	ctx    context.Context
+	// traceCtx is the omnisag.sftp-span-bearing context (set by runSFTP),
+	// used only to parent per-file omnisag.transfer/omnisag.inspect spans and
+	// to correlate their evidence events — never for cancellation, which
+	// stays on ctx (connCtx) above.
+	traceCtx      context.Context
 	matchedGroups []string      // decision.MatchedGroups for this session's target — snapshotted onto release requests for group-scoped four-eyes
 	releases      release.Store // for recording approved releases and serving /releases; nil disables the pull-download flow
 	releaseTTL    time.Duration
@@ -171,6 +181,17 @@ type remoteFS struct {
 func (fs *remoteFS) ctxOrBackground() context.Context {
 	if fs.ctx != nil {
 		return fs.ctx
+	}
+	return context.Background()
+}
+
+// traceCtxOrBackground returns fs.traceCtx, falling back to
+// context.Background() for tests (or scp.go callers) that construct a
+// remoteFS without one — spans then simply have no parent instead of
+// panicking or nesting incorrectly.
+func (fs *remoteFS) traceCtxOrBackground() context.Context {
+	if fs.traceCtx != nil {
+		return fs.traceCtx
 	}
 	return context.Background()
 }
@@ -192,7 +213,9 @@ func (fs *remoteFS) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newDownloadTap(f, p, fs), nil
+	trCtx, trSpan := tracer.Start(fs.traceCtxOrBackground(), "omnisag.transfer", trace.WithAttributes(
+		omnisagPath(p), omnisagTransferDirection("download")))
+	return newDownloadTap(trCtx, trSpan, f, p, fs), nil
 }
 
 // readRelease serves a /releases/<id> read: the release must belong to
@@ -296,6 +319,8 @@ type downloadTap struct {
 	r    io.ReaderAt
 	path string
 	fs   *remoteFS
+	ctx  context.Context // carries the omnisag.transfer span; correlates the emitted evidence event
+	span trace.Span
 
 	mu           sync.Mutex
 	h            hash.Hash
@@ -307,8 +332,8 @@ type downloadTap struct {
 	closeErr  error
 }
 
-func newDownloadTap(r io.ReaderAt, p string, fs *remoteFS) *downloadTap {
-	return &downloadTap{r: r, path: p, fs: fs, h: sha256.New()}
+func newDownloadTap(ctx context.Context, span trace.Span, r io.ReaderAt, p string, fs *remoteFS) *downloadTap {
+	return &downloadTap{ctx: ctx, span: span, r: r, path: p, fs: fs, h: sha256.New()}
 }
 
 // ReadAt proxies straight through to the real target file (the delivered
@@ -372,12 +397,14 @@ func (d *downloadTap) Close() error {
 		sum := hex.EncodeToString(d.h.Sum(nil))
 		d.mu.Unlock()
 		if d.fs.srv != nil {
-			d.fs.srv.emit(evidence.Event{
+			evt := d.fs.srv.emit(d.ctx, evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeTransfer,
 				User: d.fs.user, SourceIP: d.fs.srcIP, Path: d.path, Direction: "download",
 				Bytes: bytesSeen, SHA256: sum, Detail: "sftp transfer",
 			})
+			d.span.SetAttributes(omnisagTransferBytes(bytesSeen), omnisagEvidenceID(evt.ID))
 		}
+		d.span.End()
 	})
 	return d.closeErr
 }
@@ -512,16 +539,21 @@ func (fs *remoteFS) emitFilecmd(op, p, detail string, err error) {
 	if fs.srv == nil {
 		return
 	}
+	trCtx, trSpan := tracer.Start(fs.traceCtxOrBackground(), "omnisag.transfer", trace.WithAttributes(
+		omnisagPath(p), omnisagTransferDirection(op)))
+	defer trSpan.End()
 	reason := ""
 	if err != nil {
 		reason = err.Error()
+		trSpan.SetStatus(codes.Error, reason)
 	}
-	fs.srv.emit(evidence.Event{
+	evt := fs.srv.emit(trCtx, evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeTransfer,
 		User: fs.user, SourceIP: fs.srcIP, Path: p,
 		Direction: op, Allow: evidence.BoolPtr(err == nil), Reason: reason,
 		Detail: detail,
 	})
+	trSpan.SetAttributes(omnisagEvidenceID(evt.ID))
 }
 
 // Filewrite (FilePut): every upload streams through inspection exactly as
@@ -548,7 +580,9 @@ func (fs *remoteFS) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	}
 	p := cleanPath(r.Filepath)
 	iu := newInspectUpload(fs.ctxOrBackground(), fs.gate, p)
-	return &quarantineWriteHandle{iu: iu, fs: fs, path: p}, nil
+	trCtx, trSpan := tracer.Start(fs.traceCtxOrBackground(), "omnisag.transfer", trace.WithAttributes(
+		omnisagPath(p), omnisagTransferDirection("upload")))
+	return &quarantineWriteHandle{iu: iu, fs: fs, path: p, ctx: trCtx, span: trSpan}, nil
 }
 
 // quarantineWriteHandle wraps an inspectUpload (Task 10's now-unconditional
@@ -559,6 +593,8 @@ type quarantineWriteHandle struct {
 	iu   *inspectUpload
 	fs   *remoteFS
 	path string
+	ctx  context.Context // the omnisag.transfer span-bearing ctx; correlates every evidence event this handle emits
+	span trace.Span
 
 	// closeOnce guards Close's whole body, mirroring inspectUpload's own
 	// closeOnce above: without it, a second Close() call (pkg/sftp is not
@@ -589,8 +625,16 @@ func (h *quarantineWriteHandle) Close() error {
 
 // doClose is Close's real body, run exactly once via closeOnce above.
 func (h *quarantineWriteHandle) doClose() error {
+	defer h.span.End()
 	inspErr := h.iu.Close()
 	dec := h.iu.dec
+
+	// The ICAP verdict brackets an omnisag.inspect child span: it's the point
+	// at which the verdict is known and recorded, not the raw async ICAP
+	// round-trip inside inspectUpload's own goroutine (which has no access to
+	// this span tree) — a lean, surgical choice rather than replumbing that
+	// goroutine's context.
+	_, inspSpan := tracer.Start(h.ctx, "omnisag.inspect", trace.WithAttributes(omnisagInspectionVerdict(dec.Verdict)))
 	// Emit the inspection verdict for every upload — clean, blocked, and
 	// fail-closed-unscannable alike — exactly as the pre-Task-11 memFS path
 	// did (runSFTP's old per-session loop over fs.inspections()). Without
@@ -600,7 +644,7 @@ func (h *quarantineWriteHandle) doClose() error {
 	// check below so the blocked/unscannable case is evidenced too, not only
 	// the clean case that goes on to request a release.
 	if h.fs.srv != nil {
-		h.fs.srv.emit(evidence.Event{
+		evt := h.fs.srv.emit(h.ctx, evidence.Event{
 			Time: time.Now().UTC(), Type: evidence.TypeInspection,
 			User: h.fs.user, SourceIP: h.fs.srcIP, Path: h.path, Direction: "upload",
 			Bytes: dec.Bytes, SHA256: dec.SHA256,
@@ -608,11 +652,19 @@ func (h *quarantineWriteHandle) doClose() error {
 			ObjectKey: dec.QuarantineKey, Allow: evidence.BoolPtr(dec.Allow),
 			Reason: dec.Reason, Detail: "sftp content inspection",
 		})
+		inspSpan.SetAttributes(omnisagEvidenceID(evt.ID))
 	}
+	if !dec.Allow {
+		inspSpan.SetStatus(codes.Error, dec.Reason)
+	}
+	inspSpan.End()
+
 	if inspErr != nil {
+		h.span.SetStatus(codes.Error, inspErr.Error())
 		return inspErr // blocked/unscannable — already refused, no release request
 	}
 	if h.fs.srv == nil || h.fs.srv.approvals == nil {
+		h.span.SetStatus(codes.Error, "no approval store configured to release upload")
 		return fmt.Errorf("sftp: upload quarantined (key=%s) but no approval store is configured to release it", dec.QuarantineKey)
 	}
 	req, err := h.fs.srv.approvals.Create(approval.Request{
@@ -623,9 +675,10 @@ func (h *quarantineWriteHandle) doClose() error {
 		Reason:          fmt.Sprintf("release %s to %s", dec.QuarantineKey, h.path),
 	}, h.fs.srv.approvalTTL)
 	if err != nil {
+		h.span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("sftp: create release request: %w", err)
 	}
-	h.fs.srv.emit(evidence.Event{
+	h.fs.srv.emit(h.ctx, evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeApproval,
 		User: h.fs.user, SourceIP: h.fs.srcIP, Target: h.path, ObjectKey: req.ID,
 		Outcome: "requested", Reason: "quarantine release pending",
@@ -633,7 +686,7 @@ func (h *quarantineWriteHandle) doClose() error {
 
 	final, werr := h.fs.srv.approvals.Wait(h.fs.ctxOrBackground(), req.ID)
 	approved := werr == nil && final.Approved(time.Now())
-	h.fs.srv.emit(evidence.Event{
+	evt := h.fs.srv.emit(h.ctx, evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeApproval,
 		User: h.fs.user, SourceIP: h.fs.srcIP, Target: h.path, ObjectKey: req.ID,
 		Allow:   evidence.BoolPtr(approved),
@@ -641,10 +694,13 @@ func (h *quarantineWriteHandle) doClose() error {
 		Reason:  "quarantine release " + string(final.EffectiveStatus(time.Now())),
 	})
 	if !approved {
+		h.span.SetAttributes(omnisagEvidenceID(evt.ID))
+		h.span.SetStatus(codes.Error, "quarantine release "+string(final.EffectiveStatus(time.Now())))
 		return fmt.Errorf("sftp: upload to %s denied: quarantine release %s", h.path, final.EffectiveStatus(time.Now()))
 	}
 
 	if h.fs.releases == nil {
+		h.span.SetStatus(codes.Error, "no release store configured")
 		return fmt.Errorf("sftp: upload %s approved for release (key=%s) but no release store is configured", h.path, dec.QuarantineKey)
 	}
 	rel, err := h.fs.releases.Create(release.Release{
@@ -653,15 +709,17 @@ func (h *quarantineWriteHandle) doClose() error {
 		OriginalFilename: h.path,
 	}, h.fs.releaseTTL)
 	if err != nil {
+		h.span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("sftp: record release for %s: %w", h.path, err)
 	}
 
-	h.fs.srv.emit(evidence.Event{
+	evt2 := h.fs.srv.emit(h.ctx, evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeTransfer,
 		User: h.fs.user, SourceIP: h.fs.srcIP, Path: h.path, Direction: "released",
 		Bytes: dec.Bytes, SHA256: dec.SHA256, ObjectKey: dec.QuarantineKey,
 		Detail: fmt.Sprintf("released to /releases (id=%s, expires=%s) — pull-download by %s, not pushed to target", rel.ID, rel.ExpiresAt.Format(time.RFC3339), h.fs.user),
 	})
+	h.span.SetAttributes(omnisagTransferBytes(dec.Bytes), omnisagEvidenceID(evt2.ID))
 	return nil
 }
 

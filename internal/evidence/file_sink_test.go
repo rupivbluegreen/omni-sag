@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -74,5 +75,30 @@ func TestFileSink_AppendsAcrossOpens(t *testing.T) {
 	}
 	if lines != 2 {
 		t.Fatalf("expected 2 appended lines, got %d", lines)
+	}
+}
+
+// TestFileSink_TraceFieldsOmittedWhenEmpty proves the additive TraceID/SpanID
+// fields (populated only when a span is active — internal/session, internal/
+// dialer) are omitted from the JSONL line when unset, so JSONL emitted by a
+// gateway with OTel disabled is byte-identical to pre-feature output.
+func TestFileSink_TraceFieldsOmittedWhenEmpty(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "evidence.jsonl")
+	s, err := NewFileSink(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Emit(Event{Type: TypeAuth, User: "alice", Detail: "bind ok"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "trace_id") || strings.Contains(string(raw), "span_id") {
+		t.Fatalf("expected trace_id/span_id omitted from JSONL when unset, got: %s", raw)
 	}
 }

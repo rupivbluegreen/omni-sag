@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rupivbluegreen/omni-sag/internal/approval"
 	"github.com/rupivbluegreen/omni-sag/internal/authn"
 	"github.com/rupivbluegreen/omni-sag/internal/credential"
@@ -32,6 +33,9 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/recording"
 	"github.com/rupivbluegreen/omni-sag/internal/release"
 	"github.com/rupivbluegreen/omni-sag/internal/sessions"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -260,8 +264,20 @@ func New(hostKey ssh.Signer, auth authn.Authenticator, d *dialer.Dialer, sink ev
 // emit sends an evidence event, logging (never swallowing) any sink error so a
 // degraded evidence pipeline is observable. Emitting is non-optional. When
 // debug is enabled, the event itself is also mirrored to stdout so a live
-// tail of session activity doesn't require reading evidence.jsonl.
-func (s *Server) emit(e evidence.Event) {
+// tail of session activity doesn't require reading evidence.jsonl. If a span
+// is active on ctx, the event's TraceID/SpanID are filled before writing —
+// empty (zero-cost) whenever OTel is disabled or ctx carries no span. emit
+// assigns e.ID up front (rather than leaving it to the sink, which only ever
+// saw its own by-value copy) and returns the emitted event so callers can
+// correlate a span to the exact evidence record via its ID.
+func (s *Server) emit(ctx context.Context, e evidence.Event) evidence.Event {
+	if e.ID == "" {
+		e.ID = uuid.NewString()
+	}
+	if sc := trace.SpanFromContext(ctx).SpanContext(); sc.IsValid() {
+		e.TraceID = sc.TraceID().String()
+		e.SpanID = sc.SpanID().String()
+	}
 	if s.debug {
 		allow := "?"
 		if e.Allow != nil {
@@ -272,6 +288,7 @@ func (s *Server) emit(e evidence.Event) {
 	if err := s.sink.Emit(e); err != nil {
 		log.Printf("omni-sag: evidence emit failed (type=%s user=%s): %v", e.Type, e.User, err)
 	}
+	return e
 }
 
 // stashTargetSecret holds sec under a random single-use token until the
@@ -312,7 +329,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		if ok, retry := s.bfLimiter.Allow(srcIP); !ok {
 			loginUser, _, _ := splitTargetUser(meta.User())
 			loginUser, _ = splitPcodeSelector(loginUser)
-			s.emit(evidence.Event{
+			s.emit(context.Background(), evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeAuth,
 				User: loginUser, SourceIP: srcIP,
 				Allow: evidence.BoolPtr(false), Reason: "rate limited: too many failed attempts",
@@ -335,14 +352,14 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 			if s.debug {
 				log.Printf("omni-sag: debug: auth failed user=%s source=%s err=%v", loginUser, srcIP, err)
 			}
-			s.emit(evidence.Event{
+			s.emit(ctx, evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeAuth,
 				User: loginUser, SourceIP: srcIP,
 				Allow: evidence.BoolPtr(false), Reason: "authentication failed",
 			})
 			return nil, errors.New("authentication failed")
 		}
-		s.emit(evidence.Event{
+		s.emit(ctx, evidence.Event{
 			Time: time.Now().UTC(), Type: evidence.TypeAuth,
 			User: id.User, SourceIP: srcIP,
 			Allow: evidence.BoolPtr(true), Reason: "authenticated",
@@ -366,7 +383,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 					log.Printf("omni-sag: debug: mfa failed user=%s source=%s err=%v", id.User, srcIP, mfaErr)
 				}
 			}
-			s.emit(evidence.Event{
+			s.emit(ctx, evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeMFA,
 				User: id.User, SourceIP: srcIP,
 				Allow: evidence.BoolPtr(allowed), Reason: reason,
@@ -507,11 +524,19 @@ func (s *Server) Drain(grace time.Duration) (int64, error) {
 func (s *Server) ActiveSessions() int64 { return s.active.Load() }
 
 func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
+	ctx, root := tracer.Start(ctx, "omnisag.connection", trace.WithSpanKind(trace.SpanKindServer))
+	defer root.End()
+
 	// Bound the handshake with a deadline, then release the slot and clear the
 	// deadline once it completes. A stalled handshake trips the deadline instead
 	// of parking forever.
 	_ = raw.SetDeadline(time.Now().Add(s.handshakeTimeout))
+	_, authSpan := tracer.Start(ctx, "omnisag.auth")
 	sconn, chans, reqs, err := ssh.NewServerConn(raw, s.sshCfg)
+	if err != nil {
+		authSpan.SetStatus(codes.Error, err.Error())
+	}
+	authSpan.End()
 	_ = raw.SetDeadline(time.Time{})
 	<-s.sem // release the handshake slot (success or failure)
 	if err != nil {
@@ -531,6 +556,7 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 
 	pr := principalFrom(sconn.Permissions)
 	srcIP := hostOf(sconn.RemoteAddr())
+	root.SetAttributes(omnisagUser(pr.User), semconv.ClientAddress(srcIP), omnisagGroupsCount(len(pr.Groups)))
 
 	// Register the live session so the control-plane API can list/terminate it.
 	// terminate closes the SSH connection; the data path stays independent of
@@ -595,6 +621,8 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 			continue
 		}
 		go func(newCh ssh.NewChannel, ct string) {
+			chCtx, chSpan := tracer.Start(ctx, "omnisag.channel", trace.WithAttributes(omnisagChannelType(ct)))
+			defer chSpan.End()
 			if s.reg != nil {
 				s.reg.AddChannels(sessID, 1)
 				// Publish a live supervision event so an attached supervisor sees
@@ -615,9 +643,9 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 			}()
 			switch ct {
 			case "direct-tcpip":
-				s.handleDirectTCPIP(ctx, newCh, pr, srcIP, announcer)
+				s.handleDirectTCPIP(chCtx, newCh, pr, srcIP, announcer)
 			case "session":
-				s.handleSession(ctx, connCtx, newCh, pr, srcIP, sconn, tch, announcer)
+				s.handleSession(chCtx, connCtx, newCh, pr, srcIP, sconn, tch, announcer)
 			}
 		}(newCh, ct)
 	}
@@ -639,9 +667,14 @@ func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr
 	}
 	target := policy.Target{Host: d.HostToConnect, Port: int(d.PortToConnect)}
 
+	ctx, tun := tracer.Start(ctx, "omnisag.tunnel", trace.WithAttributes(
+		omnisagTargetHost(target.Host), semconv.ServerPort(target.Port)))
+	defer tun.End()
+
 	// forwarding=true: refused on full-recording targets (PRD FR-10).
 	conn, err := s.dialer.DialTarget(ctx, pr, srcIP, target, true)
 	if err != nil {
+		tun.SetStatus(codes.Error, err.Error())
 		switch {
 		case errors.Is(err, dialer.ErrForwardingRefused):
 			_ = newCh.Reject(ssh.Prohibited, "forwarding refused: target requires full session recording")
@@ -667,6 +700,8 @@ func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr
 		announcer.announce(tunnelOpenNotice(pr.User, d.HostToConnect, int(d.PortToConnect)))
 	}
 	go ssh.DiscardRequests(chReqs)
+	_, spliceSpan := tracer.Start(ctx, "omnisag.splice")
+	defer spliceSpan.End()
 	if s.tunnelInspect.Enabled {
 		decision := s.dialer.Peek(pr, target)
 		if !s.tunnelInspect.Enforce || len(decision.ExpectProtocol) == 0 {
@@ -675,14 +710,16 @@ func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr
 			taps := newTunnelTaps(s.tunnelInspect.MaxPrefixBytes)
 			ch2 := &tapConn{ReadWriteCloser: ch, taps: taps, fromClient: true}
 			conn2 := &tapConn{ReadWriteCloser: conn, taps: taps, fromClient: false}
-			go s.classifyAndEmit(taps, pr, srcIP, target.String(), decision.ExpectProtocol)
-			dialer.Splice(ch2, conn2)
+			go s.classifyAndEmit(ctx, taps, pr, srcIP, target.String(), decision.ExpectProtocol)
+			aToB, bToA := dialer.Splice(ch2, conn2)
+			spliceSpan.SetAttributes(omnisagTransferBytes(aToB + bToA))
 			return
 		}
-		s.enforceTunnel(ch, conn, pr, srcIP, target.String(), decision.ExpectProtocol)
+		s.enforceTunnel(ctx, ch, conn, pr, srcIP, target.String(), decision.ExpectProtocol)
 		return
 	}
-	dialer.Splice(ch, conn)
+	aToB, bToA := dialer.Splice(ch, conn)
+	spliceSpan.SetAttributes(omnisagTransferBytes(aToB + bToA))
 }
 
 func principalFrom(perms *ssh.Permissions) policy.Principal {

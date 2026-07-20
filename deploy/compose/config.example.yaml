@@ -60,6 +60,47 @@ target_insecure_host_key: true
 #               flush_interval_seconds: 5,
 #               auth: { bearer_env: "ES_TOKEN" }, tls: { ca: "es-ca.pem" } }
 #       buffer_size: 10000             # per-exporter bounded queue (default 10000)
+#     - name: otel-logs                # EXPERIMENTAL: evidence as OTLP LogRecords
+#       format: json                   # otlp transport requires json
+#       transport: otlp                # see the otel: block below — requires otel.enabled + otel.logs.enabled
+
+# OpenTelemetry (OTLP) export. Opt-in (default off). Traces are STABLE and
+# are the headline deliverable: a span tree over the connection lifecycle
+# (accept -> handshake/auth -> policy decision -> approval wait -> credential
+# fetch -> target dial -> data pump), correlated to evidence event IDs via
+# omnisag.evidence.id span attributes (and, on the evidence side, additive
+# trace_id/span_id fields). A dead/unreachable collector never blocks or
+# slows a session (non-blocking dial, bounded export timeouts, bounded
+# shutdown flush) and never affects the durable evidence chain — OTLP is
+# best-effort telemetry, not the audit record.
+#
+# otel:
+#   enabled: true
+#   endpoint: "otel-collector:4317"    # OTLP collector endpoint, host:port
+#   protocol: grpc                     # grpc (default) | http
+#   insecure: true                     # plaintext to the collector (dev only)
+#   # tls: { ca_cert: "ca.pem", client_cert: "c.pem", client_key: "k.pem" }
+#   # headers: { authorization: "Bearer ..." }  # e.g. SaaS OTLP auth
+#   # resource: { service.name: omni-sag, deployment.environment: prod }
+#   traces:
+#     enabled: true                    # default true when otel.enabled
+#     sampler: parentbased_always_on   # always_on|always_off|traceidratio|parentbased_traceidratio
+#     # sample_ratio: 1.0              # used only by the *ratio samplers
+#     # max_queue_size: 2048           # bounded async queue; overflow drops
+#     # max_export_batch_size: 512
+#     # export_timeout_seconds: 10
+#   metrics:
+#     enabled: false                   # OPTIONAL, default off. Prometheus (above)
+#                                       # stays authoritative regardless — this is
+#                                       # a second, additive read of the same
+#                                       # atomic counters, never a duplicate count.
+#     # interval_seconds: 60
+#   logs:
+#     enabled: false                   # EXPERIMENTAL, default off: the OTel logs
+#                                       # SDK is pre-GA. When true, wired as the
+#                                       # `otlp` transport in export.exporters above
+#                                       # (see the otel-logs example), not a
+#                                       # separate log path.
 
 # Capability toggles. The three disable_* below default false (enabled); any
 # combination may be disabled independently, but at least one must stay

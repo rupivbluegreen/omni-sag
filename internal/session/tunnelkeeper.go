@@ -63,7 +63,7 @@ func tunnelOpenNotice(user, host string, port int) string {
 func (s *Server) runTunnelKeeper(ctx context.Context, channel ssh.Channel, pr policy.Principal, srcIP string, announcer *tunnelAnnouncer) {
 	defer channel.Close()
 
-	s.emit(evidence.Event{
+	s.emit(ctx, evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeSessionStart,
 		User: pr.User, SourceIP: srcIP, Detail: "tunnel keeper",
 	})
@@ -122,7 +122,7 @@ func (s *Server) runTunnelKeeper(ctx context.Context, channel ssh.Channel, pr po
 		}
 	}
 
-	s.emit(evidence.Event{
+	s.emit(ctx, evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
 		User: pr.User, SourceIP: srcIP, Detail: "tunnel keeper closed",
 	})
