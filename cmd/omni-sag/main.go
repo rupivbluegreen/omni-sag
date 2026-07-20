@@ -25,6 +25,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/authn"
 	"github.com/rupivbluegreen/omni-sag/internal/config"
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
+	"github.com/rupivbluegreen/omni-sag/internal/eventexport"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/fips"
 	"github.com/rupivbluegreen/omni-sag/internal/inspect"
@@ -148,6 +149,33 @@ func run(cfgPath string, debug bool) error {
 	// data-path hot-loop instrumentation; metrics is a leaf that never imports
 	// the control plane). Exposed on its own listener below.
 	met := metrics.New()
+
+	// Event export (SIEM/log-management): opt-in, best-effort fan-out
+	// alongside the durable evidence sinks (internal/eventexport). ONE
+	// shared Fanout is built regardless of evidence mode and used to wrap
+	// BOTH the dialer and session sinks, so N configured exporters always
+	// open exactly N destination connections — never 2N. In crude (file/S3)
+	// evidence mode dialerSink and sessionSink are the SAME underlying sink
+	// (see buildEvidence); wrap it once and reuse the wrapped sink for both,
+	// so an event is never offered to an exporter twice.
+	if cfg.Export != nil && cfg.Export.Enabled {
+		fanout, err := eventexport.NewFanout(cfg.Export.ToEventExport(), met.IncExportDrop)
+		if err != nil {
+			return err
+		}
+		if ev.dialerSink == ev.sessionSink {
+			wrapped := fanout.Wrap(ev.dialerSink)
+			ev.dialerSink, ev.sessionSink = wrapped, wrapped
+		} else {
+			ev.dialerSink = fanout.Wrap(ev.dialerSink)
+			ev.sessionSink = fanout.Wrap(ev.sessionSink)
+		}
+		ev.exportCloser = fanout.Close
+		for _, ec := range cfg.Export.Exporters {
+			log.Printf("omni-sag: event export active: %s (format=%s transport=%s)", ec.Name, ec.Format, ec.Transport)
+		}
+	}
+
 	d := dialer.New(cfg.CompilePolicy(), met.CountingSink(ev.dialerSink), dopts...)
 
 	// Policy hot-reload: watch the policy file and atomically swap the dialer's
@@ -456,9 +484,27 @@ type evidenceSystem struct {
 	dialerSink  evidence.Sink
 	sessionSink evidence.Sink
 	closer      func() error
+
+	// exportCloser, when set (event export enabled — see run()), closes the
+	// shared eventexport.Fanout: cancels its exporters' contexts and waits
+	// (bounded) for each to drain its buffer, flush, and close its
+	// transport. It runs BEFORE closer, so any event still sitting in an
+	// exporter's buffer is drained/flushed while the durable sink the
+	// wrapped sinks write through is still open.
+	exportCloser func() error
 }
 
-func (e evidenceSystem) close() {
+// close runs on a *evidenceSystem (not a value) so that if run() later wraps
+// ev.dialerSink/ev.sessionSink and sets ev.exportCloser (event export is
+// enabled) AFTER `defer ev.close()` was registered, the deferred call still
+// observes those updates — a value receiver would instead close over a stale
+// copy of ev taken at defer-time, silently skipping exportCloser.
+func (e *evidenceSystem) close() {
+	if e.exportCloser != nil {
+		if err := e.exportCloser(); err != nil {
+			log.Printf("omni-sag: event export close: %v", err)
+		}
+	}
 	if e.closer != nil {
 		if err := e.closer(); err != nil {
 			log.Printf("omni-sag: evidence close: %v", err)

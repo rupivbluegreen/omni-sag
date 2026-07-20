@@ -50,6 +50,23 @@ func TestCountingSink_CountsEmitFailures(t *testing.T) {
 	}
 }
 
+func TestIncExportDrop_CountsPerExporterName(t *testing.T) {
+	m := New()
+	m.IncExportDrop("arcsight")
+	m.IncExportDrop("arcsight")
+	m.IncExportDrop("elastic-filebeat")
+
+	var b bytes.Buffer
+	m.WriteText(&b)
+	body := b.String()
+	if !strings.Contains(body, `omnisag_eventexport_dropped_total{exporter="arcsight"} 2`) {
+		t.Fatalf("missing/wrong arcsight drop count:\n%s", body)
+	}
+	if !strings.Contains(body, `omnisag_eventexport_dropped_total{exporter="elastic-filebeat"} 1`) {
+		t.Fatalf("missing/wrong elastic-filebeat drop count:\n%s", body)
+	}
+}
+
 func TestHandler_RendersPrometheus(t *testing.T) {
 	m := New()
 	m.SetActiveFn(func() int64 { return 3 })

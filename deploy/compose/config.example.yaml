@@ -26,6 +26,41 @@ target_insecure_host_key: true
 # metrics:
 #   listen: ":9090"
 
+# Event export / SIEM integration. Opt-in (default off). Streams every
+# evidence event (auth, tunnel_decision, session, transfer, inspection,
+# credential, approval, ...) to one or more SIEMs in real time, ALONGSIDE the
+# durable evidence pipeline (which stays the authoritative, tamper-evident
+# record). Delivery is BEST-EFFORT and never blocks a session: if a SIEM is
+# slow or down, events are dropped (counted in the metrics as
+# omnisag_eventexport_dropped_total) rather than stalling the gateway.
+#
+# format:    json | ecs (Elastic Common Schema) | cef (ArcSight)
+# transport: file (for a filebeat/logbeat/vector tailer) | syslog (udp|tcp|tls,
+#            RFC 5424 + RFC 6587 octet-counting) | http (NDJSON batches, e.g.
+#            Elastic _bulk / HEC). Multiple exporters run concurrently.
+# Prefer syslog tcp/tls over udp when delivery matters: a "connected" UDP
+# socket's write succeeds locally even when the SIEM is black-holing, so the
+# omnisag_eventexport_dropped_total metric cannot observe UDP delivery failures.
+# export:
+#   enabled: true
+#   exporters:
+#     - name: arcsight                 # cef over TLS syslog
+#       format: cef
+#       transport: syslog
+#       syslog: { address: "arcsight:6514", protocol: tls, facility: local0,
+#                 tls: { ca: "ca.pem", cert: "c.pem", key: "k.pem" } }
+#     - name: elastic-filebeat         # ECS lines a filebeat tailer ships
+#       format: ecs
+#       transport: file
+#       file: { path: "/var/log/omni-sag/events.ecs.jsonl" }
+#     - name: elastic-direct           # ECS straight to Elastic _bulk
+#       format: ecs
+#       transport: http
+#       http: { url: "https://es:9200/_bulk", batch_size: 100,
+#               flush_interval_seconds: 5,
+#               auth: { bearer_env: "ES_TOKEN" }, tls: { ca: "es-ca.pem" } }
+#       buffer_size: 10000             # per-exporter bounded queue (default 10000)
+
 # Capability toggles. The three disable_* below default false (enabled); any
 # combination may be disabled independently, but at least one must stay
 # enabled. Uncomment to restrict this gateway to, e.g., tunnel-only:

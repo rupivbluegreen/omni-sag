@@ -181,6 +181,19 @@ $ omni-verify -bundle ./evidence -pubkey $KEY -head $HEAD
 PASS — evidence bundle is intact and authentic.
 ```
 
+**📡 Event export / SIEM** — stream every evidence event to your SIEM in real time, opt-in and
+alongside the durable pipeline. Pick the format and transport per exporter, run several at once,
+and it's **best-effort**: a slow or dead SIEM drops events (counted in metrics), never stalls a
+session. Formats `json` / `ecs` (Elastic) / `cef` (ArcSight); transports `file` (filebeat/vector
+tail) / `syslog` (udp·tcp·tls) / `http` (NDJSON bulk).
+```yaml
+export:
+  enabled: true
+  exporters:
+    - { name: arcsight, format: cef, transport: syslog, syslog: { address: "arcsight:6514", protocol: tls } }
+    - { name: elastic,  format: ecs, transport: file,   file:   { path: "/var/log/omni-sag/events.jsonl" } }
+```
+
 **🛰️ Control plane** — an HTTP API on its own listener (mTLS or bearer tokens), a CLI, and a
 Bubble Tea TUI. Kill the API and SSH keeps serving — it's genuinely out-of-band.
 ```console
