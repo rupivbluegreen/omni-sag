@@ -12,6 +12,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/eventexport"
 	"github.com/rupivbluegreen/omni-sag/internal/fips"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
+	"github.com/rupivbluegreen/omni-sag/internal/protoident"
 	"gopkg.in/yaml.v3"
 )
 
@@ -53,6 +54,22 @@ type File struct {
 	// governed by disable_sftp instead. Not part of the "at least one
 	// capability must stay enabled" rule below, since it is off by default.
 	EnableSCP bool `yaml:"enable_scp"`
+
+	// TunnelInspection is opt-IN (default off): fingerprints the opening
+	// bytes of -L/-D tunnels to identify the protocol actually flowing
+	// through them. See internal/protoident and internal/session/tunnelinspect.go.
+	TunnelInspection *TunnelInspectionConfig `yaml:"tunnel_inspection"`
+}
+
+// TunnelInspectionConfig configures tunnel protocol identification. Enabled
+// defaults to false: a config.yaml written before this field existed leaves
+// -L/-D tunnels exactly as before (no tee, no evidence event).
+type TunnelInspectionConfig struct {
+	Enabled                bool   `yaml:"enabled"`
+	MaxPrefixBytes         int    `yaml:"max_prefix_bytes"`         // per-direction classification budget; default 512
+	ClassifyTimeoutSeconds int    `yaml:"classify_timeout_seconds"` // default 5
+	Enforce                bool   `yaml:"enforce"`                  // false = observe/dry-run only, even with expect_protocol rules
+	UnknownAction          string `yaml:"unknown_action"`           // allow | deny; default allow
 }
 
 // MetricsConfig configures the Prometheus metrics endpoint, served on its own
@@ -536,12 +553,13 @@ type RoleConfig struct {
 // "none" (default), "metadata-only", or "full". On "full" targets, port
 // forwarding (-L) is refused (PRD FR-10).
 type RuleConfig struct {
-	Host            string `yaml:"host"`
-	Ports           []int  `yaml:"ports"`
-	Record          string `yaml:"record"`
-	Credential      string `yaml:"credential"`       // inject | prompt | passthrough | deny (empty=passthrough)
-	RequireApproval bool   `yaml:"require_approval"` // gate matching targets behind a four-eyes approval
-	TargetUser      string `yaml:"target_user"`      // account on the target; empty => same as gateway login user
+	Host            string   `yaml:"host"`
+	Ports           []int    `yaml:"ports"`
+	Record          string   `yaml:"record"`
+	Credential      string   `yaml:"credential"`       // inject | prompt | passthrough | deny (empty=passthrough)
+	RequireApproval bool     `yaml:"require_approval"` // gate matching targets behind a four-eyes approval
+	TargetUser      string   `yaml:"target_user"`      // account on the target; empty => same as gateway login user
+	ExpectProtocol  []string `yaml:"expect_protocol"`  // allow-list of protocols permitted on this target's tunnels (tunnel_inspection enforce); empty = observe only
 }
 
 // Load reads and parses the configuration file at path.
@@ -679,6 +697,20 @@ func (f *File) validate() error {
 			return err
 		}
 	}
+	if ti := f.TunnelInspection; ti != nil {
+		if ti.MaxPrefixBytes == 0 {
+			ti.MaxPrefixBytes = 512
+		}
+		if ti.ClassifyTimeoutSeconds == 0 {
+			ti.ClassifyTimeoutSeconds = 5
+		}
+		if ti.UnknownAction == "" {
+			ti.UnknownAction = "allow"
+		}
+		if ti.UnknownAction != "allow" && ti.UnknownAction != "deny" {
+			return fmt.Errorf("config: tunnel_inspection.unknown_action must be allow or deny, got %q", ti.UnknownAction)
+		}
+	}
 	return nil
 }
 
@@ -758,9 +790,23 @@ func validatePolicyRoles(roles []RoleConfig) error {
 			default:
 				return fmt.Errorf("config: role %q rule for %q has invalid credential %q (want inject|prompt|passthrough|deny)", r.Name, rule.Host, rule.Credential)
 			}
+			for _, want := range rule.ExpectProtocol {
+				if !knownProtocol(want) {
+					return fmt.Errorf("config: role %q rule for %q has expect_protocol entry %q not recognized by protoident (want one of %v)", r.Name, rule.Host, want, protoident.Protocols())
+				}
+			}
 		}
 	}
 	return nil
+}
+
+func knownProtocol(name string) bool {
+	for _, p := range protoident.Protocols() {
+		if string(p) == name {
+			return true
+		}
+	}
+	return false
 }
 
 // CompilePolicyBytes parses, validates, and compiles the policy section of a
@@ -802,6 +848,7 @@ func (f *File) CompilePolicy() policy.Policy {
 				Credential:      ru.Credential,
 				RequireApproval: ru.RequireApproval,
 				TargetUser:      ru.TargetUser,
+				ExpectProtocol:  ru.ExpectProtocol,
 			})
 		}
 		roles = append(roles, policy.Role{Name: rc.Name, Groups: rc.Groups, Allow: rules})

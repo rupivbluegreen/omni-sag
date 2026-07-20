@@ -842,3 +842,90 @@ export:
 		t.Fatalf("transport = %q, want otlp", f.Export.Exporters[0].Transport)
 	}
 }
+
+func TestValidate_TunnelInspectionDefaults(t *testing.T) {
+	ok := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+tunnel_inspection:
+  enabled: true
+policy:
+  roles: []
+`
+	f, err := Load(writeTemp(t, ok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ti := f.TunnelInspection
+	if ti == nil || !ti.Enabled {
+		t.Fatal("tunnel_inspection.enabled should be true")
+	}
+	if ti.MaxPrefixBytes != 512 {
+		t.Fatalf("max_prefix_bytes default = %d, want 512", ti.MaxPrefixBytes)
+	}
+	if ti.ClassifyTimeoutSeconds != 5 {
+		t.Fatalf("classify_timeout default = %d, want 5", ti.ClassifyTimeoutSeconds)
+	}
+	if ti.UnknownAction != "allow" {
+		t.Fatalf("unknown_action default = %q, want allow", ti.UnknownAction)
+	}
+}
+
+func TestCompile_ExpectProtocol(t *testing.T) {
+	ok := `
+listen: ":2222"
+evidence: { file: "e.jsonl" }
+policy:
+  roles:
+    - name: dba
+      groups: [dba]
+      allow:
+        - host: db1
+          ports: [5432]
+          expect_protocol: [postgres]
+`
+	f, err := Load(writeTemp(t, ok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := f.CompilePolicy()
+	got := p.Roles[0].Allow[0].ExpectProtocol
+	if len(got) != 1 || got[0] != "postgres" {
+		t.Fatalf("ExpectProtocol = %v, want [postgres]", got)
+	}
+}
+
+func TestValidate_ExpectProtocolUnknownRejected(t *testing.T) {
+	bad := `
+listen: ":2222"
+evidence: { file: "e.jsonl" }
+policy:
+  roles:
+    - name: dba
+      groups: [dba]
+      allow:
+        - host: db1
+          ports: [5432]
+          expect_protocol: [nope]
+`
+	if _, err := Load(writeTemp(t, bad)); err == nil {
+		t.Fatal("unknown protocol must be rejected")
+	}
+}
+
+func TestValidate_TunnelInspectionBadUnknownAction(t *testing.T) {
+	bad := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+tunnel_inspection:
+  enabled: true
+  unknown_action: sometimes
+policy:
+  roles: []
+`
+	if _, err := Load(writeTemp(t, bad)); err == nil {
+		t.Fatal("expected error for invalid unknown_action")
+	}
+}

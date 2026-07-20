@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
+	"github.com/rupivbluegreen/omni-sag/internal/fips"
 	"github.com/rupivbluegreen/omni-sag/internal/otelexport"
 )
 
@@ -61,7 +62,7 @@ func New(inner evidence.Sink, cfg Config, onDrop func(exporterName string)) (*Fo
 func buildExporters(ctx context.Context, cfg Config, onDrop func(exporterName string)) ([]*asyncExporter, error) {
 	var exporters []*asyncExporter
 	for _, ec := range cfg.Exporters {
-		x, err := buildExporter(ec, onDrop)
+		x, err := buildExporter(ec, cfg.Mode, onDrop)
 		if err != nil {
 			for _, built := range exporters {
 				built.shutdown()
@@ -74,12 +75,12 @@ func buildExporters(ctx context.Context, cfg Config, onDrop func(exporterName st
 	return exporters, nil
 }
 
-func buildExporter(ec ExporterConfig, onDrop func(exporterName string)) (*asyncExporter, error) {
+func buildExporter(ec ExporterConfig, mode fips.Mode, onDrop func(exporterName string)) (*asyncExporter, error) {
 	fmtr, err := NewFormatter(ec.Format)
 	if err != nil {
 		return nil, err
 	}
-	tr, err := buildTransport(ec)
+	tr, err := buildTransport(ec, mode)
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +88,7 @@ func buildExporter(ec ExporterConfig, onDrop func(exporterName string)) (*asyncE
 	return newAsyncExporter(name, fmtr, tr, ec.bufferSize(), ec.flushInterval(), func() { onDrop(name) }), nil
 }
 
-func buildTransport(ec ExporterConfig) (Transport, error) {
+func buildTransport(ec ExporterConfig, mode fips.Mode) (Transport, error) {
 	switch ec.Transport {
 	case "file":
 		if ec.File == nil {
@@ -98,12 +99,12 @@ func buildTransport(ec ExporterConfig) (Transport, error) {
 		if ec.Syslog == nil {
 			return nil, fmt.Errorf("transport %q: missing syslog config", ec.Transport)
 		}
-		return newSyslogTransport(*ec.Syslog)
+		return newSyslogTransport(*ec.Syslog, mode)
 	case "http":
 		if ec.HTTP == nil {
 			return nil, fmt.Errorf("transport %q: missing http config", ec.Transport)
 		}
-		return newHTTPTransport(*ec.HTTP)
+		return newHTTPTransport(*ec.HTTP, mode)
 	case "otlp":
 		// EXPERIMENTAL (see internal/otelexport's design doc): ships evidence
 		// events as OTLP LogRecords via the OTel logs SDK's own bounded

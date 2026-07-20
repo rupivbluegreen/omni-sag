@@ -96,6 +96,8 @@ type Server struct {
 	tunnelDisabled bool // opt-in: rejects "direct-tcpip" channels (-L port forwarding); see WithTunnelDisabled
 	sftpDisabled   bool // opt-in: rejects "subsystem"+"sftp" requests on session channels; see WithSFTPDisabled
 	scpEnabled     bool // opt-IN (default false = OFF): only when true are "exec" requests matching "scp -t/-f" (legacy protocol) served; see WithSCPEnabled
+
+	tunnelInspect TunnelInspectConfig // opt-IN (default zero value = disabled): protocol identification on -L/-D/-J tunnels; see WithTunnelInspection
 }
 
 // WithRegistry registers each authenticated connection in reg so the
@@ -699,9 +701,25 @@ func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr
 	}
 	go ssh.DiscardRequests(chReqs)
 	_, spliceSpan := tracer.Start(ctx, "omnisag.splice")
+	defer spliceSpan.End()
+	if s.tunnelInspect.Enabled {
+		decision := s.dialer.Peek(pr, target)
+		if !s.tunnelInspect.Enforce || len(decision.ExpectProtocol) == 0 {
+			// Observe, or enforce with nothing to enforce on this target's
+			// rule: tee + classify off the hot path, never gate the splice.
+			taps := newTunnelTaps(s.tunnelInspect.MaxPrefixBytes)
+			ch2 := &tapConn{ReadWriteCloser: ch, taps: taps, fromClient: true}
+			conn2 := &tapConn{ReadWriteCloser: conn, taps: taps, fromClient: false}
+			go s.classifyAndEmit(ctx, taps, pr, srcIP, target.String(), decision.ExpectProtocol)
+			aToB, bToA := dialer.Splice(ch2, conn2)
+			spliceSpan.SetAttributes(omnisagTransferBytes(aToB + bToA))
+			return
+		}
+		s.enforceTunnel(ctx, ch, conn, pr, srcIP, target.String(), decision.ExpectProtocol)
+		return
+	}
 	aToB, bToA := dialer.Splice(ch, conn)
 	spliceSpan.SetAttributes(omnisagTransferBytes(aToB + bToA))
-	spliceSpan.End()
 }
 
 func principalFrom(perms *ssh.Permissions) policy.Principal {

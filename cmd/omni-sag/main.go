@@ -93,6 +93,7 @@ func run(cfgPath string, debug bool) error {
 		UserFilter:   cfg.LDAP.UserFilter,
 		InsecureTLS:  cfg.LDAP.InsecureTLS,
 		NestedGroups: cfg.LDAP.NestedGroups,
+		Mode:         cfg.FIPSMode(),
 	})
 
 	var dopts []dialer.Option
@@ -117,6 +118,7 @@ func run(cfgPath string, debug bool) error {
 			TimeoutSeconds:         ca.TimeoutSeconds,
 			BreakerFailures:        ca.BreakerFails,
 			BreakerCooldownSeconds: ca.BreakerCoolSec,
+			Mode:                   cfg.FIPSMode(),
 		})
 		if err != nil {
 			return err
@@ -208,7 +210,9 @@ func run(cfgPath string, debug bool) error {
 	// (see buildEvidence); wrap it once and reuse the wrapped sink for both,
 	// so an event is never offered to an exporter twice.
 	if cfg.Export != nil && cfg.Export.Enabled {
-		fanout, err := eventexport.NewFanout(cfg.Export.ToEventExport(), met.IncExportDrop)
+		ecfg := cfg.Export.ToEventExport()
+		ecfg.Mode = cfg.FIPSMode()
+		fanout, err := eventexport.NewFanout(ecfg, met.IncExportDrop)
 		if err != nil {
 			return err
 		}
@@ -292,6 +296,20 @@ func run(cfgPath string, debug bool) error {
 		opts = append(opts, session.WithInspection(gate))
 		log.Printf("omni-sag: SFTP content inspection enabled (ICAP %s/%s)", cfg.Inspection.ICAP.Endpoint, cfg.Inspection.ICAP.Service)
 	}
+	if ti := cfg.TunnelInspection; ti != nil && ti.Enabled {
+		opts = append(opts, session.WithTunnelInspection(session.TunnelInspectConfig{
+			Enabled:         true,
+			MaxPrefixBytes:  ti.MaxPrefixBytes,
+			ClassifyTimeout: time.Duration(ti.ClassifyTimeoutSeconds) * time.Second,
+			Enforce:         ti.Enforce,
+			UnknownDeny:     ti.UnknownAction == "deny",
+		}))
+		mode := "observe"
+		if ti.Enforce {
+			mode = "enforce"
+		}
+		log.Printf("omni-sag: tunnel protocol identification enabled (%s mode)", mode)
+	}
 	if cfg.Approval != nil {
 		relStore, err := release.NewFileStore(filepath.Join(filepath.Dir(cfg.Approval.StorePath), "releases.json"))
 		if err != nil {
@@ -327,7 +345,7 @@ func run(cfgPath string, debug bool) error {
 		// Best-effort: the control plane is out-of-band, so a failure to start
 		// it (port in use, bad TLS material during a rotation) must NOT take
 		// down the SSH data path. Log and continue serving SSH.
-		if err := startAPIServer(ctx, cfg.API, reg, holder, approvalStore); err != nil {
+		if err := startAPIServer(ctx, cfg.API, cfg.FIPSMode(), reg, holder, approvalStore); err != nil {
 			log.Printf("omni-sag: control-plane API did not start (SSH unaffected): %v", err)
 		}
 	}
@@ -393,7 +411,7 @@ func startMetricsServer(ctx context.Context, addr string, met *metrics.Metrics) 
 // startAPIServer builds and starts the control-plane API on its own listener.
 // It never blocks the caller and never shares state with the SSH data path
 // beyond the read-only registry and policy holder.
-func startAPIServer(ctx context.Context, cfg *config.APIConfig, reg *sessions.Registry, holder *policy.Holder, approvals approval.Store) error {
+func startAPIServer(ctx context.Context, cfg *config.APIConfig, mode fips.Mode, reg *sessions.Registry, holder *policy.Holder, approvals approval.Store) error {
 	authz, err := buildAuthorizer(cfg)
 	if err != nil {
 		return err
@@ -404,16 +422,16 @@ func startAPIServer(ctx context.Context, cfg *config.APIConfig, reg *sessions.Re
 		Authorizer: authz,
 		Approvals:  approvals,
 	})
+	tlsCfg, err := apiTLSConfig(cfg, mode)
+	if err != nil {
+		return err
+	}
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return err
 	}
 	httpSrv := &http.Server{Handler: apiSrv.Handler(), ReadHeaderTimeout: 10 * time.Second}
 
-	tlsCfg, err := apiTLSConfig(cfg)
-	if err != nil {
-		return err
-	}
 	go func() {
 		<-ctx.Done()
 		_ = httpSrv.Close()
@@ -452,8 +470,10 @@ func buildAuthorizer(cfg *config.APIConfig) (api.Authorizer, error) {
 }
 
 // apiTLSConfig builds the server TLS config: server cert (required for HTTPS)
-// plus, when client_ca is set, mandatory client-cert verification (mTLS).
-func apiTLSConfig(cfg *config.APIConfig) (*tls.Config, error) {
+// plus, when client_ca is set, mandatory client-cert verification (mTLS). Under
+// fips.mode warn/enforce, mode routes the config through fips.Harden; enforce
+// fails closed (the control-plane API then does not start; SSH is unaffected).
+func apiTLSConfig(cfg *config.APIConfig, mode fips.Mode) (*tls.Config, error) {
 	if cfg.TLSCert == "" {
 		return nil, nil // dev: plain HTTP + bearer token
 	}
@@ -473,6 +493,9 @@ func apiTLSConfig(cfg *config.APIConfig) (*tls.Config, error) {
 		}
 		tc.ClientCAs = pool
 		tc.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	if err := fips.Harden(tc, mode); err != nil {
+		return nil, err
 	}
 	return tc, nil
 }

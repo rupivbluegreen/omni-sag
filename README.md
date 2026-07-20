@@ -95,6 +95,29 @@ to turn it on (it adds an exec-channel surface, so it stays off by default).
 
 Not supported: `-R` remote/reverse forwarding, or X11 forwarding.
 
+**🔍 Tunnel protocol identification (opt-in)** — fingerprints the opening bytes of a `-L`/`-D`/`-J`
+tunnel to identify the protocol actually riding it (heuristic, first-packet only — TLS is opaque
+past the handshake, and unrecognized traffic classifies as `unknown`). Disabled by default
+(`tunnel_inspection.enabled: false`). Observe mode logs a `tunnel_protocol` evidence event per
+tunnel; adding `expect_protocol` to a rule additionally enforces an allow-list once
+`enforce: true` — a mismatch terminates the tunnel before any bytes reach the target. Leaving
+`enforce: false` with `expect_protocol` rules present is a dry-run: it logs what *would* be
+blocked without acting on it. Banner-ambiguous services (smtp/ftp both greet with a `220 `
+response) are best-effort — classification falls back to the banner text (e.g. must contain
+`FTP` to call it ftp), so don't rely on `expect_protocol: [smtp]`/`[ftp]` alone to tell them apart.
+```yaml
+tunnel_inspection:
+  enabled: true
+  enforce: false   # false = observe/dry-run only
+policy:
+  roles:
+    - name: dba
+      allow:
+        - host: "db1.lab.local"
+          ports: [5432]
+          expect_protocol: [postgres]
+```
+
 **🎛️ Capability kill switches** — disable whole classes of access at the gateway, independent of
 policy (at least one of the three must stay on). `enable_scp` is the opposite sense — opt-in,
 off by default.
@@ -293,13 +316,13 @@ not yet built.
   Object-Locked quarantine, CyberArk CCP injection, four-eyes (session tunnels + group-scoped
   quarantine-release) with pull-download, per-capability kill switches, CIDR policy rules, nested
   AD group resolution, `+pcode` role selector + tunnel-keeper window, legacy `scp -O`, real-time
-  event export / SIEM (json·ecs·cef × file·syslog·http), API + CLI + TUI + packaging +
-  FIPS-readiness mode. ✅
+  event export / SIEM (json·ecs·cef × file·syslog·http), tunnel protocol identification (observe +
+  enforce), API + CLI + TUI + packaging + FIPS-readiness mode. ✅
 - **Next (v1.x):** SSH certificate authority; Kerberos/GSSAPI; a real OIDC (JWKS) validator for the
   API (today a static-token stand-in); CRD-backed policy/approval sources (needs a live cluster);
   FIPS TLS-config routed through *every* listener (the boot posture gate and LDAPS land today, the
-  API/CCP listeners don't yet); OpenTelemetry (OTLP) egress and tunnel-protocol identification
-  (both have approved design specs in [`docs/superpowers/`](docs/superpowers/), no code yet).
+  API/CCP listeners don't yet); OpenTelemetry (OTLP) egress (approved design spec in
+  [`docs/superpowers/`](docs/superpowers/), no code yet).
 - **v2:** RDP (native mstsc, then browser RDP with recording).
 - **Never:** shared-process multi-tenancy, monetization machinery in the OSS, semantic command
   reconstruction from pixels.

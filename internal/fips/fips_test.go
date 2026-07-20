@@ -251,6 +251,83 @@ func TestValidateTLSConfig(t *testing.T) {
 	}
 }
 
+func TestHarden(t *testing.T) {
+	t.Run("off leaves config untouched", func(t *testing.T) {
+		c := &tls.Config{MinVersion: tls.VersionTLS10, CipherSuites: []uint16{tls.TLS_RSA_WITH_RC4_128_SHA}}
+		if err := Harden(c, ModeOff); err != nil {
+			t.Fatalf("off mode must not error: %v", err)
+		}
+		if c.MinVersion != tls.VersionTLS10 {
+			t.Fatalf("off mode changed MinVersion: %v", c.MinVersion)
+		}
+		if len(c.CipherSuites) != 1 || c.CipherSuites[0] != tls.TLS_RSA_WITH_RC4_128_SHA {
+			t.Fatalf("off mode changed CipherSuites: %v", c.CipherSuites)
+		}
+	})
+
+	t.Run("off does not panic on nil config", func(t *testing.T) {
+		if err := Harden(nil, ModeOff); err != nil {
+			t.Fatalf("nil config should be a no-op: %v", err)
+		}
+	})
+
+	t.Run("warn raises MinVersion and pins approved suites", func(t *testing.T) {
+		c := &tls.Config{MinVersion: tls.VersionTLS10}
+		if err := Harden(c, ModeWarn); err != nil {
+			t.Fatalf("warn must not error: %v", err)
+		}
+		if !TLSVersionApproved(c.MinVersion) {
+			t.Fatalf("MinVersion not raised to an approved version: 0x%04x", c.MinVersion)
+		}
+		if len(c.CipherSuites) == 0 {
+			t.Fatal("expected approved cipher suites to be set")
+		}
+		for _, id := range c.CipherSuites {
+			if !CipherSuiteApproved(id) {
+				t.Fatalf("cipher suite %s is not approved", tls.CipherSuiteName(id))
+			}
+		}
+	})
+
+	t.Run("warn does not lower an already-higher MinVersion", func(t *testing.T) {
+		c := &tls.Config{MinVersion: tls.VersionTLS13}
+		if err := Harden(c, ModeWarn); err != nil {
+			t.Fatalf("warn must not error: %v", err)
+		}
+		if c.MinVersion != tls.VersionTLS13 {
+			t.Fatalf("MinVersion should stay TLS 1.3, got 0x%04x", c.MinVersion)
+		}
+	})
+
+	t.Run("enforce succeeds for an approved config", func(t *testing.T) {
+		c := ApprovedTLSConfig()
+		if err := Harden(c, ModeEnforce); err != nil {
+			t.Fatalf("enforce should accept an already-approved config: %v", err)
+		}
+	})
+
+	t.Run("enforce hardens and validates a fixable config", func(t *testing.T) {
+		c := &tls.Config{MinVersion: tls.VersionTLS10}
+		if err := Harden(c, ModeEnforce); err != nil {
+			t.Fatalf("enforce should harden then pass validation: %v", err)
+		}
+		if err := ValidateTLSConfig(c); err != nil {
+			t.Fatalf("hardened config should validate clean: %v", err)
+		}
+	})
+
+	t.Run("enforce fails closed when the config remains non-approved", func(t *testing.T) {
+		// A bogus MinVersion above TLS 1.2 numerically is left alone by Harden
+		// (it only raises versions below TLS 1.2) but is still not an approved
+		// version, so ValidateTLSConfig must reject it and Harden must propagate
+		// that as a fail-closed error.
+		c := &tls.Config{MinVersion: 0xfffe}
+		if err := Harden(c, ModeEnforce); err == nil {
+			t.Fatal("enforce must fail closed on a config that still doesn't validate")
+		}
+	})
+}
+
 // TestApprovedTLSConfigIsUsable makes a real handshake between a server and
 // client both restricted to the FIPS baseline, proving the approved parameters
 // actually interoperate (not just that they pass a static predicate).
