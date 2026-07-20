@@ -40,3 +40,5 @@ func omnisagTransferDirection(d string) attribute.KeyValue {
 func omnisagInspectionVerdict(v string) attribute.KeyValue {
 	return attribute.String("omnisag.inspection.verdict", v)
 }
+
+func omnisagPath(p string) attribute.KeyValue { return attribute.String("omnisag.path", p) }

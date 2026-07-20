@@ -191,7 +191,10 @@ type exitStatusMsg struct{ Status uint32 }
 // already validated by parseSCPCommand before this is called; no shell is
 // ever invoked.
 func (s *Server) runSCP(ctx, connCtx context.Context, channel ssh.Channel, pr policy.Principal, srcIP string, sconn ssh.Conn, tch *targetConnCache, dir scpDirection, remotePath string) {
-	s.emit(evidence.Event{
+	ctx, scpSpan := tracer.Start(ctx, "omnisag.scp")
+	defer scpSpan.End()
+
+	s.emit(ctx, evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeSessionStart,
 		User: pr.User, SourceIP: srcIP, Detail: "scp",
 	})
@@ -204,7 +207,7 @@ func (s *Server) runSCP(ctx, connCtx context.Context, channel ssh.Channel, pr po
 		status = 1
 	}
 	_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(&exitStatusMsg{Status: status}))
-	s.emit(evidence.Event{
+	s.emit(ctx, evidence.Event{
 		Time: time.Now().UTC(), Type: evidence.TypeSessionEnd,
 		User: pr.User, SourceIP: srcIP, Detail: detail,
 	})
@@ -250,7 +253,7 @@ func (s *Server) runSCPTransfer(ctx, connCtx context.Context, channel ssh.Channe
 	defer sftpClient.Close()
 
 	fs := &remoteFS{
-		client: sftpClient, gate: s.inspect, srv: s, user: pr.User, srcIP: srcIP, ctx: connCtx,
+		client: sftpClient, gate: s.inspect, srv: s, user: pr.User, srcIP: srcIP, ctx: connCtx, traceCtx: ctx,
 		matchedGroups: decision.MatchedGroups, releases: s.releases, releaseTTL: s.releaseTTL,
 	}
 	if dir == scpUpload {

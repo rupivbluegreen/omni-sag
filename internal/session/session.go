@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rupivbluegreen/omni-sag/internal/approval"
 	"github.com/rupivbluegreen/omni-sag/internal/authn"
 	"github.com/rupivbluegreen/omni-sag/internal/credential"
@@ -261,8 +262,20 @@ func New(hostKey ssh.Signer, auth authn.Authenticator, d *dialer.Dialer, sink ev
 // emit sends an evidence event, logging (never swallowing) any sink error so a
 // degraded evidence pipeline is observable. Emitting is non-optional. When
 // debug is enabled, the event itself is also mirrored to stdout so a live
-// tail of session activity doesn't require reading evidence.jsonl.
-func (s *Server) emit(e evidence.Event) {
+// tail of session activity doesn't require reading evidence.jsonl. If a span
+// is active on ctx, the event's TraceID/SpanID are filled before writing —
+// empty (zero-cost) whenever OTel is disabled or ctx carries no span. emit
+// assigns e.ID up front (rather than leaving it to the sink, which only ever
+// saw its own by-value copy) and returns the emitted event so callers can
+// correlate a span to the exact evidence record via its ID.
+func (s *Server) emit(ctx context.Context, e evidence.Event) evidence.Event {
+	if e.ID == "" {
+		e.ID = uuid.NewString()
+	}
+	if sc := trace.SpanFromContext(ctx).SpanContext(); sc.IsValid() {
+		e.TraceID = sc.TraceID().String()
+		e.SpanID = sc.SpanID().String()
+	}
 	if s.debug {
 		allow := "?"
 		if e.Allow != nil {
@@ -273,6 +286,7 @@ func (s *Server) emit(e evidence.Event) {
 	if err := s.sink.Emit(e); err != nil {
 		log.Printf("omni-sag: evidence emit failed (type=%s user=%s): %v", e.Type, e.User, err)
 	}
+	return e
 }
 
 // stashTargetSecret holds sec under a random single-use token until the
@@ -313,7 +327,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		if ok, retry := s.bfLimiter.Allow(srcIP); !ok {
 			loginUser, _, _ := splitTargetUser(meta.User())
 			loginUser, _ = splitPcodeSelector(loginUser)
-			s.emit(evidence.Event{
+			s.emit(context.Background(), evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeAuth,
 				User: loginUser, SourceIP: srcIP,
 				Allow: evidence.BoolPtr(false), Reason: "rate limited: too many failed attempts",
@@ -336,14 +350,14 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 			if s.debug {
 				log.Printf("omni-sag: debug: auth failed user=%s source=%s err=%v", loginUser, srcIP, err)
 			}
-			s.emit(evidence.Event{
+			s.emit(ctx, evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeAuth,
 				User: loginUser, SourceIP: srcIP,
 				Allow: evidence.BoolPtr(false), Reason: "authentication failed",
 			})
 			return nil, errors.New("authentication failed")
 		}
-		s.emit(evidence.Event{
+		s.emit(ctx, evidence.Event{
 			Time: time.Now().UTC(), Type: evidence.TypeAuth,
 			User: id.User, SourceIP: srcIP,
 			Allow: evidence.BoolPtr(true), Reason: "authenticated",
@@ -367,7 +381,7 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 					log.Printf("omni-sag: debug: mfa failed user=%s source=%s err=%v", id.User, srcIP, mfaErr)
 				}
 			}
-			s.emit(evidence.Event{
+			s.emit(ctx, evidence.Event{
 				Time: time.Now().UTC(), Type: evidence.TypeMFA,
 				User: id.User, SourceIP: srcIP,
 				Allow: evidence.BoolPtr(allowed), Reason: reason,
