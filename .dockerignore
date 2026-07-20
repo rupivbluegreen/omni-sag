@@ -1,0 +1,10 @@
+# Keep the build context small and reproducible. VERSION is passed as a
+# build-arg, so the .git history is not needed inside the image build.
+.git
+.github
+bin
+docs
+deploy
+scripts
+*.md
+.DS_Store
