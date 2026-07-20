@@ -174,6 +174,24 @@ inspection:
     mode: COMPLIANCE
     retention_days: 3650
 
+# Tunnel protocol identification: fingerprints the opening bytes of -L/-D
+# tunnels to identify the protocol actually flowing through them (e.g. an
+# operator opened -L 5432 but something that isn't Postgres is riding it).
+# Disabled by default. observe mode (enforce: false) only logs a
+# tunnel_protocol evidence event per tunnel; enforce mode additionally
+# terminates a tunnel whose detected protocol isn't in a rule's
+# expect_protocol allow-list (see the policy example below) — with enforce
+# left false, expect_protocol rules run in dry-run: would-block is logged
+# (allow=false, detail mentions "dry-run"), nothing is terminated.
+# unknown_action controls what happens when the protocol can't be
+# identified: allow (default, avoids false-positive outages) or deny.
+# tunnel_inspection:
+#   enabled: true
+#   max_prefix_bytes: 512            # per-direction classification budget
+#   classify_timeout_seconds: 5
+#   enforce: false                   # false = observe/dry-run only
+#   unknown_action: allow            # allow | deny
+
 # Credential injection (Slice 6): the gateway can source a target credential
 # from CyberArk CCP over mutual TLS. Required only if a rule uses credential
 # "inject". If inject is configured and CyberArk is unavailable, the session
@@ -247,6 +265,11 @@ policy:
           # session blocks until a second human approves via omnisag-ctl/API
           # (never the requester themselves). Needs the approval: block above.
           # require_approval: false
+          # expect_protocol (opt-in enforcement, needs tunnel_inspection.
+          # enabled: true above): allow-list of protocols permitted through
+          # this rule's -L/-D tunnel, e.g. ["postgres"]. Only enforced when
+          # tunnel_inspection.enforce is also true; absent = observe only.
+          # expect_protocol: [postgres]
         # Real-target demo (this design's shell/SFTP proxy, not the -L tunnel
         # above): alice gets a genuine shell/SFTP on the ssh-target container,
         # authenticated as svc_db1. Uses "prompt" rather than "inject" because
