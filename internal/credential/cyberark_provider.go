@@ -4,6 +4,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"github.com/rupivbluegreen/omni-sag/internal/fips"
 )
 
 // CyberArkParams configures credential injection from CyberArk. Plain types
@@ -15,6 +17,7 @@ type CyberArkParams struct {
 	TimeoutSeconds                         int
 	BreakerFailures                        int
 	BreakerCooldownSeconds                 int
+	Mode                                   fips.Mode // FIPS TLS posture; warn/enforce harden the CCP client TLS config
 }
 
 // NewCyberArkProvider builds a Provider that resolves inject-mode secrets
@@ -29,6 +32,7 @@ func NewCyberArkProvider(p CyberArkParams) (*Provider, error) {
 		ClientKeyPath:  p.ClientKey,
 		CACertPath:     p.CACert,
 		Timeout:        time.Duration(p.TimeoutSeconds) * time.Second,
+		Mode:           p.Mode,
 	})
 	if err != nil {
 		return nil, err

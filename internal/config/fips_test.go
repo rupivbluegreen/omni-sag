@@ -52,3 +52,21 @@ func TestFIPSInvalidModeRejected(t *testing.T) {
 		t.Fatalf("error should mention fips: %v", err)
 	}
 }
+
+func TestFIPSEnforceRejectsLDAPInsecureTLS(t *testing.T) {
+	yaml := fipsBaseYAML + "fips:\n  mode: enforce\n" + "ldap:\n  insecure_tls: true\n"
+	_, err := Load(writeTemp(t, yaml))
+	if err == nil {
+		t.Fatal("ldap.insecure_tls must be rejected when fips.mode=enforce")
+	}
+	if !strings.Contains(err.Error(), "insecure_tls") {
+		t.Fatalf("error should name insecure_tls: %v", err)
+	}
+}
+
+func TestFIPSWarnAllowsLDAPInsecureTLS(t *testing.T) {
+	yaml := fipsBaseYAML + "fips:\n  mode: warn\n" + "ldap:\n  insecure_tls: true\n"
+	if _, err := Load(writeTemp(t, yaml)); err != nil {
+		t.Fatalf("ldap.insecure_tls under fips.mode=warn should not be rejected: %v", err)
+	}
+}

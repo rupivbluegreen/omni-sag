@@ -19,6 +19,8 @@ import (
 
 	ber "github.com/go-asn1-ber/asn1-ber"
 	"github.com/go-ldap/ldap/v3"
+
+	"github.com/rupivbluegreen/omni-sag/internal/fips"
 )
 
 func TestGroupCNsFromMemberOf(t *testing.T) {
@@ -231,6 +233,26 @@ func TestLDAPAuthenticator_Groups_NoPasswordNeeded(t *testing.T) {
 	groups, err := a.Groups(context.Background(), "alice")
 	if err != nil {
 		t.Fatalf("Groups: %v", err)
+	}
+	if len(groups) == 0 {
+		t.Fatal("want at least one group for alice, got none")
+	}
+}
+
+// TestLDAPAuthenticator_Groups_FIPSEnforceInteroperates proves dial()'s
+// fips.Harden call is actually wired in: the dial still succeeds under
+// fips.mode=enforce, meaning the hardened MinVersion/cipher suites
+// interoperate with a real handshake rather than just passing a static check.
+func TestLDAPAuthenticator_Groups_FIPSEnforceInteroperates(t *testing.T) {
+	addr := startFakeLDAPServer(t, fakeLDAPDirectory{
+		"alice": {"CN=dba,OU=Groups,DC=lab,DC=local"},
+	})
+	cfg := testLDAPConfig(addr)
+	cfg.Mode = fips.ModeEnforce
+	a := NewLDAP(cfg)
+	groups, err := a.Groups(context.Background(), "alice")
+	if err != nil {
+		t.Fatalf("Groups under fips.mode=enforce: %v", err)
 	}
 	if len(groups) == 0 {
 		t.Fatal("want at least one group for alice, got none")
