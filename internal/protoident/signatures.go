@@ -193,13 +193,19 @@ func matchPostgresStartup(b []byte) (string, bool) {
 }
 
 // matchMySQLGreeting matches the MySQL/MariaDB server greeting packet: a
-// 3-byte payload length, a 1-byte sequence number, then protocol-version
-// 0x0a at offset 4.
+// plausible 3-byte little-endian payload length, sequence number 0, then
+// protocol-version 0x0a at offset 4. The length/seq check (not just the
+// protocol-version byte) keeps this from shadowing smtp/ftp's "220 " banner
+// whenever its 5th byte happens to be 0x0a.
 func matchMySQLGreeting(b []byte) (string, bool) {
 	if len(b) < 5 {
 		return "", false
 	}
-	return "", b[4] == 0x0a
+	length := int(b[0]) | int(b[1])<<8 | int(b[2])<<16
+	if length >= 0x1000 || b[3] != 0x00 || b[4] != 0x0a {
+		return "", false
+	}
+	return "", true
 }
 
 // matchOracleTNS matches a TNS CONNECT packet: 8-byte header with packet

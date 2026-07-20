@@ -97,3 +97,25 @@ func buildClientHelloWithSNI(host string) []byte {
 
 func u16(n int) []byte { return []byte{byte(n >> 8), byte(n)} }
 func u24(n int) []byte { return []byte{byte(n >> 16), byte(n >> 8), byte(n)} }
+
+// TestMySQLSignature_NotConfusedBySMTPBanner guards against a loose mysql
+// signature (checking only b[4]==0x0a) shadowing the correct smtp/ftp match
+// (checked later in serverSignatures) whenever a "220 " banner's 5th byte
+// happens to be 0x0a — causing an enforce-mode false-denial of a legit
+// smtp/ftp tunnel.
+func TestMySQLSignature_NotConfusedBySMTPBanner(t *testing.T) {
+	banner := append([]byte("220 "), append([]byte{0x0a}, []byte("mail ready\r\n")...)...)
+	got := Classify(nil, banner)
+	if got.Protocol == MySQL {
+		t.Fatalf("banner-ambiguous 220-greeting misclassified as mysql: %+v", got)
+	}
+	if got.Protocol != SMTP {
+		t.Fatalf("Protocol = %q, want smtp", got.Protocol)
+	}
+
+	handshake := []byte{0x4a, 0x00, 0x00, 0x00, 0x0a, '8', '.', '0'} // real handshake-v10 prefix
+	got = Classify(nil, handshake)
+	if got.Protocol != MySQL {
+		t.Fatalf("Protocol = %q, want mysql for a real handshake-v10 prefix", got.Protocol)
+	}
+}
