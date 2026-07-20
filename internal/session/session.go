@@ -605,6 +605,8 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 			continue
 		}
 		go func(newCh ssh.NewChannel, ct string) {
+			chCtx, chSpan := tracer.Start(ctx, "omnisag.channel", trace.WithAttributes(omnisagChannelType(ct)))
+			defer chSpan.End()
 			if s.reg != nil {
 				s.reg.AddChannels(sessID, 1)
 				// Publish a live supervision event so an attached supervisor sees
@@ -625,9 +627,9 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 			}()
 			switch ct {
 			case "direct-tcpip":
-				s.handleDirectTCPIP(ctx, newCh, pr, srcIP, announcer)
+				s.handleDirectTCPIP(chCtx, newCh, pr, srcIP, announcer)
 			case "session":
-				s.handleSession(ctx, connCtx, newCh, pr, srcIP, sconn, tch, announcer)
+				s.handleSession(chCtx, connCtx, newCh, pr, srcIP, sconn, tch, announcer)
 			}
 		}(newCh, ct)
 	}
@@ -649,9 +651,14 @@ func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr
 	}
 	target := policy.Target{Host: d.HostToConnect, Port: int(d.PortToConnect)}
 
+	ctx, tun := tracer.Start(ctx, "omnisag.tunnel", trace.WithAttributes(
+		omnisagTargetHost(target.Host), semconv.ServerPort(target.Port)))
+	defer tun.End()
+
 	// forwarding=true: refused on full-recording targets (PRD FR-10).
 	conn, err := s.dialer.DialTarget(ctx, pr, srcIP, target, true)
 	if err != nil {
+		tun.SetStatus(codes.Error, err.Error())
 		switch {
 		case errors.Is(err, dialer.ErrForwardingRefused):
 			_ = newCh.Reject(ssh.Prohibited, "forwarding refused: target requires full session recording")
@@ -677,7 +684,10 @@ func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr
 		announcer.announce(tunnelOpenNotice(pr.User, d.HostToConnect, int(d.PortToConnect)))
 	}
 	go ssh.DiscardRequests(chReqs)
-	dialer.Splice(ch, conn)
+	_, spliceSpan := tracer.Start(ctx, "omnisag.splice")
+	aToB, bToA := dialer.Splice(ch, conn)
+	spliceSpan.SetAttributes(omnisagTransferBytes(aToB + bToA))
+	spliceSpan.End()
 }
 
 func principalFrom(perms *ssh.Permissions) policy.Principal {

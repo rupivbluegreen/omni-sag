@@ -21,6 +21,10 @@ func omnisagChannelType(t string) attribute.KeyValue {
 	return attribute.String("omnisag.channel.type", t)
 }
 
+func omnisagTargetHost(h string) attribute.KeyValue {
+	return attribute.String("omnisag.target.host", h)
+}
+
 func omnisagEvidenceID(id string) attribute.KeyValue {
 	return attribute.String("omnisag.evidence.id", id)
 }

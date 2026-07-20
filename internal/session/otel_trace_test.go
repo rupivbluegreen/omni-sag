@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,21 +16,34 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 )
 
-// installSpanRecorder installs a fresh TracerProvider backed by an
-// in-memory SpanRecorder as the global provider, restoring the previous
-// global provider on test cleanup so tests never leak state into each
-// other.
+// otel's global TracerProvider only ever re-delegates already-minted
+// otel.Tracer(name) handles (like this package's package-level `tracer`
+// var) to the FIRST real provider passed to otel.SetTracerProvider — see
+// go.opentelemetry.io/otel/internal/global's delegateTraceOnce. A second
+// SetTracerProvider call updates otel.GetTracerProvider()'s return value
+// but does NOT re-delegate already-obtained tracers, so installing a fresh
+// TracerProvider per test silently orphans every test after the first. The
+// fix: install exactly one recorder for the whole test binary and Reset it
+// per test instead of swapping providers. A black-hole batch exporter rides
+// alongside the recorder on every span for the rest of the file's tests, so
+// TestTracing_ExporterErrorDoesNotBlockSession is exercising the real
+// installed provider rather than one that got silently orphaned.
+var (
+	sharedRecorderOnce sync.Once
+	sharedRecorder     *tracetest.SpanRecorder
+)
+
 func installSpanRecorder(t *testing.T) *tracetest.SpanRecorder {
 	t.Helper()
-	sr := tracetest.NewSpanRecorder()
-	prev := otel.GetTracerProvider()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
-	t.Cleanup(func() {
-		_ = tp.Shutdown(context.Background())
-		otel.SetTracerProvider(prev)
+	sharedRecorderOnce.Do(func() {
+		sharedRecorder = tracetest.NewSpanRecorder()
+		otel.SetTracerProvider(sdktrace.NewTracerProvider(
+			sdktrace.WithSpanProcessor(sharedRecorder),
+			sdktrace.WithBatcher(blackHoleExporter{}, sdktrace.WithExportTimeout(50*time.Millisecond)),
+		))
 	})
-	otel.SetTracerProvider(tp)
-	return sr
+	sharedRecorder.Reset()
+	return sharedRecorder
 }
 
 // findSpan returns the first ended span named name, or nil.
@@ -114,15 +128,24 @@ func TestTracing_ConnectionAndAuthSpans(t *testing.T) {
 	}
 }
 
+// TestTracing_DisabledProducesNoSpans proves the instrumentation call sites
+// never break a session's normal behavior, regardless of tracer state. The
+// authoritative "OTel disabled installs nothing globally" guarantee is
+// internal/otelexport's TestSetup_DisabledInstallsNoopAndNoShutdownWork,
+// which runs in its own process before any provider has ever been
+// installed; that specific assertion can't be repeated here once another
+// test in this binary has installed a real provider (see the comment on
+// installSpanRecorder).
 func TestTracing_DisabledProducesNoSpans(t *testing.T) {
-	// No provider installed: the global tracer stays the default no-op, so
-	// driving a real session must succeed exactly as without this feature —
-	// proving the disabled instrumentation path is inert, not just cheap.
 	driveAllowedForward(t)
 }
 
 // blackHoleExporter's ExportSpans blocks until its context is cancelled,
-// simulating an unreachable/hung OTLP collector.
+// simulating an unreachable/hung OTLP collector. It rides alongside the
+// shared SpanRecorder on every span end for the rest of this file's tests
+// (see installSpanRecorder) — a BatchSpanProcessor's OnEnd is a
+// non-blocking enqueue, so a stuck/erroring exporter here must never slow
+// span.End() or the session itself.
 type blackHoleExporter struct{}
 
 func (blackHoleExporter) ExportSpans(ctx context.Context, _ []sdktrace.ReadOnlySpan) error {
@@ -132,20 +155,60 @@ func (blackHoleExporter) ExportSpans(ctx context.Context, _ []sdktrace.ReadOnlyS
 func (blackHoleExporter) Shutdown(context.Context) error { return nil }
 
 func TestTracing_ExporterErrorDoesNotBlockSession(t *testing.T) {
-	prev := otel.GetTracerProvider()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(blackHoleExporter{},
-		sdktrace.WithExportTimeout(50*time.Millisecond)))
-	otel.SetTracerProvider(tp)
-	t.Cleanup(func() {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-		defer cancel()
-		_ = tp.Shutdown(shutCtx)
-		otel.SetTracerProvider(prev)
-	})
-
+	installSpanRecorder(t)
 	start := time.Now()
 	driveAllowedForward(t)
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Fatalf("session with a black-hole span exporter took %s, want it unaffected", elapsed)
+	}
+}
+
+func TestTracing_TunnelChannelSpanTree(t *testing.T) {
+	sr := installSpanRecorder(t)
+	driveAllowedForward(t)
+
+	ended := sr.Ended()
+	ch := findSpan(ended, "omnisag.channel")
+	if ch == nil {
+		t.Fatalf("expected an omnisag.channel span, got: %+v", ended)
+	}
+	if typ, ok := attrString(ch, "omnisag.channel.type"); !ok || typ != "direct-tcpip" {
+		t.Fatalf("omnisag.channel.type = %q (ok=%v), want direct-tcpip", typ, ok)
+	}
+
+	tun := findSpan(ended, "omnisag.tunnel")
+	if tun == nil {
+		t.Fatalf("expected an omnisag.tunnel span, got: %+v", ended)
+	}
+	if tun.Parent().SpanID() != ch.SpanContext().SpanID() {
+		t.Fatal("omnisag.tunnel must be a child of omnisag.channel")
+	}
+
+	dial := findSpan(ended, "omnisag.dial")
+	if dial == nil {
+		t.Fatalf("expected an omnisag.dial span (from dialer.DialTarget), got: %+v", ended)
+	}
+	if dial.Parent().SpanID() != tun.SpanContext().SpanID() {
+		t.Fatal("omnisag.dial must be a child of omnisag.tunnel")
+	}
+
+	splice := findSpan(ended, "omnisag.splice")
+	if splice == nil {
+		t.Fatalf("expected an omnisag.splice span, got: %+v", ended)
+	}
+	if splice.Parent().SpanID() != tun.SpanContext().SpanID() {
+		t.Fatal("omnisag.splice must be a child of omnisag.tunnel")
+	}
+	found := false
+	for _, kv := range splice.Attributes() {
+		if string(kv.Key) == "omnisag.transfer.bytes" {
+			found = true
+			if kv.Value.AsInt64() <= 0 {
+				t.Fatalf("omnisag.transfer.bytes = %d, want > 0", kv.Value.AsInt64())
+			}
+		}
+	}
+	if !found {
+		t.Fatal("omnisag.splice span missing omnisag.transfer.bytes attribute")
 	}
 }
