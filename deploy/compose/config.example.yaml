@@ -185,6 +185,8 @@ inspection:
 # (allow=false, detail mentions "dry-run"), nothing is terminated.
 # unknown_action controls what happens when the protocol can't be
 # identified: allow (default, avoids false-positive outages) or deny.
+# smtp/ftp are banner-ambiguous (both greet with "220 ") and are best-effort:
+# don't rely on expect_protocol: [smtp]/[ftp] alone to tell them apart.
 # tunnel_inspection:
 #   enabled: true
 #   max_prefix_bytes: 512            # per-direction classification budget

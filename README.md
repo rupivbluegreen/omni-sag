@@ -102,7 +102,9 @@ past the handshake, and unrecognized traffic classifies as `unknown`). Disabled 
 tunnel; adding `expect_protocol` to a rule additionally enforces an allow-list once
 `enforce: true` — a mismatch terminates the tunnel before any bytes reach the target. Leaving
 `enforce: false` with `expect_protocol` rules present is a dry-run: it logs what *would* be
-blocked without acting on it.
+blocked without acting on it. Banner-ambiguous services (smtp/ftp both greet with a `220 `
+response) are best-effort — classification falls back to the banner text (e.g. must contain
+`FTP` to call it ftp), so don't rely on `expect_protocol: [smtp]`/`[ftp]` alone to tell them apart.
 ```yaml
 tunnel_inspection:
   enabled: true
