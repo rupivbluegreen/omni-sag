@@ -243,10 +243,11 @@ func (r *asyncReader) Read(p []byte) (int, error) {
 
 // holdAndClassify peeks at both sides' opening bytes concurrently — via each
 // side's already-running asyncReader — until protoident matches a signature,
-// both sides reach budget, or timeout elapses. It returns as soon as EITHER
-// side alone yields a match, so a client-first protocol classifies without
-// ever waiting on a target that stays silent until spoken to (the
-// client-first deadlock guard) — and symmetrically for a server-first one.
+// both sides reach budget, both sides are done (EOF/error, nothing left to
+// arrive), or timeout elapses. It returns as soon as EITHER side alone
+// yields a match, so a client-first protocol classifies without ever
+// waiting on a target that stays silent until spoken to (the client-first
+// deadlock guard) — and symmetrically for a server-first one.
 func holdAndClassify(clientAR, serverAR *asyncReader, budget int, timeout time.Duration) protoident.Result {
 	deadline := time.After(timeout)
 	for {
@@ -255,6 +256,9 @@ func holdAndClassify(clientAR, serverAR *asyncReader, budget int, timeout time.D
 			return res
 		}
 		if len(clientAR.buf) >= budget && len(serverAR.buf) >= budget {
+			return res
+		}
+		if clientAR.err != nil && serverAR.err != nil {
 			return res
 		}
 		select {

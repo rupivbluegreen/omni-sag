@@ -13,6 +13,7 @@ import (
 
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
+	"github.com/rupivbluegreen/omni-sag/internal/protoident"
 )
 
 // startEchoWithPreamble starts a TCP listener that writes preamble once per
@@ -441,5 +442,38 @@ func TestTunnelInspect_DryRunLogsWithoutBlocking(t *testing.T) {
 	}
 	if !bytes.Equal(rt.snapshot(), jdwp) {
 		t.Fatalf("target should still receive bytes in dry-run, got %x, want %x", rt.snapshot(), jdwp)
+	}
+}
+
+// TestHoldAndClassify_ReturnsEarlyWhenBothSidesDoneBeforeTimeout drives
+// holdAndClassify directly with two sides that send unclassifiable bytes and
+// then EOF. Once both sides are done there is nothing left to arrive, so it
+// should return immediately rather than holding the tunnel for the full
+// ClassifyTimeout.
+func TestHoldAndClassify_ReturnsEarlyWhenBothSidesDoneBeforeTimeout(t *testing.T) {
+	clientR, clientW := io.Pipe()
+	serverR, serverW := io.Pipe()
+	clientAR := newAsyncReader(clientR)
+	serverAR := newAsyncReader(serverR)
+
+	go func() {
+		clientW.Write([]byte("xy"))
+		clientW.Close()
+	}()
+	go func() {
+		serverW.Write([]byte("zz"))
+		serverW.Close()
+	}()
+
+	const timeout = 5 * time.Second
+	start := time.Now()
+	res := holdAndClassify(clientAR, serverAR, 512, timeout)
+	elapsed := time.Since(start)
+
+	if res.Protocol != protoident.Unknown {
+		t.Fatalf("Protocol = %q, want unknown", res.Protocol)
+	}
+	if elapsed >= timeout/2 {
+		t.Fatalf("holdAndClassify took %v after both sides closed, want an early return well under the %v timeout", elapsed, timeout)
 	}
 }
