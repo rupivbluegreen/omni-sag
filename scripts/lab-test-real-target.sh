@@ -376,7 +376,7 @@ def main():
         finish(fd, pid, 1)
     os.write(fd, (gw_pw + "\n").encode())
 
-    if not wait_for("Target password:"):
+    if not wait_for("svc_db1@"):
         print("DRIVER_ERROR=never saw target password prompt")
         finish(fd, pid, 1)
     os.write(fd, (tgt_pw + "\n").encode())
@@ -498,7 +498,7 @@ def main():
         finish(fd, pid, 1, "FAIL:never saw gateway password prompt")
     os.write(fd, (gw_pw + "\n").encode())
 
-    if not wait_for("Target password:", auth_deadline):
+    if not wait_for("svc_db1@", auth_deadline):
         finish(fd, pid, 1, "FAIL:never saw target password prompt")
     os.write(fd, (tgt_pw + "\n").encode())
 
@@ -711,7 +711,7 @@ def main():
         finish(fd, pid, 1, ["GET_RESULT=FAIL:never saw gateway password prompt"])
     os.write(fd, (gw_pw + "\n").encode())
 
-    if not wait_for("Target password:", auth_deadline):
+    if not wait_for("svc_db1@", auth_deadline):
         finish(fd, pid, 1, ["GET_RESULT=FAIL:never saw target password prompt"])
     os.write(fd, (tgt_pw + "\n").encode())
 
@@ -856,7 +856,7 @@ def main():
     # session.go: the credential-mode peek only prompts when a rule
     # matched). Answer it anyway if it somehow appears, so this assertion is
     # about the sftp subsystem being refused, not about which prompt bob sees.
-    if wait_for("Target password:", time.time() + 8):
+    if wait_for("svc_db1@", time.time() + 8):
         os.write(fd, (tgt_pw + "\n").encode())
 
     got_sftp_prompt = wait_for("sftp>", time.time() + 15)
