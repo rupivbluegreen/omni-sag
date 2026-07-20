@@ -145,6 +145,11 @@ type Decision struct {
 	// rebinding between decision time and connect time is otherwise
 	// invisible to policy).
 	MatchedCIDR *net.IPNet
+	// ExpectProtocol is the matched rule's tunnel protocol allow-list (see
+	// Rule.ExpectProtocol), threaded through so tunnel protocol
+	// identification enforce mode can check it without re-matching policy.
+	// Empty on deny and when the matched rule sets no expect_protocol.
+	ExpectProtocol []string
 }
 
 // ForwardingAllowed reports whether port-forwarding (-L) is permitted for this
@@ -257,6 +262,7 @@ func (p Policy) Decide(pr Principal, t Target, resolve ResolverFunc) Decision {
 					RequireApproval: rule.RequireApproval,
 					TargetUser:      rule.TargetUser,
 					MatchedGroups:   intersectGroups(pr.Groups, r.Groups),
+					ExpectProtocol:  rule.ExpectProtocol,
 				}
 			}
 		}
@@ -286,6 +292,7 @@ func (p Policy) Decide(pr Principal, t Target, resolve ResolverFunc) Decision {
 					TargetUser:      rule.TargetUser,
 					MatchedGroups:   intersectGroups(pr.Groups, r.Groups),
 					MatchedCIDR:     n,
+					ExpectProtocol:  rule.ExpectProtocol,
 				}
 			}
 		}

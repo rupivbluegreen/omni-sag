@@ -667,12 +667,19 @@ func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr
 		announcer.announce(tunnelOpenNotice(pr.User, d.HostToConnect, int(d.PortToConnect)))
 	}
 	go ssh.DiscardRequests(chReqs)
-	if s.tunnelInspect.Enabled && !s.tunnelInspect.Enforce {
-		taps := newTunnelTaps(s.tunnelInspect.MaxPrefixBytes)
-		ch2 := &tapConn{ReadWriteCloser: ch, taps: taps, fromClient: true}
-		conn2 := &tapConn{ReadWriteCloser: conn, taps: taps, fromClient: false}
-		go s.classifyAndEmit(taps, pr, srcIP, target.String())
-		dialer.Splice(ch2, conn2)
+	if s.tunnelInspect.Enabled {
+		decision := s.dialer.Peek(pr, target)
+		if !s.tunnelInspect.Enforce || len(decision.ExpectProtocol) == 0 {
+			// Observe, or enforce with nothing to enforce on this target's
+			// rule: tee + classify off the hot path, never gate the splice.
+			taps := newTunnelTaps(s.tunnelInspect.MaxPrefixBytes)
+			ch2 := &tapConn{ReadWriteCloser: ch, taps: taps, fromClient: true}
+			conn2 := &tapConn{ReadWriteCloser: conn, taps: taps, fromClient: false}
+			go s.classifyAndEmit(taps, pr, srcIP, target.String(), decision.ExpectProtocol)
+			dialer.Splice(ch2, conn2)
+			return
+		}
+		s.enforceTunnel(ch, conn, pr, srcIP, target.String(), decision.ExpectProtocol)
 		return
 	}
 	dialer.Splice(ch, conn)
