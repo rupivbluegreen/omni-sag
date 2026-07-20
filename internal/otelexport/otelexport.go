@@ -17,9 +17,13 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
@@ -63,10 +67,14 @@ type TracesConfig struct {
 	ExportTimeoutSeconds int
 }
 
-// MetricsConfig configures the optional OTLP metrics signal.
+// MetricsConfig configures the optional OTLP metrics signal. SnapshotFn
+// reads the existing atomic counters (internal/metrics.Metrics.Snapshot) —
+// there is no second counting decorator, so Prometheus stays the single
+// source of truth and this is purely an additional read path.
 type MetricsConfig struct {
 	Enabled         bool
 	IntervalSeconds int
+	SnapshotFn      func() map[string]int64
 }
 
 // LogsConfig configures the experimental OTLP logs signal.
@@ -123,6 +131,15 @@ func Setup(ctx context.Context, cfg Config) (*Providers, error) {
 		otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 			propagation.TraceContext{}, propagation.Baggage{}))
 		shutdowns = append(shutdowns, tp.Shutdown)
+	}
+
+	if cfg.Metrics.Enabled && cfg.Metrics.SnapshotFn != nil {
+		mp, err := buildMeterProvider(ctx, cfg, res)
+		if err != nil {
+			return nil, err
+		}
+		otel.SetMeterProvider(mp)
+		shutdowns = append(shutdowns, mp.Shutdown)
 	}
 
 	p.shutdown = func(ctx context.Context) error {
@@ -299,4 +316,93 @@ func (e *countingSpanExporter) ExportSpans(ctx context.Context, spans []sdktrace
 		e.failures.Add(1)
 	}
 	return err
+}
+
+// buildMeterProvider builds the OTLP metric exporter and a MeterProvider
+// whose PeriodicReader pushes on cfg.Metrics' interval (default 60s), with
+// observable counters registered from cfg.Metrics.SnapshotFn.
+func buildMeterProvider(ctx context.Context, cfg Config, res *resource.Resource) (*sdkmetric.MeterProvider, error) {
+	exp, err := buildMetricExporter(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("otelexport: metric exporter: %w", err)
+	}
+	interval := time.Duration(cfg.Metrics.IntervalSeconds) * time.Second
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithResource(res),
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exp, sdkmetric.WithInterval(interval))),
+	)
+	if err := registerObservableCounters(mp.Meter("github.com/rupivbluegreen/omni-sag/internal/otelexport"), cfg.Metrics.SnapshotFn); err != nil {
+		return nil, fmt.Errorf("otelexport: register counters: %w", err)
+	}
+	return mp, nil
+}
+
+// registerObservableCounters creates one Int64ObservableCounter per key in
+// an initial snapshotFn() call (the counter set is fixed for the life of
+// the process) and registers a single callback that re-reads snapshotFn on
+// every collection, so the reported values always match the live atomics —
+// no second counting decorator, no divergence from Prometheus.
+func registerObservableCounters(meter metric.Meter, snapshotFn func() map[string]int64) error {
+	initial := snapshotFn()
+	instruments := make(map[string]metric.Int64Observable, len(initial))
+	observables := make([]metric.Observable, 0, len(initial))
+	for name := range initial {
+		inst, err := meter.Int64ObservableCounter("omnisag_" + name)
+		if err != nil {
+			return err
+		}
+		instruments[name] = inst
+		observables = append(observables, inst)
+	}
+	_, err := meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		for name, inst := range instruments {
+			o.ObserveInt64(inst, snapshotFn()[name])
+		}
+		return nil
+	}, observables...)
+	return err
+}
+
+// buildMetricExporter builds the OTLP metric exporter for cfg.Protocol,
+// mirroring buildTraceExporter: both otlpmetricgrpc.New and
+// otlpmetrichttp.New dial lazily, so an unreachable endpoint never blocks
+// this call.
+func buildMetricExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) {
+	switch cfg.Protocol {
+	case "", "grpc":
+		opts := []otlpmetricgrpc.Option{otlpmetricgrpc.WithEndpoint(cfg.Endpoint)}
+		if len(cfg.Headers) > 0 {
+			opts = append(opts, otlpmetricgrpc.WithHeaders(cfg.Headers))
+		}
+		if cfg.Insecure {
+			opts = append(opts, otlpmetricgrpc.WithInsecure())
+		} else {
+			tlsCfg, err := buildTLSConfig(cfg.TLS)
+			if err != nil {
+				return nil, err
+			}
+			opts = append(opts, otlpmetricgrpc.WithTLSCredentials(credentials.NewTLS(tlsCfg)))
+		}
+		return otlpmetricgrpc.New(ctx, opts...)
+	case "http":
+		opts := []otlpmetrichttp.Option{otlpmetrichttp.WithEndpoint(cfg.Endpoint)}
+		if len(cfg.Headers) > 0 {
+			opts = append(opts, otlpmetrichttp.WithHeaders(cfg.Headers))
+		}
+		if cfg.Insecure {
+			opts = append(opts, otlpmetrichttp.WithInsecure())
+		} else {
+			tlsCfg, err := buildTLSConfig(cfg.TLS)
+			if err != nil {
+				return nil, err
+			}
+			opts = append(opts, otlpmetrichttp.WithTLSClientConfig(tlsCfg))
+		}
+		return otlpmetrichttp.New(ctx, opts...)
+	default:
+		return nil, fmt.Errorf("otelexport: unknown protocol %q (want grpc|http)", cfg.Protocol)
+	}
 }

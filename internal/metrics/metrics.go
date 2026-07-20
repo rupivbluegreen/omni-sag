@@ -132,6 +132,31 @@ func (m *Metrics) record(e evidence.Event) {
 	}
 }
 
+// Snapshot returns the current value of every fixed-name counter, keyed by
+// the same name used in the Prometheus text output (without the omnisag_
+// prefix). Used by the optional OTLP metrics exporter (internal/otelexport)
+// to register observable counters that read these same atomics — there is
+// no second counting decorator, so Prometheus stays the single source of
+// truth and this is purely an additional read path.
+func (m *Metrics) Snapshot() map[string]int64 {
+	return map[string]int64{
+		"auth_success_total":           m.authSuccess.get(),
+		"auth_failure_total":           m.authFailure.get(),
+		"mfa_approved_total":           m.mfaApproved.get(),
+		"mfa_denied_total":             m.mfaDenied.get(),
+		"tunnel_allow_total":           m.tunnelAllow.get(),
+		"tunnel_deny_total":            m.tunnelDeny.get(),
+		"approval_granted_total":       m.approvalGranted.get(),
+		"approval_refused_total":       m.approvalRefused.get(),
+		"inspection_clean_total":       m.inspectClean.get(),
+		"inspection_blocked_total":     m.inspectBlocked.get(),
+		"recordings_total":             m.recordings.get(),
+		"transfers_total":              m.transfers.get(),
+		"evidence_emit_failures_total": m.evidenceEmitFailures.get(),
+		"otel_export_failures_total":   m.otelExportFailuresFn(),
+	}
+}
+
 func pick(ok bool, yes, no *counter) {
 	if ok {
 		yes.inc()

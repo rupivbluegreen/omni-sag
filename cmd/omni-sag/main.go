@@ -182,6 +182,7 @@ func run(cfgPath string, debug bool) error {
 			Metrics: otelexport.MetricsConfig{
 				Enabled:         cfg.OTel.MetricsEnabled(),
 				IntervalSeconds: cfg.OTel.MetricsIntervalSeconds(),
+				SnapshotFn:      met.Snapshot,
 			},
 			Logs: otelexport.LogsConfig{Enabled: cfg.OTel.LogsEnabled()},
 		})
@@ -190,6 +191,9 @@ func run(cfgPath string, debug bool) error {
 		}
 		met.SetOTelExportFailuresFn(otelProviders.ExportFailures)
 		log.Printf("omni-sag: OpenTelemetry OTLP export enabled (endpoint=%s protocol=%s)", cfg.OTel.Endpoint, cfg.OTel.Protocol())
+		if cfg.OTel.MetricsEnabled() {
+			log.Printf("omni-sag: OTLP metrics export enabled (Prometheus /metrics remains authoritative)")
+		}
 		if cfg.OTel.LogsEnabled() {
 			log.Printf("omni-sag: WARNING OTLP logs export is EXPERIMENTAL (OTel logs SDK is pre-GA)")
 		}

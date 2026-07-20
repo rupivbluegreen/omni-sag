@@ -104,3 +104,47 @@ func TestSetOTelExportFailuresFn_DefaultsZeroAndWiresThrough(t *testing.T) {
 		t.Fatalf("expected wired otel export failures count:\n%s", b.String())
 	}
 }
+
+func TestSnapshot_MatchesPrometheusCounters(t *testing.T) {
+	m := New()
+	s := m.CountingSink(evidence.NewMemSink())
+	_ = s.Emit(evidence.Event{Type: evidence.TypeAuth, Allow: evidence.BoolPtr(true)})
+	_ = s.Emit(evidence.Event{Type: evidence.TypeTunnelDecision, Allow: evidence.BoolPtr(false)})
+
+	snap := m.Snapshot()
+	if snap["auth_success_total"] != 1 {
+		t.Fatalf("snapshot auth_success_total = %d, want 1", snap["auth_success_total"])
+	}
+	if snap["tunnel_deny_total"] != 1 {
+		t.Fatalf("snapshot tunnel_deny_total = %d, want 1", snap["tunnel_deny_total"])
+	}
+
+	var b bytes.Buffer
+	m.WriteText(&b)
+	if !strings.Contains(b.String(), "omnisag_auth_success_total 1") {
+		t.Fatalf("prometheus text missing matching counter:\n%s", b.String())
+	}
+	if !strings.Contains(b.String(), "omnisag_tunnel_deny_total 1") {
+		t.Fatalf("prometheus text missing matching counter:\n%s", b.String())
+	}
+}
+
+// TestSnapshot_DoesNotAffectPrometheusText proves OTLP metrics coexist with
+// Prometheus: reading via Snapshot (as an OTLP collector interval would)
+// never mutates the counters or otherwise changes /metrics output.
+func TestSnapshot_DoesNotAffectPrometheusText(t *testing.T) {
+	m := New()
+	_ = m.CountingSink(evidence.NewMemSink()).Emit(evidence.Event{Type: evidence.TypeAuth, Allow: evidence.BoolPtr(true)})
+
+	var before bytes.Buffer
+	m.WriteText(&before)
+
+	_ = m.Snapshot()
+	_ = m.Snapshot()
+
+	var after bytes.Buffer
+	m.WriteText(&after)
+	if before.String() != after.String() {
+		t.Fatalf("Prometheus text changed after Snapshot reads:\nbefore:\n%s\nafter:\n%s", before.String(), after.String())
+	}
+}
