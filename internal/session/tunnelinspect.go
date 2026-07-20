@@ -175,24 +175,37 @@ type asyncChunk struct {
 // for the rest of the tunnel's life without ever having two goroutines
 // racing to Read the same underlying conn/channel.
 type asyncReader struct {
-	ch  chan asyncChunk
-	buf []byte // bytes received but not yet returned via Read
-	err error  // sticky error once inner.Read errors or returns EOF
+	ch       chan asyncChunk
+	quit     chan struct{}
+	stopOnce sync.Once
+	buf      []byte // bytes received but not yet returned via Read
+	err      error  // sticky error once inner.Read errors or returns EOF
 }
 
 func newAsyncReader(inner io.Reader) *asyncReader {
-	r := &asyncReader{ch: make(chan asyncChunk, 1)}
+	r := &asyncReader{ch: make(chan asyncChunk, 1), quit: make(chan struct{})}
 	go func() {
 		for {
 			b := make([]byte, 4096)
 			n, err := inner.Read(b)
-			r.ch <- asyncChunk{b: b[:n], err: err}
+			select {
+			case r.ch <- asyncChunk{b: b[:n], err: err}:
+			case <-r.quit:
+				return
+			}
 			if err != nil {
 				return
 			}
 		}
 	}()
 	return r
+}
+
+// stop tells the background goroutine to abandon a blocked (or future) send
+// instead of waiting forever for a consumer that's gone — used on the
+// enforce-deny path, which closes the tunnel without draining. Idempotent.
+func (r *asyncReader) stop() {
+	r.stopOnce.Do(func() { close(r.quit) })
 }
 
 func (r *asyncReader) absorb(c asyncChunk) {
@@ -296,6 +309,8 @@ func (s *Server) enforceTunnel(ch io.ReadWriteCloser, conn io.ReadWriteCloser, p
 		Reason:   reason,
 	})
 	if !allow {
+		clientAR.stop()
+		serverAR.stop()
 		_ = ch.Close()
 		_ = conn.Close()
 		return
