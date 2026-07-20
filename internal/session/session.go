@@ -32,6 +32,9 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/recording"
 	"github.com/rupivbluegreen/omni-sag/internal/release"
 	"github.com/rupivbluegreen/omni-sag/internal/sessions"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -505,11 +508,19 @@ func (s *Server) Drain(grace time.Duration) (int64, error) {
 func (s *Server) ActiveSessions() int64 { return s.active.Load() }
 
 func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
+	ctx, root := tracer.Start(ctx, "omnisag.connection", trace.WithSpanKind(trace.SpanKindServer))
+	defer root.End()
+
 	// Bound the handshake with a deadline, then release the slot and clear the
 	// deadline once it completes. A stalled handshake trips the deadline instead
 	// of parking forever.
 	_ = raw.SetDeadline(time.Now().Add(s.handshakeTimeout))
+	_, authSpan := tracer.Start(ctx, "omnisag.auth")
 	sconn, chans, reqs, err := ssh.NewServerConn(raw, s.sshCfg)
+	if err != nil {
+		authSpan.SetStatus(codes.Error, err.Error())
+	}
+	authSpan.End()
 	_ = raw.SetDeadline(time.Time{})
 	<-s.sem // release the handshake slot (success or failure)
 	if err != nil {
@@ -529,6 +540,7 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 
 	pr := principalFrom(sconn.Permissions)
 	srcIP := hostOf(sconn.RemoteAddr())
+	root.SetAttributes(omnisagUser(pr.User), semconv.ClientAddress(srcIP), omnisagGroupsCount(len(pr.Groups)))
 
 	// Register the live session so the control-plane API can list/terminate it.
 	// terminate closes the SSH connection; the data path stays independent of
