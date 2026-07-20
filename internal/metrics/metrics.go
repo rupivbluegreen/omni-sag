@@ -38,7 +38,8 @@ type Metrics struct {
 	// eventexport), not a fixed known set.
 	exportDropped sync.Map // string -> *counter
 
-	activeFn func() int64
+	activeFn             func() int64
+	otelExportFailuresFn func() int64
 }
 
 // IncExportDrop increments the drop counter for the named export
@@ -50,13 +51,24 @@ func (m *Metrics) IncExportDrop(exporter string) {
 }
 
 // New returns a Metrics with a zero active gauge.
-func New() *Metrics { return &Metrics{activeFn: func() int64 { return 0 }} }
+func New() *Metrics {
+	return &Metrics{activeFn: func() int64 { return 0 }, otelExportFailuresFn: func() int64 { return 0 }}
+}
 
 // SetActiveFn wires the active-sessions gauge to a source (e.g. the session
 // registry's live count).
 func (m *Metrics) SetActiveFn(fn func() int64) {
 	if fn != nil {
 		m.activeFn = fn
+	}
+}
+
+// SetOTelExportFailuresFn wires the OTLP export-failures counter to a source
+// (otelexport.Providers.ExportFailures). Unset (the default, OTel disabled)
+// reports zero. Mirrors SetActiveFn.
+func (m *Metrics) SetOTelExportFailuresFn(fn func() int64) {
+	if fn != nil {
+		m.otelExportFailuresFn = fn
 	}
 }
 
@@ -155,6 +167,7 @@ func (m *Metrics) WriteText(w io.Writer) {
 	ctr("recordings_total", "Session recordings produced", m.recordings.get())
 	ctr("transfers_total", "SFTP transfers", m.transfers.get())
 	ctr("evidence_emit_failures_total", "Evidence emit failures", m.evidenceEmitFailures.get())
+	ctr("otel_export_failures_total", "OTLP export failures/drops", m.otelExportFailuresFn())
 
 	// exportDropped is a labeled counter (one series per exporter name), so
 	// it can't use the fixed-name ctr helper above; emit HELP/TYPE once then

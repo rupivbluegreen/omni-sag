@@ -88,3 +88,19 @@ func TestHandler_RendersPrometheus(t *testing.T) {
 		t.Fatal("expected a TYPE line per metric")
 	}
 }
+
+func TestSetOTelExportFailuresFn_DefaultsZeroAndWiresThrough(t *testing.T) {
+	m := New()
+	var b bytes.Buffer
+	m.WriteText(&b)
+	if !strings.Contains(b.String(), "omnisag_otel_export_failures_total 0") {
+		t.Fatalf("expected zero otel export failures by default:\n%s", b.String())
+	}
+
+	m.SetOTelExportFailuresFn(func() int64 { return 5 })
+	b.Reset()
+	m.WriteText(&b)
+	if !strings.Contains(b.String(), "omnisag_otel_export_failures_total 5") {
+		t.Fatalf("expected wired otel export failures count:\n%s", b.String())
+	}
+}

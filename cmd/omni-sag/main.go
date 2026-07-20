@@ -31,6 +31,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/inspect"
 	"github.com/rupivbluegreen/omni-sag/internal/inspectgate"
 	"github.com/rupivbluegreen/omni-sag/internal/metrics"
+	"github.com/rupivbluegreen/omni-sag/internal/otelexport"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 	"github.com/rupivbluegreen/omni-sag/internal/policysource"
 	"github.com/rupivbluegreen/omni-sag/internal/recording"
@@ -149,6 +150,50 @@ func run(cfgPath string, debug bool) error {
 	// data-path hot-loop instrumentation; metrics is a leaf that never imports
 	// the control plane). Exposed on its own listener below.
 	met := metrics.New()
+
+	// OpenTelemetry OTLP export: opt-in, default off. Setup registers the
+	// global TracerProvider (and, when configured, MeterProvider) so every
+	// instrumented call site elsewhere in the tree picks it up through the
+	// no-op-when-disabled global API — no other wiring needed. A dead/slow
+	// collector never blocks boot (non-blocking dial); Shutdown runs inside
+	// the drain sequence below with a hard timeout.
+	var otelProviders *otelexport.Providers
+	if cfg.OTel != nil && cfg.OTel.Enabled {
+		otelProviders, err = otelexport.Setup(ctx, otelexport.Config{
+			Enabled:  true,
+			Endpoint: cfg.OTel.Endpoint,
+			Protocol: cfg.OTel.Protocol(),
+			Insecure: cfg.OTel.Insecure,
+			TLS: otelexport.TLSConfig{
+				CACert:     cfg.OTel.TLS.CACert,
+				ClientCert: cfg.OTel.TLS.ClientCert,
+				ClientKey:  cfg.OTel.TLS.ClientKey,
+			},
+			Headers:  cfg.OTel.Headers,
+			Resource: cfg.OTel.Resource,
+			Traces: otelexport.TracesConfig{
+				Enabled:              cfg.OTel.TracesEnabled(),
+				Sampler:              cfg.OTel.Sampler(),
+				SampleRatio:          cfg.OTel.SampleRatio(),
+				MaxQueueSize:         cfg.OTel.MaxQueueSize(),
+				MaxExportBatchSize:   cfg.OTel.MaxExportBatchSize(),
+				ExportTimeoutSeconds: cfg.OTel.ExportTimeout(),
+			},
+			Metrics: otelexport.MetricsConfig{
+				Enabled:         cfg.OTel.MetricsEnabled(),
+				IntervalSeconds: cfg.OTel.MetricsIntervalSeconds(),
+			},
+			Logs: otelexport.LogsConfig{Enabled: cfg.OTel.LogsEnabled()},
+		})
+		if err != nil {
+			return err
+		}
+		met.SetOTelExportFailuresFn(otelProviders.ExportFailures)
+		log.Printf("omni-sag: OpenTelemetry OTLP export enabled (endpoint=%s protocol=%s)", cfg.OTel.Endpoint, cfg.OTel.Protocol())
+		if cfg.OTel.LogsEnabled() {
+			log.Printf("omni-sag: WARNING OTLP logs export is EXPERIMENTAL (OTel logs SDK is pre-GA)")
+		}
+	}
 
 	// Event export (SIEM/log-management): opt-in, best-effort fan-out
 	// alongside the durable evidence sinks (internal/eventexport). ONE
@@ -307,6 +352,17 @@ func run(cfgPath string, debug bool) error {
 		log.Printf("omni-sag: %v; exiting", err)
 	} else {
 		log.Printf("omni-sag: drained cleanly (%d sessions remained)", n)
+	}
+
+	// Shut down OTel providers AFTER the drain, so in-flight sessions' final
+	// spans are recorded first, with a hard bounded timeout so a dead
+	// collector can never hang process exit.
+	if otelProviders != nil {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := otelProviders.Shutdown(shutCtx); err != nil {
+			log.Printf("omni-sag: otel shutdown: %v", err)
+		}
 	}
 	return nil
 }
