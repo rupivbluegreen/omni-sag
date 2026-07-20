@@ -59,6 +59,30 @@ func TestSplitPcodeSelector(t *testing.T) {
 	}
 }
 
+func TestSplitTargetHostPort(t *testing.T) {
+	cases := []struct {
+		in, host string
+		port     int
+	}{
+		{"10.0.0.5", "10.0.0.5", 0},
+		{"10.0.0.5:22", "10.0.0.5", 22},
+		{"host.local", "host.local", 0},
+		{"host.local:2222", "host.local", 2222},
+		{"[2001:db8::1]:22", "2001:db8::1", 22}, // bracketed IPv6 + port
+		{"2001:db8::1", "2001:db8::1", 0},       // bare IPv6 => host-only
+		{"10.0.0.5:0", "10.0.0.5:0", 0},         // port 0 invalid => whole is host
+		{"10.0.0.5:99999", "10.0.0.5:99999", 0}, // out of range => host-only
+		{"10.0.0.5:ssh", "10.0.0.5:ssh", 0},     // non-numeric => host-only
+		{"", "", 0},
+	}
+	for _, c := range cases {
+		h, p := splitTargetHostPort(c.in)
+		if h != c.host || p != c.port {
+			t.Errorf("splitTargetHostPort(%q) = (%q, %d), want (%q, %d)", c.in, h, p, c.host, c.port)
+		}
+	}
+}
+
 // startFakeTarget runs a minimal SSH server on an in-memory pipe that accepts
 // only the given password, and returns the client-side net.Conn to dial.
 // It runs until the test ends (t.Cleanup closes both ends).
