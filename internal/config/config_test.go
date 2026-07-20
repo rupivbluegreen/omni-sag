@@ -723,3 +723,80 @@ func TestExportConfig_BufferSizeDefaultsInEventExport(t *testing.T) {
 		t.Fatalf("toEventExport should pass BufferSize through unmodified (eventexport itself defaults <=0), got %d", got)
 	}
 }
+
+func TestLoad_OTelDefaultsWhenBlockPresent(t *testing.T) {
+	y := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+otel:
+  enabled: true
+  endpoint: "collector:4317"
+`
+	f, err := Load(writeTemp(t, y))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.OTel == nil || !f.OTel.Enabled {
+		t.Fatal("otel should be enabled")
+	}
+	if f.OTel.Protocol() != "grpc" {
+		t.Fatalf("default protocol = %q, want grpc", f.OTel.Protocol())
+	}
+	if f.OTel.Sampler() != "parentbased_always_on" {
+		t.Fatalf("default sampler = %q", f.OTel.Sampler())
+	}
+	// traces default ON when otel enabled; metrics/logs default OFF
+	if !f.OTel.TracesEnabled() {
+		t.Fatal("traces should default enabled")
+	}
+	if f.OTel.MetricsEnabled() || f.OTel.LogsEnabled() {
+		t.Fatal("metrics and logs should default disabled")
+	}
+}
+
+func TestLoad_OTelAbsentIsNil(t *testing.T) {
+	y := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+`
+	f, err := Load(writeTemp(t, y))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.OTel != nil {
+		t.Fatal("absent otel block must be nil (feature off)")
+	}
+}
+
+func TestLoad_OTelRejectsBadProtocolAndSampler(t *testing.T) {
+	for _, bad := range []string{
+		"otel:\n  enabled: true\n  protocol: carrier-pigeon\n",
+		"otel:\n  enabled: true\n  traces:\n    sampler: sometimes\n",
+	} {
+		y := "listen: \":2222\"\nevidence:\n  file: \"e.jsonl\"\npolicy:\n  roles: []\n" + bad
+		if _, err := Load(writeTemp(t, y)); err == nil {
+			t.Fatalf("expected validation error for %q", bad)
+		}
+	}
+}
+
+func TestLoad_OTelRequiresEndpointWhenEnabled(t *testing.T) {
+	y := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles: []
+otel:
+  enabled: true
+`
+	if _, err := Load(writeTemp(t, y)); err == nil {
+		t.Fatal("expected validation error for otel.enabled with no endpoint")
+	}
+}

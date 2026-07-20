@@ -31,6 +31,7 @@ type File struct {
 	Metrics    *MetricsConfig    `yaml:"metrics"`       // optional Prometheus /metrics listener (out-of-band)
 	FIPS       *FIPSConfig       `yaml:"fips"`          // optional FIPS-readiness posture (off|warn|enforce)
 	Export     *ExportConfig     `yaml:"export"`        // optional real-time event export to a SIEM (opt-in, default off)
+	OTel       *OTelConfig       `yaml:"otel"`          // optional OTLP export: traces/metrics/logs (opt-in, default off)
 	DrainGrace int               `yaml:"drain_grace_seconds"`
 	Policy     PolicyConfig      `yaml:"policy"`
 
@@ -183,6 +184,156 @@ func (c *ExportTLSConfig) toEventExport() *eventexport.TLSConfig {
 		return nil
 	}
 	return &eventexport.TLSConfig{CA: c.CA, Cert: c.Cert, Key: c.Key}
+}
+
+// OTelConfig configures opt-in OTLP export (internal/otelexport). Nil (the
+// default) means the feature is off: no providers built, no goroutines, the
+// global no-op tracer/meter/logger stays installed. Mirrors the spec's
+// `otel:` yaml block.
+type OTelConfig struct {
+	Enabled   bool              `yaml:"enabled"`
+	Endpoint  string            `yaml:"endpoint"` // OTLP collector endpoint, host:port
+	ProtocolV string            `yaml:"protocol"` // grpc | http; empty defaults to grpc
+	Insecure  bool              `yaml:"insecure"` // allow plaintext to the collector (dev only)
+	TLS       OTelTLS           `yaml:"tls"`
+	Headers   map[string]string `yaml:"headers"`  // static headers, e.g. SaaS OTLP auth
+	Resource  map[string]string `yaml:"resource"` // merged into the OTel Resource; service.name defaults to "omni-sag"
+	Traces    OTelTraces        `yaml:"traces"`
+	Metrics   OTelMetrics       `yaml:"metrics"`
+	Logs      OTelLogs          `yaml:"logs"`
+}
+
+// OTelTLS names PEM files for a client TLS connection to the collector.
+type OTelTLS struct {
+	CACert     string `yaml:"ca_cert"`
+	ClientCert string `yaml:"client_cert"`
+	ClientKey  string `yaml:"client_key"`
+}
+
+// OTelTraces configures the traces signal. Enabled is a *bool so "unset"
+// (nil) can default to true, distinct from an explicit false.
+type OTelTraces struct {
+	Enabled              *bool   `yaml:"enabled"`
+	SamplerV             string  `yaml:"sampler"` // always_on|always_off|traceidratio|parentbased_always_on|parentbased_traceidratio
+	SampleRatio          float64 `yaml:"sample_ratio"`
+	MaxQueueSize         int     `yaml:"max_queue_size"`
+	MaxExportBatchSize   int     `yaml:"max_export_batch_size"`
+	ExportTimeoutSeconds int     `yaml:"export_timeout_seconds"`
+}
+
+// OTelMetrics configures the optional OTLP metrics path, default off.
+// Prometheus stays authoritative regardless of this setting.
+type OTelMetrics struct {
+	Enabled         bool `yaml:"enabled"`
+	IntervalSeconds int  `yaml:"interval_seconds"`
+}
+
+// OTelLogs configures the experimental evidence-as-OTLP-logs path, default
+// off (the OTel logs SDK is pre-GA — see the design doc).
+type OTelLogs struct {
+	Enabled bool `yaml:"enabled"`
+}
+
+// Protocol returns the configured OTLP wire protocol, defaulting to grpc.
+func (o *OTelConfig) Protocol() string {
+	if o == nil || o.ProtocolV == "" {
+		return "grpc"
+	}
+	return o.ProtocolV
+}
+
+// Sampler returns the configured trace sampler, defaulting to
+// parentbased_always_on (every session matters on a low-volume, high-value
+// privileged-access gateway).
+func (o *OTelConfig) Sampler() string {
+	if o == nil || o.Traces.SamplerV == "" {
+		return "parentbased_always_on"
+	}
+	return o.Traces.SamplerV
+}
+
+// SampleRatio returns the configured ratio for the *ratio samplers, default 1.0.
+func (o *OTelConfig) SampleRatio() float64 {
+	if o == nil || o.Traces.SampleRatio <= 0 {
+		return 1.0
+	}
+	return o.Traces.SampleRatio
+}
+
+// MaxQueueSize returns the traces batch processor's bounded queue size, default 2048.
+func (o *OTelConfig) MaxQueueSize() int {
+	if o == nil || o.Traces.MaxQueueSize <= 0 {
+		return 2048
+	}
+	return o.Traces.MaxQueueSize
+}
+
+// MaxExportBatchSize returns the traces batch processor's max batch size, default 512.
+func (o *OTelConfig) MaxExportBatchSize() int {
+	if o == nil || o.Traces.MaxExportBatchSize <= 0 {
+		return 512
+	}
+	return o.Traces.MaxExportBatchSize
+}
+
+// ExportTimeout returns the bounded per-export timeout, default 10s.
+func (o *OTelConfig) ExportTimeout() int {
+	if o == nil || o.Traces.ExportTimeoutSeconds <= 0 {
+		return 10
+	}
+	return o.Traces.ExportTimeoutSeconds
+}
+
+// MetricsIntervalSeconds returns the OTLP metrics push interval, default 60.
+func (o *OTelConfig) MetricsIntervalSeconds() int {
+	if o == nil || o.Metrics.IntervalSeconds <= 0 {
+		return 60
+	}
+	return o.Metrics.IntervalSeconds
+}
+
+// TracesEnabled defaults to true whenever otel is enabled and the field is
+// unset, since Traces.Enabled is a *bool distinguishing "unset" from "false".
+func (o *OTelConfig) TracesEnabled() bool {
+	if o == nil {
+		return false
+	}
+	if o.Traces.Enabled == nil {
+		return true
+	}
+	return *o.Traces.Enabled
+}
+
+// MetricsEnabled defaults to false — Prometheus stays authoritative unless
+// an operator explicitly opts in to the native OTLP metrics path too.
+func (o *OTelConfig) MetricsEnabled() bool {
+	return o != nil && o.Metrics.Enabled
+}
+
+// LogsEnabled defaults to false — the OTel logs SDK is pre-GA; see the
+// design doc's stability caveat.
+func (o *OTelConfig) LogsEnabled() bool {
+	return o != nil && o.Logs.Enabled
+}
+
+// validateOTelConfig rejects a semantically-invalid otel block. Only runs
+// when otel.enabled is true, matching the opt-in posture used by every other
+// optional config block.
+func validateOTelConfig(o *OTelConfig) error {
+	if o.Endpoint == "" {
+		return fmt.Errorf("config: otel.enabled is true but otel.endpoint is empty")
+	}
+	switch o.Protocol() {
+	case "grpc", "http":
+	default:
+		return fmt.Errorf("config: otel.protocol must be grpc or http, got %q", o.Protocol())
+	}
+	switch o.Sampler() {
+	case "always_on", "always_off", "traceidratio", "parentbased_always_on", "parentbased_traceidratio":
+	default:
+		return fmt.Errorf("config: otel.traces.sampler must be one of always_on|always_off|traceidratio|parentbased_always_on|parentbased_traceidratio, got %q", o.Sampler())
+	}
+	return nil
 }
 
 // DrainGraceSeconds returns the rolling-upgrade drain grace period (default 30s).
@@ -520,6 +671,11 @@ func (f *File) validate() error {
 	}
 	if ex := f.Export; ex != nil && ex.Enabled {
 		if err := validateExportConfig(ex); err != nil {
+			return err
+		}
+	}
+	if o := f.OTel; o != nil && o.Enabled {
+		if err := validateOTelConfig(o); err != nil {
 			return err
 		}
 	}
