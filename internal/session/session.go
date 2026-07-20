@@ -92,6 +92,8 @@ type Server struct {
 	tunnelDisabled bool // opt-in: rejects "direct-tcpip" channels (-L port forwarding); see WithTunnelDisabled
 	sftpDisabled   bool // opt-in: rejects "subsystem"+"sftp" requests on session channels; see WithSFTPDisabled
 	scpEnabled     bool // opt-IN (default false = OFF): only when true are "exec" requests matching "scp -t/-f" (legacy protocol) served; see WithSCPEnabled
+
+	tunnelInspect TunnelInspectConfig // opt-IN (default zero value = disabled): protocol identification on -L/-D/-J tunnels; see WithTunnelInspection
 }
 
 // WithRegistry registers each authenticated connection in reg so the
@@ -665,6 +667,14 @@ func (s *Server) handleDirectTCPIP(ctx context.Context, newCh ssh.NewChannel, pr
 		announcer.announce(tunnelOpenNotice(pr.User, d.HostToConnect, int(d.PortToConnect)))
 	}
 	go ssh.DiscardRequests(chReqs)
+	if s.tunnelInspect.Enabled && !s.tunnelInspect.Enforce {
+		taps := newTunnelTaps(s.tunnelInspect.MaxPrefixBytes)
+		ch2 := &tapConn{ReadWriteCloser: ch, taps: taps, fromClient: true}
+		conn2 := &tapConn{ReadWriteCloser: conn, taps: taps, fromClient: false}
+		go s.classifyAndEmit(taps, pr, srcIP, target.String())
+		dialer.Splice(ch2, conn2)
+		return
+	}
 	dialer.Splice(ch, conn)
 }
 
