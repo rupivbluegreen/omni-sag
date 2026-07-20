@@ -108,14 +108,15 @@ response) are best-effort — classification falls back to the banner text (e.g.
 ```yaml
 tunnel_inspection:
   enabled: true
-  enforce: false   # false = observe/dry-run only
+  enforce: false          # false = observe/dry-run; true = terminate on mismatch
+  unknown_action: allow   # allow (default) | deny (fail closed on unclassifiable)
 policy:
   roles:
     - name: dba
       allow:
         - host: "db1.lab.local"
           ports: [5432]
-          expect_protocol: [postgres]
+          expect_protocol: [postgres]   # enforced only when enforce: true
 ```
 
 **🎛️ Capability kill switches** — disable whole classes of access at the gateway, independent of
