@@ -94,6 +94,11 @@ type Rule struct {
 	// TargetUser is the account the gateway authenticates as on the target for
 	// this rule's matches. Empty => the same name as the gateway login user.
 	TargetUser string
+	// ExpectProtocol is the allow-list of app protocols permitted on tunnels
+	// (-L/-D) to this rule's targets, checked by tunnel protocol
+	// identification enforce mode (internal/protoident). Empty => no
+	// enforcement (observe only), regardless of the detected protocol.
+	ExpectProtocol []string
 }
 
 // Role binds AD group membership to a set of allow rules.
@@ -140,6 +145,11 @@ type Decision struct {
 	// rebinding between decision time and connect time is otherwise
 	// invisible to policy).
 	MatchedCIDR *net.IPNet
+	// ExpectProtocol is the matched rule's tunnel protocol allow-list (see
+	// Rule.ExpectProtocol), threaded through so tunnel protocol
+	// identification enforce mode can check it without re-matching policy.
+	// Empty on deny and when the matched rule sets no expect_protocol.
+	ExpectProtocol []string
 }
 
 // ForwardingAllowed reports whether port-forwarding (-L) is permitted for this
@@ -252,6 +262,7 @@ func (p Policy) Decide(pr Principal, t Target, resolve ResolverFunc) Decision {
 					RequireApproval: rule.RequireApproval,
 					TargetUser:      rule.TargetUser,
 					MatchedGroups:   intersectGroups(pr.Groups, r.Groups),
+					ExpectProtocol:  rule.ExpectProtocol,
 				}
 			}
 		}
@@ -281,6 +292,7 @@ func (p Policy) Decide(pr Principal, t Target, resolve ResolverFunc) Decision {
 					TargetUser:      rule.TargetUser,
 					MatchedGroups:   intersectGroups(pr.Groups, r.Groups),
 					MatchedCIDR:     n,
+					ExpectProtocol:  rule.ExpectProtocol,
 				}
 			}
 		}

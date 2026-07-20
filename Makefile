@@ -1,4 +1,4 @@
-.PHONY: build binaries test lint check-imports ci lab-up lab-down lab-logs lab-seed lab-test-real-target lab-test-scp lab-test-eventexport
+.PHONY: build binaries test lint check-imports ci lab-up lab-down lab-logs lab-seed lab-test-real-target lab-test-scp lab-test-eventexport lab-test-tunnel-protoid
 
 build:
 	go build ./...
@@ -49,6 +49,9 @@ lab-test-scp:
 
 lab-test-eventexport:
 	bash scripts/lab-test-eventexport.sh
+
+lab-test-tunnel-protoid:
+	bash scripts/lab-test-tunnel-protoid.sh
 
 lab-down:
 	docker compose -f deploy/compose/docker-compose.yml down

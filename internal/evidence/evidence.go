@@ -20,6 +20,7 @@ const (
 	TypeAuth           Type = "auth"            // primary authentication attempt
 	TypeMFA            Type = "mfa"             // second-factor (MFA) outcome
 	TypeTunnelDecision Type = "tunnel_decision" // dialer authorization decision
+	TypeTunnelProtocol Type = "tunnel_protocol" // identified protocol carried by a -L/-D tunnel
 	TypeSessionStart   Type = "session_start"   // interactive session opened
 	TypeSessionEnd     Type = "session_end"     // interactive session closed
 	TypeRecording      Type = "recording"       // a session recording was produced (asciicast)
@@ -46,6 +47,9 @@ type Event struct {
 	Reason      string `json:"reason,omitempty"`
 	MatchedRole string `json:"matched_role,omitempty"`
 	RecordMode  string `json:"record_mode,omitempty"` // none | metadata-only | full
+
+	// Tunnel protocol-identification field (tunnel_protocol events).
+	Protocol string `json:"protocol,omitempty"` // detected app protocol, e.g. "postgres", "jdwp", "unknown"
 
 	// Recording / transfer / inspection fields.
 	ObjectKey string `json:"object_key,omitempty"` // S3 (or local) key of the artifact (or quarantine key)
