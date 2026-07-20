@@ -70,3 +70,35 @@ func TestFIPSWarnAllowsLDAPInsecureTLS(t *testing.T) {
 		t.Fatalf("ldap.insecure_tls under fips.mode=warn should not be rejected: %v", err)
 	}
 }
+
+func TestFIPSEnforceRejectsAPINoCert(t *testing.T) {
+	yaml := fipsBaseYAML + "fips:\n  mode: enforce\n" + "api:\n  listen: \":8443\"\n"
+	_, err := Load(writeTemp(t, yaml))
+	if err == nil {
+		t.Fatal("a cleartext api (no tls_cert) must be rejected when fips.mode=enforce")
+	}
+	if !strings.Contains(err.Error(), "tls_cert") {
+		t.Fatalf("error should name tls_cert: %v", err)
+	}
+}
+
+func TestFIPSEnforceAllowsAPIWithCert(t *testing.T) {
+	yaml := fipsBaseYAML + "fips:\n  mode: enforce\n" + "api:\n  listen: \":8443\"\n  tls_cert: \"server.crt\"\n  tls_key: \"server.key\"\n"
+	if _, err := Load(writeTemp(t, yaml)); err != nil {
+		t.Fatalf("api with tls_cert set should load under fips.mode=enforce: %v", err)
+	}
+}
+
+func TestFIPSWarnAllowsAPINoCert(t *testing.T) {
+	yaml := fipsBaseYAML + "fips:\n  mode: warn\n" + "api:\n  listen: \":8443\"\n"
+	if _, err := Load(writeTemp(t, yaml)); err != nil {
+		t.Fatalf("a cleartext api under fips.mode=warn should not be rejected: %v", err)
+	}
+}
+
+func TestFIPSOffAllowsAPINoCert(t *testing.T) {
+	yaml := fipsBaseYAML + "api:\n  listen: \":8443\"\n"
+	if _, err := Load(writeTemp(t, yaml)); err != nil {
+		t.Fatalf("a cleartext api under fips.mode=off should not be rejected: %v", err)
+	}
+}

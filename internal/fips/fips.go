@@ -12,8 +12,8 @@
 // signing, SHA-256 hashing). TLS-parameter conformance for LDAPS / CyberArk CCP
 // / the control-plane API is NOT part of Check; it is provided by the exported
 // ValidateTLSConfig / ApprovedTLSConfig helpers for callers to apply, and the
-// LDAPS insecure_tls escape hatch is separately rejected under fips.mode=enforce
-// by config validation.
+// LDAPS insecure_tls escape hatch and a cleartext control-plane API are
+// separately rejected under fips.mode=enforce by config validation.
 //
 // Default builds are unaffected: with no GODEBUG the runtime is not in FIPS
 // mode, Mode defaults to Off, and Check is a no-op that always succeeds.

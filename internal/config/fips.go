@@ -17,11 +17,18 @@ func (f *File) FIPSMode() fips.Mode {
 }
 
 // validateFIPS rejects config that is inconsistent with an enforced FIPS
-// posture — notably the LDAPS certificate-verification escape hatch, which would
-// otherwise silently defeat TLS under a declared fips.mode=enforce.
+// posture — notably the LDAPS certificate-verification escape hatch and a
+// cleartext control-plane API, either of which would otherwise silently
+// defeat TLS under a declared fips.mode=enforce.
 func (f *File) validateFIPS() error {
-	if f.FIPSMode() == fips.ModeEnforce && f.LDAP.InsecureTLS {
+	if f.FIPSMode() != fips.ModeEnforce {
+		return nil
+	}
+	if f.LDAP.InsecureTLS {
 		return fmt.Errorf("config: ldap.insecure_tls must not be set when fips.mode=enforce")
+	}
+	if f.API != nil && f.API.TLSCert == "" {
+		return fmt.Errorf("config: api.tls_cert must be set when fips.mode=enforce (cleartext control-plane API is not allowed)")
 	}
 	return nil
 }
