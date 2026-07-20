@@ -277,6 +277,26 @@ func ApprovedTLSConfig() *tls.Config {
 	}
 }
 
+// Harden applies FIPS-approved TLS parameters to c in place, according to
+// mode. ModeOff leaves c untouched. ModeWarn and ModeEnforce raise MinVersion
+// to TLS 1.2 (never lowering an already-higher value) and pin CipherSuites to
+// the approved set. ModeEnforce additionally validates the result and fails
+// closed (returns the validation error) if it is still not FIPS-acceptable. A
+// nil config is a no-op.
+func Harden(c *tls.Config, mode Mode) error {
+	if mode == ModeOff || c == nil {
+		return nil
+	}
+	if c.MinVersion < tls.VersionTLS12 {
+		c.MinVersion = tls.VersionTLS12
+	}
+	c.CipherSuites = ApprovedCipherSuites()
+	if mode == ModeEnforce {
+		return ValidateTLSConfig(c)
+	}
+	return nil
+}
+
 func tlsVersionName(v uint16) string {
 	switch v {
 	case tls.VersionTLS10:
