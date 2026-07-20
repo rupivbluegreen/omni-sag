@@ -108,14 +108,15 @@ response) are best-effort — classification falls back to the banner text (e.g.
 ```yaml
 tunnel_inspection:
   enabled: true
-  enforce: false   # false = observe/dry-run only
+  enforce: false          # false = observe/dry-run; true = terminate on mismatch
+  unknown_action: allow   # allow (default) | deny (fail closed on unclassifiable)
 policy:
   roles:
     - name: dba
       allow:
         - host: "db1.lab.local"
           ports: [5432]
-          expect_protocol: [postgres]
+          expect_protocol: [postgres]   # enforced only when enforce: true
 ```
 
 **🎛️ Capability kill switches** — disable whole classes of access at the gateway, independent of
@@ -317,12 +318,11 @@ not yet built.
   quarantine-release) with pull-download, per-capability kill switches, CIDR policy rules, nested
   AD group resolution, `+pcode` role selector + tunnel-keeper window, legacy `scp -O`, real-time
   event export / SIEM (json·ecs·cef × file·syslog·http), tunnel protocol identification (observe +
-  enforce), API + CLI + TUI + packaging + FIPS-readiness mode. ✅
+  enforce), OpenTelemetry (OTLP) export (traces + optional metrics/logs), FIPS-approved TLS routed
+  through the API/CCP/LDAP/event-export listeners under `warn`/`enforce`, API + CLI + TUI +
+  packaging + FIPS-readiness mode. ✅
 - **Next (v1.x):** SSH certificate authority; Kerberos/GSSAPI; a real OIDC (JWKS) validator for the
-  API (today a static-token stand-in); CRD-backed policy/approval sources (needs a live cluster);
-  FIPS TLS-config routed through *every* listener (the boot posture gate and LDAPS land today, the
-  API/CCP listeners don't yet); OpenTelemetry (OTLP) egress (approved design spec in
-  [`docs/superpowers/`](docs/superpowers/), no code yet).
+  API (today a static-token stand-in); CRD-backed policy/approval sources (needs a live cluster).
 - **v2:** RDP (native mstsc, then browser RDP with recording).
 - **Never:** shared-process multi-tenancy, monetization machinery in the OSS, semantic command
   reconstruction from pixels.
