@@ -94,6 +94,11 @@ type Rule struct {
 	// TargetUser is the account the gateway authenticates as on the target for
 	// this rule's matches. Empty => the same name as the gateway login user.
 	TargetUser string
+	// ExpectProtocol is the allow-list of app protocols permitted on tunnels
+	// (-L/-D) to this rule's targets, checked by tunnel protocol
+	// identification enforce mode (internal/protoident). Empty => no
+	// enforcement (observe only), regardless of the detected protocol.
+	ExpectProtocol []string
 }
 
 // Role binds AD group membership to a set of allow rules.

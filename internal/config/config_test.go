@@ -753,6 +753,48 @@ policy:
 	}
 }
 
+func TestCompile_ExpectProtocol(t *testing.T) {
+	ok := `
+listen: ":2222"
+evidence: { file: "e.jsonl" }
+policy:
+  roles:
+    - name: dba
+      groups: [dba]
+      allow:
+        - host: db1
+          ports: [5432]
+          expect_protocol: [postgres]
+`
+	f, err := Load(writeTemp(t, ok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := f.CompilePolicy()
+	got := p.Roles[0].Allow[0].ExpectProtocol
+	if len(got) != 1 || got[0] != "postgres" {
+		t.Fatalf("ExpectProtocol = %v, want [postgres]", got)
+	}
+}
+
+func TestValidate_ExpectProtocolUnknownRejected(t *testing.T) {
+	bad := `
+listen: ":2222"
+evidence: { file: "e.jsonl" }
+policy:
+  roles:
+    - name: dba
+      groups: [dba]
+      allow:
+        - host: db1
+          ports: [5432]
+          expect_protocol: [nope]
+`
+	if _, err := Load(writeTemp(t, bad)); err == nil {
+		t.Fatal("unknown protocol must be rejected")
+	}
+}
+
 func TestValidate_TunnelInspectionBadUnknownAction(t *testing.T) {
 	bad := `
 listen: ":2222"
