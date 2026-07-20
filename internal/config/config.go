@@ -52,6 +52,22 @@ type File struct {
 	// governed by disable_sftp instead. Not part of the "at least one
 	// capability must stay enabled" rule below, since it is off by default.
 	EnableSCP bool `yaml:"enable_scp"`
+
+	// TunnelInspection is opt-IN (default off): fingerprints the opening
+	// bytes of -L/-D tunnels to identify the protocol actually flowing
+	// through them. See internal/protoident and internal/session/tunnelinspect.go.
+	TunnelInspection *TunnelInspectionConfig `yaml:"tunnel_inspection"`
+}
+
+// TunnelInspectionConfig configures tunnel protocol identification. Enabled
+// defaults to false: a config.yaml written before this field existed leaves
+// -L/-D tunnels exactly as before (no tee, no evidence event).
+type TunnelInspectionConfig struct {
+	Enabled                bool   `yaml:"enabled"`
+	MaxPrefixBytes         int    `yaml:"max_prefix_bytes"`         // per-direction classification budget; default 512
+	ClassifyTimeoutSeconds int    `yaml:"classify_timeout_seconds"` // default 5
+	Enforce                bool   `yaml:"enforce"`                  // false = observe/dry-run only, even with expect_protocol rules
+	UnknownAction          string `yaml:"unknown_action"`           // allow | deny; default allow
 }
 
 // MetricsConfig configures the Prometheus metrics endpoint, served on its own
@@ -521,6 +537,20 @@ func (f *File) validate() error {
 	if ex := f.Export; ex != nil && ex.Enabled {
 		if err := validateExportConfig(ex); err != nil {
 			return err
+		}
+	}
+	if ti := f.TunnelInspection; ti != nil {
+		if ti.MaxPrefixBytes == 0 {
+			ti.MaxPrefixBytes = 512
+		}
+		if ti.ClassifyTimeoutSeconds == 0 {
+			ti.ClassifyTimeoutSeconds = 5
+		}
+		if ti.UnknownAction == "" {
+			ti.UnknownAction = "allow"
+		}
+		if ti.UnknownAction != "allow" && ti.UnknownAction != "deny" {
+			return fmt.Errorf("config: tunnel_inspection.unknown_action must be allow or deny, got %q", ti.UnknownAction)
 		}
 	}
 	return nil

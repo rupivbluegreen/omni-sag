@@ -723,3 +723,48 @@ func TestExportConfig_BufferSizeDefaultsInEventExport(t *testing.T) {
 		t.Fatalf("toEventExport should pass BufferSize through unmodified (eventexport itself defaults <=0), got %d", got)
 	}
 }
+
+func TestValidate_TunnelInspectionDefaults(t *testing.T) {
+	ok := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+tunnel_inspection:
+  enabled: true
+policy:
+  roles: []
+`
+	f, err := Load(writeTemp(t, ok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ti := f.TunnelInspection
+	if ti == nil || !ti.Enabled {
+		t.Fatal("tunnel_inspection.enabled should be true")
+	}
+	if ti.MaxPrefixBytes != 512 {
+		t.Fatalf("max_prefix_bytes default = %d, want 512", ti.MaxPrefixBytes)
+	}
+	if ti.ClassifyTimeoutSeconds != 5 {
+		t.Fatalf("classify_timeout default = %d, want 5", ti.ClassifyTimeoutSeconds)
+	}
+	if ti.UnknownAction != "allow" {
+		t.Fatalf("unknown_action default = %q, want allow", ti.UnknownAction)
+	}
+}
+
+func TestValidate_TunnelInspectionBadUnknownAction(t *testing.T) {
+	bad := `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+tunnel_inspection:
+  enabled: true
+  unknown_action: sometimes
+policy:
+  roles: []
+`
+	if _, err := Load(writeTemp(t, bad)); err == nil {
+		t.Fatal("expected error for invalid unknown_action")
+	}
+}
