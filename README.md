@@ -275,13 +275,21 @@ those reviews caught real bugs. That's the point.
 
 ## 🗺️ Roadmap
 
-- **v1 (here):** SSH + SFTP, real shell/SFTP target proxy, AD+MFA, dialer authz, evidence chain,
-  recording, content inspection + quarantine, CyberArk injection, four-eyes (session tunnels +
-  group-scoped quarantine-release) with pull-download, per-capability toggles, API + CLI + TUI +
-  packaging. ✅
-- **v1.x:** SSH certificate authority, Kerberos/GSSAPI, a real OIDC (JWKS) validator for the API
-  (today a static-token stand-in), CRD-backed policy/approval sources (needs a live cluster), FIPS
-  TLS-config routing through every listener.
+*Shipped* means it's in the feature list above, backed by code. *Next* means designed or wanted,
+not yet built.
+
+- **Shipped (v1 → v1.6):** SSH + SFTP, real shell/SFTP target proxy, AD + MFA, single-dialer
+  SSRF/rebind guard, hash-chained Ed25519-signed evidence, session recording, ICAP inspection +
+  Object-Locked quarantine, CyberArk CCP injection, four-eyes (session tunnels + group-scoped
+  quarantine-release) with pull-download, per-capability kill switches, CIDR policy rules, nested
+  AD group resolution, `+pcode` role selector + tunnel-keeper window, legacy `scp -O`, real-time
+  event export / SIEM (json·ecs·cef × file·syslog·http), API + CLI + TUI + packaging +
+  FIPS-readiness mode. ✅
+- **Next (v1.x):** SSH certificate authority; Kerberos/GSSAPI; a real OIDC (JWKS) validator for the
+  API (today a static-token stand-in); CRD-backed policy/approval sources (needs a live cluster);
+  FIPS TLS-config routed through *every* listener (the boot posture gate and LDAPS land today, the
+  API/CCP listeners don't yet); OpenTelemetry (OTLP) egress and tunnel-protocol identification
+  (both have approved design specs in [`docs/superpowers/`](docs/superpowers/), no code yet).
 - **v2:** RDP (native mstsc, then browser RDP with recording).
 - **Never:** shared-process multi-tenancy, monetization machinery in the OSS, semantic command
   reconstruction from pixels.
