@@ -13,12 +13,14 @@ import (
 	"strings"
 
 	"github.com/rupivbluegreen/omni-sag/internal/api"
+	"github.com/rupivbluegreen/omni-sag/internal/config"
 	"github.com/rupivbluegreen/omni-sag/internal/tui"
 )
 
 func main() {
 	base := flag.String("api", envOr("OMNI_API", "http://127.0.0.1:8443"), "control-plane API base URL")
 	token := flag.String("token", os.Getenv("OMNI_TOKEN"), "bearer token")
+	policyFile := flag.String("policy-file", "", "for `trace`: evaluate a local policy.yaml offline instead of the API")
 	flag.Parse()
 
 	args := flag.Args()
@@ -29,13 +31,13 @@ func main() {
 
 	c := api.NewClient(*base, *token, nil)
 	ctx := context.Background()
-	if err := dispatch(ctx, c, args); err != nil {
+	if err := dispatch(ctx, c, args, *policyFile); err != nil {
 		fmt.Fprintln(os.Stderr, "omnisag-ctl:", err)
 		os.Exit(1)
 	}
 }
 
-func dispatch(ctx context.Context, c *api.Client, args []string) error {
+func dispatch(ctx context.Context, c *api.Client, args []string, policyFile string) error {
 	switch args[0] {
 	case "sessions":
 		if len(args) >= 2 && args[1] == "kill" {
@@ -94,9 +96,23 @@ func dispatch(ctx context.Context, c *api.Client, args []string) error {
 		if len(args) < 5 {
 			return fmt.Errorf("usage: omnisag-ctl trace <user> <group,group> <host> <port>")
 		}
-		pv, err := c.GetPolicy(ctx)
-		if err != nil {
-			return err
+		var pv api.PolicyView
+		if policyFile != "" {
+			data, err := os.ReadFile(policyFile)
+			if err != nil {
+				return err
+			}
+			compiled, err := config.CompilePolicyBytes(data)
+			if err != nil {
+				return fmt.Errorf("policy %s: %w", policyFile, err)
+			}
+			pv = api.PolicyToView(compiled)
+		} else {
+			var err error
+			pv, err = c.GetPolicy(ctx)
+			if err != nil {
+				return err
+			}
 		}
 		port, err := strconv.Atoi(args[4])
 		if err != nil {
