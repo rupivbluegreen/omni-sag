@@ -370,10 +370,28 @@ func run(cfgPath string, debug bool) error {
 		_ = ln.Close()
 		return err
 	}
-	if gwTLS != nil {
+	switch {
+	case gwTLS != nil && cfg.TLS.Listen != "":
+		// Dual: plain SSH stays on cfg.Listen, TLS is added alongside. Serve is
+		// safe to run concurrently — its shared state is atomics, a semaphore
+		// and a WaitGroup — and both listeners feed the same session server, so
+		// Drain still accounts for every session.
+		tln, err := net.Listen("tcp", cfg.TLS.Listen)
+		if err != nil {
+			_ = ln.Close()
+			return err
+		}
+		tln = tls.NewListener(tln, gwTLS)
+		go func() {
+			if err := srv.Serve(ctx, tln); err != nil {
+				log.Printf("omni-sag: TLS listener stopped: %v", err)
+			}
+		}()
+		log.Printf("omni-sag listening on %s (SSH) and %s (SSH over TLS)", cfg.Listen, cfg.TLS.Listen)
+	case gwTLS != nil:
 		ln = tls.NewListener(ln, gwTLS)
-		log.Printf("omni-sag listening on %s (SSH over TLS)", cfg.Listen)
-	} else {
+		log.Printf("omni-sag listening on %s (SSH over TLS; plain SSH disabled)", cfg.Listen)
+	default:
 		log.Printf("omni-sag listening on %s (SSH)", cfg.Listen)
 	}
 

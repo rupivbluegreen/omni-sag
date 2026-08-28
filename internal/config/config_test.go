@@ -929,3 +929,32 @@ policy:
 		t.Fatal("expected error for invalid unknown_action")
 	}
 }
+
+func TestValidate_TLSRequiresCertAndKey(t *testing.T) {
+	f := &File{Listen: ":2222", TLS: &GatewayTLSConfig{Cert: "/tmp/c.pem"}}
+	if err := f.validate(); err == nil {
+		t.Fatal("tls.cert without tls.key must be rejected, not silently downgraded to plain SSH")
+	}
+}
+
+func TestValidate_TLSListenMustDifferFromListen(t *testing.T) {
+	f := &File{
+		Listen: ":2222",
+		TLS:    &GatewayTLSConfig{Listen: ":2222", Cert: "/tmp/c.pem", Key: "/tmp/k.pem"},
+	}
+	if err := f.validate(); err == nil {
+		t.Fatal("tls.listen equal to listen must be rejected")
+	}
+}
+
+func TestValidate_DualListenerAccepted(t *testing.T) {
+	f := &File{
+		Listen:   ":2222",
+		HostKey:  "hostkey.pem",
+		Evidence: EvidenceConfig{File: "evidence.jsonl"},
+		TLS:      &GatewayTLSConfig{Listen: ":2443", Cert: "/tmp/c.pem", Key: "/tmp/k.pem"},
+	}
+	if err := f.validate(); err != nil {
+		t.Fatalf("dual-listener config should validate: %v", err)
+	}
+}

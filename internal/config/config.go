@@ -407,7 +407,19 @@ func (a *ApprovalConfig) ReleaseTTL() int {
 //	ssh -o ProxyCommand="openssl s_client -quiet -servername %h -connect %h:443" user@host
 //
 // Leave nil to serve plain SSH.
+//
+// Listen selects between two shapes:
+//
+//	tls.listen empty     TLS-only. The primary `listen` socket is wrapped, and
+//	                     plain SSH is no longer served at all.
+//	tls.listen set       Dual. `listen` keeps serving plain SSH (in-cluster,
+//	                     kubectl port-forward, break-glass) while tls.listen
+//	                     serves the same gateway over TLS for the ingress.
+//
+// Dual is the safer default when publishing an existing gateway: exposing the
+// TLS port does not take plain SSH away from anyone still using it.
 type GatewayTLSConfig struct {
+	Listen   string `yaml:"listen"`    // optional second address, e.g. ":2443"; empty ⇒ wrap the primary listener
 	Cert     string `yaml:"cert"`      // PEM server certificate; required
 	Key      string `yaml:"key"`       // PEM private key; required
 	ClientCA string `yaml:"client_ca"` // optional PEM CA; when set, mutual TLS is required
@@ -614,6 +626,9 @@ func (f *File) validate() error {
 		// the opposite of what an operator enabling this asked for.
 		if f.TLS.Cert == "" || f.TLS.Key == "" {
 			return fmt.Errorf("config: tls.cert and tls.key are both required when tls is set")
+		}
+		if f.TLS.Listen != "" && f.TLS.Listen == f.Listen {
+			return fmt.Errorf("config: tls.listen must differ from listen (%q); leave tls.listen empty to serve TLS only", f.Listen)
 		}
 	}
 	if f.DisableSSH && f.DisableTunnel && f.DisableSFTP {
