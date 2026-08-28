@@ -8,7 +8,10 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
+	"io"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -91,5 +94,89 @@ func TestAPITLSConfig_NoTLSUnaffected(t *testing.T) {
 	}
 	if tc != nil {
 		t.Fatalf("no tls_cert configured should return a nil config, got %+v", tc)
+	}
+}
+
+func TestGatewayTLSConfig_NotConfiguredServesPlainSSH(t *testing.T) {
+	tc, err := gatewayTLSConfig(nil, fips.ModeEnforce)
+	if err != nil {
+		t.Fatalf("absent tls block should not error: %v", err)
+	}
+	if tc != nil {
+		t.Fatalf("absent tls block should return a nil config, got %+v", tc)
+	}
+}
+
+func TestGatewayTLSConfig_EnforceModeHardened(t *testing.T) {
+	certPath, keyPath := selfSignedCert(t)
+	tc, err := gatewayTLSConfig(&config.GatewayTLSConfig{Cert: certPath, Key: keyPath}, fips.ModeEnforce)
+	if err != nil {
+		t.Fatalf("gatewayTLSConfig: %v", err)
+	}
+	if err := fips.ValidateTLSConfig(tc); err != nil {
+		t.Fatalf("enforce-mode config should be FIPS-acceptable: %v", err)
+	}
+}
+
+func TestGatewayTLSConfig_BadClientCARejected(t *testing.T) {
+	certPath, keyPath := selfSignedCert(t)
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caPath, []byte("not pem"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := gatewayTLSConfig(&config.GatewayTLSConfig{Cert: certPath, Key: keyPath, ClientCA: caPath}, fips.ModeOff)
+	if !errors.Is(err, errBadGatewayClientCA) {
+		t.Fatalf("want errBadGatewayClientCA, got %v", err)
+	}
+}
+
+// The point of the whole feature: a TLS-wrapped listener must present a
+// handshake an SNI-routing ingress can see, and speak SSH inside it.
+func TestGatewayTLSListener_SNIHandshakeThenSSH(t *testing.T) {
+	certPath, keyPath := selfSignedCert(t)
+	tc, err := gatewayTLSConfig(&config.GatewayTLSConfig{Cert: certPath, Key: keyPath}, fips.ModeOff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln := tls.NewListener(raw, tc)
+	defer ln.Close()
+
+	var sni string
+	tc.GetConfigForClient = func(h *tls.ClientHelloInfo) (*tls.Config, error) {
+		sni = h.ServerName
+		return nil, nil
+	}
+
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _ = c.Write([]byte("SSH-2.0-Go\r\n"))
+	}()
+
+	conn, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         "omni-sag.example.net",
+	})
+	if err != nil {
+		t.Fatalf("TLS dial: %v", err)
+	}
+	defer conn.Close()
+
+	buf := make([]byte, 12)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read banner: %v", err)
+	}
+	if got := string(buf); got != "SSH-2.0-Go\r\n" {
+		t.Fatalf("want SSH banner inside TLS, got %q", got)
+	}
+	if sni != "omni-sag.example.net" {
+		t.Fatalf("ingress needs SNI to route on; got %q", sni)
 	}
 }

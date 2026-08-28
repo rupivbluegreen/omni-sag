@@ -20,6 +20,7 @@ import (
 type File struct {
 	Listen     string            `yaml:"listen"`   // SSH listen address, e.g. ":2222"
 	HostKey    string            `yaml:"host_key"` // path to the SSH host key (created if absent)
+	TLS        *GatewayTLSConfig `yaml:"tls"`      // optional TLS wrapper around the SSH data path
 	LDAP       LDAPConfig        `yaml:"ldap"`
 	MFA        MFAConfig         `yaml:"mfa"`
 	Evidence   EvidenceConfig    `yaml:"evidence"`
@@ -389,6 +390,29 @@ func (a *ApprovalConfig) ReleaseTTL() int {
 	return a.ReleaseTTLSeconds
 }
 
+// GatewayTLSConfig optionally wraps the SSH data-path listener in TLS.
+//
+// SSH is normally spoken on a bare TCP socket, and the server sends its version
+// banner before the client says anything. That makes the data path invisible to
+// any layer-7 router that selects a backend from the client's first bytes —
+// notably an OpenShift/Kubernetes ingress, which routes HTTP by Host header or
+// TLS by SNI. Neither exists in a plain SSH stream, so the gateway cannot be
+// published through one.
+//
+// Enabling this puts a TLS layer underneath SSH: the client performs a TLS
+// handshake (carrying SNI) and speaks SSH inside it. The router can then route
+// on SNI with a passthrough rule, and the gateway needs no external load
+// balancer. The cost is that clients must wrap the connection too, e.g.
+//
+//	ssh -o ProxyCommand="openssl s_client -quiet -servername %h -connect %h:443" user@host
+//
+// Leave nil to serve plain SSH.
+type GatewayTLSConfig struct {
+	Cert     string `yaml:"cert"`      // PEM server certificate; required
+	Key      string `yaml:"key"`       // PEM private key; required
+	ClientCA string `yaml:"client_ca"` // optional PEM CA; when set, mutual TLS is required
+}
+
 // APIConfig configures the control-plane API server. It runs on a listener
 // separate from the SSH data path.
 type APIConfig struct {
@@ -584,6 +608,13 @@ func (f *File) validate() error {
 	}
 	if f.HostKey == "" {
 		f.HostKey = "hostkey.pem"
+	}
+	if f.TLS != nil {
+		// Half-configured TLS would silently fall back to plain SSH, which is
+		// the opposite of what an operator enabling this asked for.
+		if f.TLS.Cert == "" || f.TLS.Key == "" {
+			return fmt.Errorf("config: tls.cert and tls.key are both required when tls is set")
+		}
 	}
 	if f.DisableSSH && f.DisableTunnel && f.DisableSFTP {
 		return fmt.Errorf("config: disable_ssh, disable_tunnel, and disable_sftp cannot all be true (the gateway would serve nothing)")

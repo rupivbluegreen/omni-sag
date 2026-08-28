@@ -42,6 +42,8 @@ import (
 
 var errBadClientCA = errors.New("api: client_ca is not valid PEM")
 
+var errBadGatewayClientCA = errors.New("tls: client_ca is not valid PEM")
+
 func main() {
 	cfgPath := flag.String("config", "config.yaml", "path to configuration file")
 	debug := flag.Bool("debug", false, "log underlying auth/MFA failure detail to stdout (dev only: weakens the anti-enumeration posture, never enable in production)")
@@ -360,7 +362,20 @@ func run(cfgPath string, debug bool) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("omni-sag listening on %s (SSH)", cfg.Listen)
+	// Optional TLS underlay. Unlike the API's best-effort start, a failure here
+	// is fatal: falling back to plain SSH would quietly downgrade the transport
+	// an operator explicitly asked to protect.
+	gwTLS, err := gatewayTLSConfig(cfg.TLS, cfg.FIPSMode())
+	if err != nil {
+		_ = ln.Close()
+		return err
+	}
+	if gwTLS != nil {
+		ln = tls.NewListener(ln, gwTLS)
+		log.Printf("omni-sag listening on %s (SSH over TLS)", cfg.Listen)
+	} else {
+		log.Printf("omni-sag listening on %s (SSH)", cfg.Listen)
+	}
 
 	if err := srv.Serve(ctx, ln); err != nil {
 		return err
@@ -473,6 +488,35 @@ func buildAuthorizer(cfg *config.APIConfig) (api.Authorizer, error) {
 // plus, when client_ca is set, mandatory client-cert verification (mTLS). Under
 // fips.mode warn/enforce, mode routes the config through fips.Harden; enforce
 // fails closed (the control-plane API then does not start; SSH is unaffected).
+// gatewayTLSConfig builds the TLS layer wrapped around the SSH data path.
+// Returns (nil, nil) when TLS is not configured, so the caller serves plain SSH.
+func gatewayTLSConfig(cfg *config.GatewayTLSConfig, mode fips.Mode) (*tls.Config, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	cert, err := tls.LoadX509KeyPair(cfg.Cert, cfg.Key)
+	if err != nil {
+		return nil, err
+	}
+	tc := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	if cfg.ClientCA != "" {
+		caPEM, err := os.ReadFile(cfg.ClientCA)
+		if err != nil {
+			return nil, err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return nil, errBadGatewayClientCA
+		}
+		tc.ClientCAs = pool
+		tc.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	if err := fips.Harden(tc, mode); err != nil {
+		return nil, err
+	}
+	return tc, nil
+}
+
 func apiTLSConfig(cfg *config.APIConfig, mode fips.Mode) (*tls.Config, error) {
 	if cfg.TLSCert == "" {
 		return nil, nil // dev: plain HTTP + bearer token
