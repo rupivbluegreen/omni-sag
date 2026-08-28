@@ -574,7 +574,7 @@ type PolicyConfig struct {
 	// for CIDR-shaped rules — matching then falls back to IP-literal targets
 	// only, same as if no resolver were configured. Default false (resolution
 	// enabled); see internal/policy.ResolverFunc.
-	DisableCIDRHostnameResolution bool `yaml:"disable_cidr_hostname_resolution"`
+	DisableCIDRHostnameResolution bool `yaml:"disable_cidr_hostname_resolution,omitempty"`
 }
 
 // RoleConfig binds AD groups to allow rules.
@@ -590,12 +590,12 @@ type RoleConfig struct {
 // forwarding (-L) is refused (PRD FR-10).
 type RuleConfig struct {
 	Host            string   `yaml:"host"`
-	Ports           []int    `yaml:"ports"`
+	Ports           []int    `yaml:"ports,omitempty"`
 	Record          string   `yaml:"record"`
 	Credential      string   `yaml:"credential"`       // inject | prompt | passthrough | deny (empty=passthrough)
-	RequireApproval bool     `yaml:"require_approval"` // gate matching targets behind a four-eyes approval
-	TargetUser      string   `yaml:"target_user"`      // account on the target; empty => same as gateway login user
-	ExpectProtocol  []string `yaml:"expect_protocol"`  // allow-list of protocols permitted on this target's tunnels (tunnel_inspection enforce); empty = observe only
+	RequireApproval bool     `yaml:"require_approval,omitempty"` // gate matching targets behind a four-eyes approval
+	TargetUser      string   `yaml:"target_user,omitempty"`      // account on the target; empty => same as gateway login user
+	ExpectProtocol  []string `yaml:"expect_protocol,omitempty"`  // allow-list of protocols permitted on this target's tunnels (tunnel_inspection enforce); empty = observe only
 }
 
 // Load reads and parses the configuration file at path.
