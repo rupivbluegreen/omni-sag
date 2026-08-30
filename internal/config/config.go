@@ -592,7 +592,7 @@ type RuleConfig struct {
 	Host            string   `yaml:"host"`
 	Ports           []int    `yaml:"ports,omitempty"`
 	Record          string   `yaml:"record"`
-	Credential      string   `yaml:"credential"`       // inject | prompt | passthrough | deny (empty=passthrough)
+	Credential      string   `yaml:"credential"`                 // inject | prompt | passthrough | deny (empty=passthrough)
 	RequireApproval bool     `yaml:"require_approval,omitempty"` // gate matching targets behind a four-eyes approval
 	TargetUser      string   `yaml:"target_user,omitempty"`      // account on the target; empty => same as gateway login user
 	ExpectProtocol  []string `yaml:"expect_protocol,omitempty"`  // allow-list of protocols permitted on this target's tunnels (tunnel_inspection enforce); empty = observe only

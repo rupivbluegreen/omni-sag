@@ -26,15 +26,9 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/omni-sag ./cmd/omni-sag
 
-# The SDN policy reconciler ships in the same image (CronJob entrypoint).
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
-    -o /out/omnisag-sdnsync ./cmd/omnisag-sdnsync
-
 # ---- runtime stage ------------------------------------------------------
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/omni-sag /omni-sag
-COPY --from=build /out/omnisag-sdnsync /omnisag-sdnsync
 
 # The gateway's SSH listener (see config.yaml `listen: ":2222"`).
 EXPOSE 2222
