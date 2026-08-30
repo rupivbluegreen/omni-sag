@@ -21,8 +21,17 @@ ports:
   ssh: 2222
   api: 8443
   metrics: 9090
+  sshTLS: 2223  # SSH-over-TLS data-path port (container-side, unprivileged).
+                # Only opened when gatewayTLS.enabled (see below).
 
 # Raw-TCP SSH ingress. Use LoadBalancer (MetalLB / cloud LB) for real ingress.
+# If gatewayTLS.route.enabled fronts this gateway externally, this Service's
+# LoadBalancer is no longer required for THAT path — the Route/router handles
+# external exposure of the TLS listener. You can switch `type` to ClusterIP
+# once the Route is live and confirmed working, but the chart does not do
+# this for you: plain SSH (ports.ssh) would then only be reachable in-cluster
+# / via kubectl port-forward / break-glass — decide deliberately based on
+# your own fallback-access requirements, don't flip this reflexively.
 sshService:
   type: LoadBalancer
   port: 22
@@ -39,6 +48,47 @@ metrics:
 # shared secrets, TLS, signing keys) belong in a Secret referenced here — do NOT
 # put them in values in production.
 configSecretName: ""   # optional Secret mounted at /etc/omni-sag alongside config
+
+# SSH-over-TLS data path ("TLS Routing"): wraps a SECOND listener (ports.sshTLS)
+# in TLS so an SNI-aware L4 router can pick this backend from the ClientHello
+# before any SSH bytes are sent — e.g. an OpenShift Route with
+# `spec.tls.termination: passthrough`. The existing plain-SSH listener
+# (ports.ssh / sshService) keeps serving unmodified alongside it; this is
+# purely additive, never a replacement. See docs/openshift-tls-routing.md for
+# the client-side `ssh -o ProxyCommand=...` invocation.
+#
+# NOTE: if configSecretName is set, the chart's bootstrap ConfigMap (and the
+# `tls:` stanza it generates below) is NOT rendered at all — you must
+# hand-author the equivalent `tls:` block in your own config, pointing at the
+# same mount path (/etc/omni-sag/tls/tls.crt, tls.key[, ca.crt]) this chart
+# mounts from certSecretName.
+gatewayTLS:
+  enabled: false
+
+  # Secret of type kubernetes.io/tls (keys: tls.crt, tls.key), mounted
+  # read-only at /etc/omni-sag/tls. Required when gatewayTLS.enabled is true;
+  # the chart never generates or manages this material — bring your own,
+  # same convention as configSecretName.
+  certSecretName: ""
+
+  # When true, also expects a `ca.crt` key in certSecretName and sets
+  # `tls.client_ca` in the templated config, requiring mutual TLS (client
+  # certificates) on the SSH-over-TLS listener only — the plain-SSH listener
+  # is never affected by this setting.
+  clientCAEnabled: false
+
+  route:
+    # Renders an OpenShift Route (route.openshift.io/v1, passthrough
+    # termination) fronting the SSH-over-TLS port. OpenShift-only API — leave
+    # this false on plain Kubernetes. If left true where the route.openshift.io
+    # CRD isn't present, the template refuses to render with a clear error
+    # instead of emitting a Route the API server would reject.
+    enabled: false
+    host: ""  # e.g. gateway.apps.cluster.example.com; empty ⇒ OpenShift assigns one
+    annotations: {}
+      # The OpenShift router's default idle timeout WILL cut long-lived/idle
+      # SSH sessions and -L tunnels riding this Route unless raised, e.g.:
+      # haproxy.router.openshift.io/timeout: "1h"
 
 # restricted-v2 / ADR-0001 compatible pod security. No IPC_LOCK, no privilege,
 # read-only rootfs, seccomp RuntimeDefault, non-root. Swap-off is a NODE

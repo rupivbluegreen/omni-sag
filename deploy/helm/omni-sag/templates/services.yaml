@@ -14,6 +14,12 @@ spec:
       port: {{ .Values.sshService.port }}
       targetPort: ssh
       protocol: TCP
+    {{- if .Values.gatewayTLS.enabled }}
+    - name: sshtls
+      port: {{ .Values.ports.sshTLS }}
+      targetPort: sshtls
+      protocol: TCP
+    {{- end }}
 ---
 apiVersion: v1
 kind: Service

@@ -18,6 +18,18 @@ data:
     metrics:
       listen: ":{{ .Values.ports.metrics }}"
     {{- end }}
+    {{- if .Values.gatewayTLS.enabled }}
+    # Mirrors gatewayTLS.* in values.yaml, for the bootstrap/dev config only.
+    # Production configs supplied via configSecretName are NOT rendered by
+    # this ConfigMap at all — hand-author the equivalent `tls:` block there.
+    tls:
+      listen: ":{{ .Values.ports.sshTLS }}"
+      cert: "/etc/omni-sag/tls/tls.crt"
+      key: "/etc/omni-sag/tls/tls.key"
+      {{- if .Values.gatewayTLS.clientCAEnabled }}
+      client_ca: "/etc/omni-sag/tls/ca.crt"
+      {{- end }}
+    {{- end }}
     evidence:
       pipeline:
         data_dir: "/var/lib/omni-sag/evidence"

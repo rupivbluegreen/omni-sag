@@ -245,7 +245,8 @@ $ omni-sag -config config.yaml -debug
 
 **📦 Packaging** — UBI9 non-root image, a Helm chart (restricted-v2 pod security), Prometheus
 metrics on their own listener, graceful drain on SIGTERM, and a FIPS-readiness mode
-(`off` | `warn` | `enforce`).
+(`off` | `warn` | `enforce`). Optionally wrap the SSH data path in TLS so an OpenShift passthrough
+Route can front it — see [docs/openshift-tls-routing.md](docs/openshift-tls-routing.md).
 
 ## 🚀 60 seconds to "whoa"
 
@@ -320,7 +321,7 @@ not yet built.
   event export / SIEM (json·ecs·cef × file·syslog·http), tunnel protocol identification (observe +
   enforce), OpenTelemetry (OTLP) export (traces + optional metrics/logs), FIPS-approved TLS routed
   through the API/CCP/LDAP/event-export listeners under `warn`/`enforce`, API + CLI + TUI +
-  packaging + FIPS-readiness mode. ✅
+  packaging + FIPS-readiness mode, SSH-over-TLS (SNI passthrough ingress, e.g. OpenShift Routes). ✅
 - **Next (v1.x):** SSH certificate authority; Kerberos/GSSAPI; a real OIDC (JWKS) validator for the
   API (today a static-token stand-in); CRD-backed policy/approval sources (needs a live cluster).
 - **v2:** RDP (native mstsc, then browser RDP with recording).
