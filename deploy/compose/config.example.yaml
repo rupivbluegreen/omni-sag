@@ -26,6 +26,17 @@ target_insecure_host_key: true
 # metrics:
 #   listen: ":9090"
 
+# SSH-over-TLS: wraps a SECOND listener in TLS so an SNI-aware router (e.g. an
+# OpenShift Route with `spec.tls.termination: passthrough`) can pick this
+# backend from the ClientHello, without decrypting anything, before any SSH
+# bytes are sent. Additive — the plain `listen` above keeps serving unchanged.
+# See docs/openshift-tls-routing.md.
+# tls:
+#   listen: ":2223"
+#   cert: "gateway-cert.pem"
+#   key:  "gateway-key.pem"
+#   # client_ca: "gateway-client-ca.pem" # enables mTLS on this listener only
+
 # Event export / SIEM integration. Opt-in (default off). Streams every
 # evidence event (auth, tunnel_decision, session, transfer, inspection,
 # credential, approval, ...) to one or more SIEMs in real time, ALONGSIDE the
