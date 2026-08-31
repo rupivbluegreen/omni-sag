@@ -39,6 +39,7 @@ type File struct {
 
 	TargetKnownHosts      string `yaml:"target_known_hosts"`       // OpenSSH known_hosts path verifying real-target host keys
 	TargetInsecureHostKey bool   `yaml:"target_insecure_host_key"` // dev-lab only: explicitly disable target host-key verification; see WithInsecureTargetHostKey
+	TargetAllowLoopback   bool   `yaml:"target_allow_loopback"`    // dev-lab only: permit loopback real targets past the SSRF guard; see session.WithLoopbackTargetsAllowed
 
 	// Capability toggles: shell, -L forwarding, and SFTP default to false
 	// (enabled); a config.yaml written before these fields existed keeps

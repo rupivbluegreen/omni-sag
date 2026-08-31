@@ -95,9 +95,9 @@ func (t *syslogTransport) redialLocked() error {
 	var err error
 	switch t.cfg.Protocol {
 	case "udp":
-		conn, err = net.DialTimeout("udp", t.cfg.Address, syslogDialTimeout)
+		conn, err = net.DialTimeout("udp", t.cfg.Address, syslogDialTimeout) // omni-sag:integration-dial
 	case "tcp":
-		conn, err = net.DialTimeout("tcp", t.cfg.Address, syslogDialTimeout)
+		conn, err = net.DialTimeout("tcp", t.cfg.Address, syslogDialTimeout) // omni-sag:integration-dial
 	case "tls":
 		// omni-sag:integration-dial — dials the operator-configured SIEM
 		// syslog endpoint (t.cfg.Address), an integration client like the ICAP

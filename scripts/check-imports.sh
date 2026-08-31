@@ -11,7 +11,7 @@ echo "== net.Dial restricted to internal/dialer (+ marked integration clients) =
 # its single dial site is explicitly annotated with the marker below; that one
 # line is exempt. The marker names an operator-configured integration endpoint,
 # NOT a session target, so the single-target-dialer invariant is preserved.
-matches=$(grep -rnE '\bnet\.Dial(er)?\b' --include='*.go' \
+matches=$(grep -rnE '\bnet\.Dial[A-Za-z]*\b' --include='*.go' \
   --exclude-dir='.git' --exclude-dir='.claude' --exclude-dir='vendor' . \
   | grep -v '_test\.go:' \
   | grep -v '^\./internal/dialer/' \

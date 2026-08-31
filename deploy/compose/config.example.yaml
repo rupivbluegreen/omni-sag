@@ -13,6 +13,11 @@ host_key: "hostkey.pem"
 # EITHER this or target_known_hosts, dialTarget fails closed and the
 # Real-target demo rule below can never succeed. Never set this in production.
 target_insecure_host_key: true
+# The lab's ssh-target is published on the gateway's own loopback
+# (127.0.0.1:2200), which the SSRF guard blocks by default. Dev-lab only —
+# never set this in production, where a loopback target means the gateway
+# dialling itself.
+target_allow_loopback: true
 # Production alternative: pin real target host keys instead of the insecure
 # bypass above (set exactly one of the two).
 # target_known_hosts: "/etc/omni-sag/target_known_hosts"
