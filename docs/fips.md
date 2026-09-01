@@ -97,11 +97,13 @@ library) does three things:
    primitive would fault here at boot rather than mid-session.
 3. **TLS parameter helpers** — `internal/fips` exposes `ValidateTLSConfig`,
    `ApprovedTLSConfig`, `TLSVersionApproved`, `CipherSuiteApproved`, and
-   `ApprovedTLS13Suite` so the TLS used for LDAPS, the CyberArk CCP client, the
-   control-plane API, and the optional SSH-over-TLS gateway listener (see
-   [docs/openshift-tls-routing.md](openshift-tls-routing.md)) can be pinned to
-   FIPS-acceptable versions (TLS 1.2+) and AES-GCM cipher suites
-   (ChaCha20-Poly1305, CBC, 3DES, RC4 excluded).
+   `ApprovedTLS13Suite` so every TLS path can be pinned to FIPS-acceptable
+   versions (TLS 1.2+) and AES-GCM cipher suites (ChaCha20-Poly1305, CBC, 3DES,
+   RC4 excluded). That covers both listeners — the control-plane API and the
+   optional SSH-over-TLS gateway listener (see
+   [docs/openshift-tls-routing.md](openshift-tls-routing.md)) — and every TLS
+   egress client: LDAPS, the CyberArk CCP client, event export (syslog/HTTP),
+   and the OTLP collector connection.
 
 ## Algorithm inventory (FIPS acceptability)
 
@@ -109,7 +111,7 @@ library) does three things:
 |---------------------------------------|----------------------|-------------------|
 | Evidence checkpoint signing           | Ed25519 (EdDSA)      | Approved (FIPS 186-5) |
 | Evidence hash chain / recording ids   | SHA-256              | Approved (FIPS 180-4 / SHS) |
-| LDAPS / CCP / API / gateway-TLS transport | TLS 1.2+ AES-GCM | Approved |
+| All TLS (LDAPS, CCP, event export, OTLP, API, gateway-TLS) | TLS 1.2+ AES-GCM | Approved |
 | TLS ChaCha20-Poly1305                 | ChaCha20-Poly1305    | **Not** approved — excluded by the helpers |
 
 ## Notes and caveats

@@ -49,7 +49,7 @@ func buildLogExporter(ctx context.Context, cfg Config) (sdklog.Exporter, error) 
 		if cfg.Insecure {
 			opts = append(opts, otlploggrpc.WithInsecure())
 		} else {
-			tlsCfg, err := buildTLSConfig(cfg.TLS)
+			tlsCfg, err := buildTLSConfig(cfg.TLS, cfg.Mode)
 			if err != nil {
 				return nil, err
 			}
@@ -64,7 +64,7 @@ func buildLogExporter(ctx context.Context, cfg Config) (sdklog.Exporter, error) 
 		if cfg.Insecure {
 			opts = append(opts, otlploghttp.WithInsecure())
 		} else {
-			tlsCfg, err := buildTLSConfig(cfg.TLS)
+			tlsCfg, err := buildTLSConfig(cfg.TLS, cfg.Mode)
 			if err != nil {
 				return nil, err
 			}

@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rupivbluegreen/omni-sag/internal/fips"
+
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
@@ -40,6 +42,7 @@ const defaultServiceName = "omni-sag"
 // package a leaf.
 type Config struct {
 	Enabled  bool
+	Mode     fips.Mode // FIPS posture; routes collector TLS through fips.Harden like every other TLS egress
 	Endpoint string
 	Protocol string // grpc | http
 	Insecure bool
@@ -260,7 +263,7 @@ func buildTraceExporter(ctx context.Context, cfg Config) (sdktrace.SpanExporter,
 		if cfg.Insecure {
 			opts = append(opts, otlptracegrpc.WithInsecure())
 		} else {
-			tlsCfg, err := buildTLSConfig(cfg.TLS)
+			tlsCfg, err := buildTLSConfig(cfg.TLS, cfg.Mode)
 			if err != nil {
 				return nil, err
 			}
@@ -278,7 +281,7 @@ func buildTraceExporter(ctx context.Context, cfg Config) (sdktrace.SpanExporter,
 		if cfg.Insecure {
 			opts = append(opts, otlptracehttp.WithInsecure())
 		} else {
-			tlsCfg, err := buildTLSConfig(cfg.TLS)
+			tlsCfg, err := buildTLSConfig(cfg.TLS, cfg.Mode)
 			if err != nil {
 				return nil, err
 			}
@@ -293,7 +296,12 @@ func buildTraceExporter(ctx context.Context, cfg Config) (sdktrace.SpanExporter,
 // buildTLSConfig loads TLS material for a verified (optionally mutual-TLS)
 // connection to the collector. A zero-value TLSConfig yields the platform
 // default trust store with no client certificate.
-func buildTLSConfig(c TLSConfig) (*tls.Config, error) {
+//
+// The result is routed through fips.Harden, the same as every other TLS
+// egress client (LDAPS, CyberArk CCP, event export) and both listeners: under
+// warn/enforce this pins TLS 1.2+ and the approved AES-GCM suites, and enforce
+// fails closed rather than negotiating a non-approved cipher to the collector.
+func buildTLSConfig(c TLSConfig, mode fips.Mode) (*tls.Config, error) {
 	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
 	if c.CACert != "" {
 		pem, err := os.ReadFile(c.CACert)
@@ -312,6 +320,9 @@ func buildTLSConfig(c TLSConfig) (*tls.Config, error) {
 			return nil, fmt.Errorf("tls client cert: %w", err)
 		}
 		cfg.Certificates = []tls.Certificate{cert}
+	}
+	if err := fips.Harden(cfg, mode); err != nil {
+		return nil, err
 	}
 	return cfg, nil
 }
@@ -394,7 +405,7 @@ func buildMetricExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, e
 		if cfg.Insecure {
 			opts = append(opts, otlpmetricgrpc.WithInsecure())
 		} else {
-			tlsCfg, err := buildTLSConfig(cfg.TLS)
+			tlsCfg, err := buildTLSConfig(cfg.TLS, cfg.Mode)
 			if err != nil {
 				return nil, err
 			}
@@ -409,7 +420,7 @@ func buildMetricExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, e
 		if cfg.Insecure {
 			opts = append(opts, otlpmetrichttp.WithInsecure())
 		} else {
-			tlsCfg, err := buildTLSConfig(cfg.TLS)
+			tlsCfg, err := buildTLSConfig(cfg.TLS, cfg.Mode)
 			if err != nil {
 				return nil, err
 			}
