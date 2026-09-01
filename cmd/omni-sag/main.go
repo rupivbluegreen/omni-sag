@@ -337,6 +337,10 @@ func run(cfgPath string, debug bool) error {
 	default:
 		log.Printf("omni-sag: real-target host key verification is NOT configured — shell/SFTP sessions to real targets will fail closed until target_known_hosts or target_insecure_host_key (dev-lab only) is set")
 	}
+	if cfg.TargetAllowLoopback {
+		opts = append(opts, session.WithLoopbackTargetsAllowed())
+		log.Printf("omni-sag: WARNING loopback real targets are ALLOWED past the SSRF guard (target_allow_loopback: true) — dev-lab only, never use in production")
+	}
 	srv := session.New(hostKey, auth, d, met.CountingSink(ev.sessionSink), opts...)
 	met.SetActiveFn(srv.ActiveSessions)
 

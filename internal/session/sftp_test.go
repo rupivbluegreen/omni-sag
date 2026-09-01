@@ -178,7 +178,9 @@ func wireFakeSFTPTarget(t *testing.T, files map[string][]byte) (targetHost strin
 	t.Helper()
 	fakeConn := startFakeSFTPTarget(t, files)
 	orig := dialNet
-	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	dialNet = func(_ context.Context, network, addr string, timeout time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
+		return fakeConn, nil
+	}
 	t.Cleanup(func() { dialNet = orig })
 
 	prov := credential.NewProvider(credential.Config{

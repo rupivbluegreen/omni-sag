@@ -15,6 +15,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/rupivbluegreen/omni-sag/internal/credential"
+	"github.com/rupivbluegreen/omni-sag/internal/dialer"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 )
@@ -68,10 +69,12 @@ func splitTargetHostPort(hostspec string) (host string, port int) {
 }
 
 // dialNet is the single dial seam for the target's second SSH leg. A package
-// variable solely so tests can substitute a fake transport (mirrors
-// internal/dialer's netDial pattern); production always uses net.DialTimeout.
-var dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) {
-	return net.DialTimeout(network, addr, timeout)
+// variable solely so tests can substitute a fake transport; production routes
+// through dialer.DialGuarded so this leg gets the same SSRF and DNS-rebind
+// guards as -L forwarding, rather than a second unguarded path to a
+// user-supplied host. matchedCIDR is the decision's matched range, if any.
+var dialNet = func(ctx context.Context, network, addr string, timeout time.Duration, matchedCIDR *net.IPNet, allowLoopback bool) (net.Conn, error) {
+	return dialer.DialGuarded(ctx, network, addr, timeout, matchedCIDR, allowLoopback)
 }
 
 // emitTargetCredential emits one evidence.TypeCredential event for a
@@ -215,7 +218,7 @@ func (s *Server) dialTarget(ctx context.Context, sconn ssh.Conn, pr policy.Princ
 	}
 
 	addr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
-	rawConn, err := dialNet("tcp", addr, cfg.Timeout)
+	rawConn, err := dialNet(ctx, "tcp", addr, cfg.Timeout, decision.MatchedCIDR, s.allowLoopbackTargets)
 	if err != nil {
 		return nil, fmt.Errorf("session: dial target %s: %w", addr, err)
 	}

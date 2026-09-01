@@ -87,6 +87,8 @@ type Server struct {
 
 	targetHostKeyCB ssh.HostKeyCallback // verifies the target's host key on the second SSH leg; nil => dialTarget fails closed (see WithTargetHostKeyCallback / WithInsecureTargetHostKey)
 
+	allowLoopbackTargets bool // dev-lab only: permit loopback real targets past the SSRF guard (see WithLoopbackTargetsAllowed)
+
 	wg       sync.WaitGroup // tracks active connections for graceful drain
 	active   atomic.Int64   // current active connections
 	draining atomic.Bool    // set once ctx is cancelled; refuses new connections
@@ -228,6 +230,14 @@ func WithTargetHostKeyCallback(cb ssh.HostKeyCallback) Option {
 // Never call this in a production wiring path.
 func WithInsecureTargetHostKey() Option {
 	return func(s *Server) { s.targetHostKeyCB = ssh.InsecureIgnoreHostKey() }
+}
+
+// WithLoopbackTargetsAllowed permits real-target sessions to loopback
+// addresses, which the SSRF guard blocks by default. Same posture as
+// dialer.WithLoopbackTargetsAllowed: for harnesses running the target on the
+// gateway's own loopback (the compose lab), never production.
+func WithLoopbackTargetsAllowed() Option {
+	return func(s *Server) { s.allowLoopbackTargets = true }
 }
 
 // WithBruteForceLimiter overrides the default per-source-IP brute-force

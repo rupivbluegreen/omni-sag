@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -285,7 +286,9 @@ func wireFakeTarget(t *testing.T, wantPassword string, resizeObserved chan<- [2]
 	t.Helper()
 	fakeConn := startFakeTargetShell(t, wantPassword, resizeObserved)
 	orig := dialNet
-	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	dialNet = func(_ context.Context, network, addr string, timeout time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
+		return fakeConn, nil
+	}
 	t.Cleanup(func() { dialNet = orig })
 
 	prov := credential.NewProvider(credential.Config{
@@ -323,7 +326,7 @@ func TestDialTarget_NoHostKeyCallbackFailsClosed(t *testing.T) {
 	// stops it, and that it stops it BEFORE any dial is attempted.
 	dialed := false
 	orig := dialNet
-	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) {
+	dialNet = func(_ context.Context, network, addr string, timeout time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
 		dialed = true
 		return nil, errors.New("must not dial: host-key check should fail closed first")
 	}
@@ -388,7 +391,9 @@ func TestDialTarget_PassthroughNoConnFailsClosed(t *testing.T) {
 func TestDialTarget_InjectSucceeds(t *testing.T) {
 	fakeConn := startFakeTarget(t, "injected-secret")
 	orig := dialNet
-	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	dialNet = func(_ context.Context, network, addr string, timeout time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
+		return fakeConn, nil
+	}
 	t.Cleanup(func() { dialNet = orig })
 
 	prov := credential.NewProvider(credential.Config{
@@ -407,7 +412,9 @@ func TestDialTarget_InjectSucceeds(t *testing.T) {
 func TestDialTarget_PromptSucceeds(t *testing.T) {
 	fakeConn := startFakeTarget(t, "prompted-secret")
 	orig := dialNet
-	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	dialNet = func(_ context.Context, network, addr string, timeout time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
+		return fakeConn, nil
+	}
 	t.Cleanup(func() { dialNet = orig })
 
 	s := &Server{sink: noopSink{}, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
@@ -429,7 +436,9 @@ func TestDialTarget_PromptSucceeds(t *testing.T) {
 func TestDialTarget_PromptSucceedsKeyboardInteractiveOnly(t *testing.T) {
 	fakeConn := startFakeTargetKbdOnly(t, "prompted-secret")
 	orig := dialNet
-	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	dialNet = func(_ context.Context, network, addr string, timeout time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
+		return fakeConn, nil
+	}
 	t.Cleanup(func() { dialNet = orig })
 
 	s := &Server{sink: noopSink{}, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
@@ -447,7 +456,9 @@ func TestDialTarget_PromptSucceedsKeyboardInteractiveOnly(t *testing.T) {
 func TestDialTarget_InjectSucceedsKeyboardInteractiveOnly(t *testing.T) {
 	fakeConn := startFakeTargetKbdOnly(t, "injected-secret")
 	orig := dialNet
-	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	dialNet = func(_ context.Context, network, addr string, timeout time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
+		return fakeConn, nil
+	}
 	t.Cleanup(func() { dialNet = orig })
 
 	prov := credential.NewProvider(credential.Config{
@@ -488,7 +499,7 @@ func TestRunRecordedShell_DialsDecisionResolvedPort(t *testing.T) {
 	// not the test goroutine.
 	addrCh := make(chan string, 1)
 	orig := dialNet
-	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) {
+	dialNet = func(_ context.Context, network, addr string, timeout time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
 		addrCh <- addr
 		return fakeConn, nil
 	}
@@ -593,7 +604,9 @@ func assertNoSecretLeak(t *testing.T, e evidence.Event, secrets ...string) {
 func TestDialTarget_InjectEmitsCredentialEvidence(t *testing.T) {
 	fakeConn := startFakeTarget(t, "injected-secret")
 	orig := dialNet
-	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	dialNet = func(_ context.Context, network, addr string, timeout time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
+		return fakeConn, nil
+	}
 	t.Cleanup(func() { dialNet = orig })
 
 	prov := credential.NewProvider(credential.Config{
@@ -625,7 +638,9 @@ func TestDialTarget_InjectEmitsCredentialEvidence(t *testing.T) {
 func TestDialTarget_PromptEmitsCredentialEvidence(t *testing.T) {
 	fakeConn := startFakeTarget(t, "prompted-secret")
 	orig := dialNet
-	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	dialNet = func(_ context.Context, network, addr string, timeout time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
+		return fakeConn, nil
+	}
 	t.Cleanup(func() { dialNet = orig })
 
 	sink := evidence.NewMemSink()
@@ -709,7 +724,9 @@ func TestDialTarget_PassthroughEmitsCredentialEvidence(t *testing.T) {
 
 	fakeConn := startFakeTargetNoAuth(t)
 	orig := dialNet
-	dialNet = func(network, addr string, timeout time.Duration) (net.Conn, error) { return fakeConn, nil }
+	dialNet = func(_ context.Context, network, addr string, timeout time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
+		return fakeConn, nil
+	}
 	t.Cleanup(func() { dialNet = orig })
 
 	sink := evidence.NewMemSink()
@@ -768,5 +785,75 @@ func TestDialTarget_InjectFailClosedEmitsCredentialEvidence(t *testing.T) {
 	}
 	if e.Allow == nil || *e.Allow {
 		t.Fatalf("credential event Allow = %v, want false", e.Allow)
+	}
+}
+
+// --- SSRF / DNS-rebind guard on the real-target leg -------------------------
+//
+// These deliberately do NOT stub dialNet: the whole point is to exercise the
+// real guarded dial. Before this guard was wired, the target leg used a bare
+// net.DialTimeout and every one of these connected.
+
+func TestDialTarget_BlocksLinkLocalMetadataAddress(t *testing.T) {
+	s := &Server{sink: noopSink{}, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	token := s.stashTargetSecret(credential.New([]byte("secret")))
+	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
+		policy.Decision{CredentialMode: "prompt"}, "169.254.169.254", 22, token)
+	if !errors.Is(err, dialer.ErrBlockedAddress) {
+		t.Fatalf("cloud metadata IP must be refused by the SSRF guard, got %v", err)
+	}
+}
+
+func TestDialTarget_BlocksLoopbackByDefault(t *testing.T) {
+	s := &Server{sink: noopSink{}, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	token := s.stashTargetSecret(credential.New([]byte("secret")))
+	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
+		policy.Decision{CredentialMode: "prompt"}, "127.0.0.1", 22, token)
+	if !errors.Is(err, dialer.ErrBlockedAddress) {
+		t.Fatalf("loopback must be refused unless explicitly allowed, got %v", err)
+	}
+}
+
+func TestDialTarget_LoopbackAllowedWithOption(t *testing.T) {
+	fakeConn := startFakeTarget(t, "secret")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func() { _, _ = io.Copy(c, fakeConn) }()
+		_, _ = io.Copy(fakeConn, c)
+	}()
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	s := &Server{sink: noopSink{}, targetHostKeyCB: ssh.InsecureIgnoreHostKey(), allowLoopbackTargets: true} // test fixture: deliberate, not production
+	token := s.stashTargetSecret(credential.New([]byte("secret")))
+	client, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
+		policy.Decision{CredentialMode: "prompt"}, "127.0.0.1", port, token)
+	if err != nil {
+		t.Fatalf("loopback must connect when WithLoopbackTargetsAllowed is set: %v", err)
+	}
+	defer client.Close()
+}
+
+func TestDialTarget_RefusesAddressOutsideMatchedCIDR(t *testing.T) {
+	_, allowed, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{sink: noopSink{}, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	token := s.stashTargetSecret(credential.New([]byte("secret")))
+	// Authorized against 10.0.0.0/8, but the address actually dialed is not in
+	// it — the rebind the CIDR guard exists to catch.
+	_, err = s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
+		policy.Decision{CredentialMode: "prompt", MatchedCIDR: allowed}, "192.0.2.1", 22, token)
+	if !errors.Is(err, dialer.ErrBlockedAddress) {
+		t.Fatalf("address outside the matched CIDR must be refused, got %v", err)
 	}
 }

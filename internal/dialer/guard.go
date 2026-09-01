@@ -1,10 +1,12 @@
 package dialer
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"syscall"
+	"time"
 )
 
 // ErrBlockedAddress is returned when the address the OS actually resolved a
@@ -117,6 +119,32 @@ func blockedIP(ip net.IP) (bool, string) {
 	default:
 		return false, ""
 	}
+}
+
+// DialGuarded dials addr with the same protection netDial installs at the
+// dialer's own single target dial site: the resolved-address SSRF guard, plus
+// the DNS-rebind guard when matchedCIDR is non-nil. It exists so the real
+// target's second SSH leg (internal/session) shares these guards instead of
+// opening a second, unguarded path to a user-supplied host.
+//
+// allowLoopback mirrors WithLoopbackTargetsAllowed and carries the same
+// warning: dev/test harnesses only, never production.
+func DialGuarded(ctx context.Context, network, addr string, timeout time.Duration, matchedCIDR *net.IPNet, allowLoopback bool) (net.Conn, error) {
+	control := dialControlFunc(guardResolvedAddr)
+	if allowLoopback {
+		control = guardResolvedAddrAllowLoopback
+	}
+	if matchedCIDR != nil {
+		base, n := control, matchedCIDR
+		control = func(network, address string, c syscall.RawConn) error {
+			if err := base(network, address, c); err != nil {
+				return err
+			}
+			return guardWithinCIDR(network, address, n)
+		}
+	}
+	d := net.Dialer{Timeout: timeout, Control: control}
+	return d.DialContext(ctx, network, addr)
 }
 
 // guardWithinCIDR re-validates a connect-time address against the CIDR range
