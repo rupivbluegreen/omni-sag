@@ -90,6 +90,9 @@ target_insecure_host_key: true
 #   endpoint: "otel-collector:4317"    # OTLP collector endpoint, host:port
 #   protocol: grpc                     # grpc (default) | http
 #   insecure: true                     # plaintext to the collector (dev only)
+#   # Collector TLS. Routed through fips.Harden like every other TLS egress
+#   # client, so under fips.mode warn/enforce this is pinned to TLS 1.2+ and
+#   # the approved AES-GCM suites (enforce fails closed).
 #   # tls: { ca_cert: "ca.pem", client_cert: "c.pem", client_key: "k.pem" }
 #   # headers: { authorization: "Bearer ..." }  # e.g. SaaS OTLP auth
 #   # resource: { service.name: omni-sag, deployment.environment: prod }

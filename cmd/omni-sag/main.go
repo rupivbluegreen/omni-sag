@@ -165,6 +165,7 @@ func run(cfgPath string, debug bool) error {
 	if cfg.OTel != nil && cfg.OTel.Enabled {
 		otelProviders, err = otelexport.Setup(ctx, otelexport.Config{
 			Enabled:  true,
+			Mode:     cfg.FIPSMode(),
 			Endpoint: cfg.OTel.Endpoint,
 			Protocol: cfg.OTel.Protocol(),
 			Insecure: cfg.OTel.Insecure,
