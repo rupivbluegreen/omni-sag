@@ -239,6 +239,11 @@ type targetConnCache struct {
 	client *ssh.Client
 	err    error
 	dialed bool
+
+	// observe, when set, receives how long the one real dial took and
+	// whether it succeeded (see LatencyObservers.SessionSetup). It runs
+	// under mu, so it must be a cheap, non-blocking recorder.
+	observe func(d time.Duration, ok bool)
 }
 
 // getOrDial returns the cached target client, dialing it on first use. A
@@ -250,8 +255,14 @@ func (c *targetConnCache) getOrDial(dial func() (*ssh.Client, error)) (*ssh.Clie
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.dialed {
+		started := time.Now()
 		c.client, c.err = dial()
 		c.dialed = true
+		if c.observe != nil {
+			// Only the first (real) dial is timed; later cache hits cost
+			// nothing and would otherwise flood the histogram with zeros.
+			c.observe(time.Since(started), c.err == nil)
+		}
 	}
 	return c.client, c.err
 }

@@ -9,10 +9,13 @@ package metrics
 import (
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 )
@@ -21,6 +24,78 @@ type counter struct{ v atomic.Int64 }
 
 func (c *counter) inc()       { c.v.Add(1) }
 func (c *counter) get() int64 { return c.v.Load() }
+
+// Latency bucket boundaries, in seconds, as package-level vars so a deployment
+// with different expectations can tune them in one place. Both are ascending
+// and exclude +Inf, which every histogram appends itself.
+var (
+	// SetupBuckets suit the sub-second-to-a-minute work of admitting a
+	// connection: an SSH handshake and directory bind land in the low
+	// milliseconds, a slow directory or a far target in the seconds.
+	SetupBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
+
+	// LifetimeBuckets suit whole sessions, which range from a scripted
+	// command that ends at once to a shell parked for a working day.
+	LifetimeBuckets = []float64{1, 5, 15, 30, 60, 300, 900, 1800, 3600, 14400, 28800}
+)
+
+// histogram is a lock-free Prometheus histogram over a fixed bucket set. Like
+// the counters above it is written from the data path and read by a scrape,
+// so every field is atomic and observe() never allocates.
+type histogram struct {
+	bounds  []float64
+	buckets []atomic.Int64 // per-bucket, NOT cumulative; summed at render time
+	sumBits atomic.Uint64  // float64 seconds, CAS-updated
+	count   atomic.Int64
+}
+
+func newHistogram(bounds []float64) *histogram {
+	return &histogram{bounds: bounds, buckets: make([]atomic.Int64, len(bounds))}
+}
+
+// observe records one duration. The bucket is incremented before the count so
+// a concurrent scrape can only ever read a cumulative bucket total <= _count,
+// never a bucket larger than the +Inf bucket (which would be invalid output).
+func (h *histogram) observe(d time.Duration) {
+	v := d.Seconds()
+	if i := sort.SearchFloat64s(h.bounds, v); i < len(h.bounds) {
+		h.buckets[i].Add(1) // bounds[i] is the first boundary with v <= le
+	}
+	for {
+		old := h.sumBits.Load()
+		if h.sumBits.CompareAndSwap(old, math.Float64bits(math.Float64frombits(old)+v)) {
+			break
+		}
+	}
+	h.count.Add(1)
+}
+
+// write emits the _bucket/_sum/_count series for one histogram. labels is the
+// already-rendered label set this series carries ("" for an unlabeled family).
+// An untouched histogram still writes every series, at zero.
+func (h *histogram) write(w io.Writer, name, labels string) {
+	le := func(v string) string {
+		if labels == "" {
+			return fmt.Sprintf("{le=%q}", v)
+		}
+		return fmt.Sprintf("{%s,le=%q}", labels, v)
+	}
+	suffix := ""
+	if labels != "" {
+		suffix = "{" + labels + "}"
+	}
+	var cum int64
+	for i, b := range h.bounds {
+		cum += h.buckets[i].Load()
+		fmt.Fprintf(w, "omnisag_%s_bucket%s %d\n", name, le(formatFloat(b)), cum)
+	}
+	count := h.count.Load()
+	fmt.Fprintf(w, "omnisag_%s_bucket%s %d\n", name, le("+Inf"), count)
+	fmt.Fprintf(w, "omnisag_%s_sum%s %s\n", name, suffix, formatFloat(math.Float64frombits(h.sumBits.Load())))
+	fmt.Fprintf(w, "omnisag_%s_count%s %d\n", name, suffix, count)
+}
+
+func formatFloat(v float64) string { return strconv.FormatFloat(v, 'g', -1, 64) }
 
 // Metrics holds the gateway counters and an active-sessions gauge source.
 type Metrics struct {
@@ -38,6 +113,14 @@ type Metrics struct {
 	// eventexport), not a fixed known set.
 	exportDropped sync.Map // string -> *counter
 
+	// Latency histograms. Split by outcome where the data path already knows
+	// it; no user, source-IP or target label is ever attached, so the series
+	// count stays fixed no matter how many distinct principals or hosts the
+	// gateway serves.
+	authOK, authFail   *histogram
+	setupOK, setupFail *histogram
+	sessionLifetime    *histogram
+
 	activeFn             func() int64
 	otelExportFailuresFn func() int64
 }
@@ -50,9 +133,49 @@ func (m *Metrics) IncExportDrop(exporter string) {
 	v.(*counter).inc()
 }
 
-// New returns a Metrics with a zero active gauge.
+// New returns a Metrics with a zero active gauge and empty histograms.
 func New() *Metrics {
-	return &Metrics{activeFn: func() int64 { return 0 }, otelExportFailuresFn: func() int64 { return 0 }}
+	return &Metrics{
+		authOK:               newHistogram(SetupBuckets),
+		authFail:             newHistogram(SetupBuckets),
+		setupOK:              newHistogram(SetupBuckets),
+		setupFail:            newHistogram(SetupBuckets),
+		sessionLifetime:      newHistogram(LifetimeBuckets),
+		activeFn:             func() int64 { return 0 },
+		otelExportFailuresFn: func() int64 { return 0 },
+	}
+}
+
+// ObserveAuth records how long a client connection took to reach its
+// authentication decision, measured from the moment the connection was
+// accepted. ok distinguishes an authenticated connection from a rejected one:
+// the two have very different shapes and averaging them hides both.
+func (m *Metrics) ObserveAuth(d time.Duration, ok bool) {
+	pickHist(ok, m.authOK, m.authFail).observe(d)
+}
+
+// ObserveSessionSetup records how long it took to establish the gateway's
+// second SSH leg to the target (credential resolution, TCP dial and target
+// handshake) — the wait between an authenticated client asking for a session
+// and that session being usable. Observed once per gateway connection, on
+// first use, for shell/SFTP/scp sessions.
+func (m *Metrics) ObserveSessionSetup(d time.Duration, ok bool) {
+	pickHist(ok, m.setupOK, m.setupFail).observe(d)
+}
+
+// ObserveSessionLifetime records how long an authenticated connection lived,
+// from the completed handshake to teardown. Unsplit: a session that ends
+// because the client left and one that ends because the target died look the
+// same from here.
+func (m *Metrics) ObserveSessionLifetime(d time.Duration) {
+	m.sessionLifetime.observe(d)
+}
+
+func pickHist(ok bool, yes, no *histogram) *histogram {
+	if ok {
+		return yes
+	}
+	return no
 }
 
 // SetActiveFn wires the active-sessions gauge to a source (e.g. the session
@@ -157,6 +280,20 @@ func (m *Metrics) Snapshot() map[string]int64 {
 	}
 }
 
+// histSeries pairs one histogram with the label set it is exposed under. A
+// family's HELP/TYPE is written once, then every series beneath it.
+type histSeries struct {
+	labels string
+	h      *histogram
+}
+
+func writeHistogram(w io.Writer, name, help string, series ...histSeries) {
+	fmt.Fprintf(w, "# HELP omnisag_%s %s\n# TYPE omnisag_%s histogram\n", name, help, name)
+	for _, s := range series {
+		s.h.write(w, name, s.labels)
+	}
+}
+
 func pick(ok bool, yes, no *counter) {
 	if ok {
 		yes.inc()
@@ -193,6 +330,16 @@ func (m *Metrics) WriteText(w io.Writer) {
 	ctr("transfers_total", "SFTP transfers", m.transfers.get())
 	ctr("evidence_emit_failures_total", "Evidence emit failures", m.evidenceEmitFailures.get())
 	ctr("otel_export_failures_total", "OTLP export failures/drops", m.otelExportFailuresFn())
+
+	writeHistogram(w, "auth_duration_seconds",
+		"Time from connection accepted to authentication decision",
+		histSeries{`result="success"`, m.authOK}, histSeries{`result="failure"`, m.authFail})
+	writeHistogram(w, "session_setup_duration_seconds",
+		"Time to establish the target connection for a shell/SFTP/scp session (excludes -L tunnel dials)",
+		histSeries{`result="success"`, m.setupOK}, histSeries{`result="failure"`, m.setupFail})
+	writeHistogram(w, "session_duration_seconds",
+		"Lifetime of an authenticated connection, handshake to teardown",
+		histSeries{"", m.sessionLifetime})
 
 	// exportDropped is a labeled counter (one series per exporter name), so
 	// it can't use the fixed-name ctr helper above; emit HELP/TYPE once then

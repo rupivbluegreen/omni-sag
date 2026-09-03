@@ -342,6 +342,11 @@ func run(cfgPath string, debug bool) error {
 		opts = append(opts, session.WithLoopbackTargetsAllowed())
 		log.Printf("omni-sag: WARNING loopback real targets are ALLOWED past the SSRF guard (target_allow_loopback: true) — dev-lab only, never use in production")
 	}
+	opts = append(opts, session.WithLatencyObservers(session.LatencyObservers{
+		Auth:            met.ObserveAuth,
+		SessionSetup:    met.ObserveSessionSetup,
+		SessionLifetime: met.ObserveSessionLifetime,
+	}))
 	srv := session.New(hostKey, auth, d, met.CountingSink(ev.sessionSink), opts...)
 	met.SetActiveFn(srv.ActiveSessions)
 

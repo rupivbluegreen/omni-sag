@@ -100,6 +100,31 @@ type Server struct {
 	scpEnabled     bool // opt-IN (default false = OFF): only when true are "exec" requests matching "scp -t/-f" (legacy protocol) served; see WithSCPEnabled
 
 	tunnelInspect TunnelInspectConfig // opt-IN (default zero value = disabled): protocol identification on -L/-D/-J tunnels; see WithTunnelInspection
+
+	latency LatencyObservers // optional duration sinks; zero value observes nothing
+}
+
+// LatencyObservers receives one duration sample per connection-lifecycle
+// stage. The observers are injected (rather than the data path importing a
+// metrics package) so internal/session stays independent of how — or whether —
+// the durations are exposed. Every member is optional; a nil one is skipped.
+// Implementations run inline on the connection goroutine and must not block.
+type LatencyObservers struct {
+	// Auth is called once per accepted connection with the time taken to
+	// reach the authentication decision, and whether it authenticated.
+	Auth func(d time.Duration, ok bool)
+	// SessionSetup is called at most once per connection with the time taken
+	// to establish the target SSH leg, and whether it succeeded.
+	SessionSetup func(d time.Duration, ok bool)
+	// SessionLifetime is called once per authenticated connection with how
+	// long it lived after the handshake completed.
+	SessionLifetime func(d time.Duration)
+}
+
+// WithLatencyObservers wires duration observers for the auth, session-setup
+// and session-lifetime stages. Unset (the default) records nothing.
+func WithLatencyObservers(o LatencyObservers) Option {
+	return func(s *Server) { s.latency = o }
 }
 
 // WithRegistry registers each authenticated connection in reg so the
@@ -486,6 +511,11 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			}
 			return err
 		}
+		// Stamped before the handshake-slot wait below, so time a connection
+		// spends queued under load lands in the auth latency histogram — that
+		// queueing is latency the client feels, and hiding it would leave a
+		// saturated gateway looking healthy.
+		acceptedAt := time.Now()
 		if s.draining.Load() {
 			_ = conn.Close() // draining: refuse new connections
 			continue
@@ -501,13 +531,13 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		}
 		s.wg.Add(1)
 		s.active.Add(1)
-		go func(c net.Conn) {
+		go func(c net.Conn, acceptedAt time.Time) {
 			defer func() {
 				s.active.Add(-1)
 				s.wg.Done()
 			}()
-			s.handleConn(ctx, c)
-		}(conn)
+			s.handleConn(ctx, c, acceptedAt)
+		}(conn, acceptedAt)
 	}
 }
 
@@ -533,7 +563,9 @@ func (s *Server) Drain(grace time.Duration) (int64, error) {
 // ActiveSessions returns the current active connection count.
 func (s *Server) ActiveSessions() int64 { return s.active.Load() }
 
-func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
+// acceptedAt is when Serve accepted raw, taken before the handshake-slot
+// wait so the auth duration it feeds includes any queueing.
+func (s *Server) handleConn(ctx context.Context, raw net.Conn, acceptedAt time.Time) {
 	ctx, root := tracer.Start(ctx, "omnisag.connection", trace.WithSpanKind(trace.SpanKindServer))
 	defer root.End()
 
@@ -548,12 +580,19 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 	}
 	authSpan.End()
 	_ = raw.SetDeadline(time.Time{})
+	if s.latency.Auth != nil {
+		s.latency.Auth(time.Since(acceptedAt), err == nil)
+	}
 	<-s.sem // release the handshake slot (success or failure)
 	if err != nil {
 		_ = raw.Close()
 		return
 	}
 	defer sconn.Close()
+	if s.latency.SessionLifetime != nil {
+		authedAt := time.Now()
+		defer func() { s.latency.SessionLifetime(time.Since(authedAt)) }()
+	}
 	go ssh.DiscardRequests(reqs)
 
 	if tok := sconn.Permissions.Extensions["target_secret_token"]; tok != "" {
@@ -583,7 +622,7 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 	// tch lazily dials and caches one target *ssh.Client per connection,
 	// shared across every channel (shell, sftp) opened on it, and closed once
 	// here when the connection ends.
-	tch := &targetConnCache{}
+	tch := &targetConnCache{observe: s.latency.SessionSetup}
 	defer tch.close()
 
 	// announcer relays "tunnel open" notices from this connection's -L handlers
