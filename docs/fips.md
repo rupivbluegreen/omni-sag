@@ -83,6 +83,41 @@ To confirm the module is linked (boringcrypto builds):
 go tool nm ./omni-sag | grep -i boringcrypto
 ```
 
+### Container images
+
+Two image variants are published for every release:
+
+| Tag | `GODEBUG` | Highest reachable `fips.mode` |
+| --- | --- | --- |
+| `<version>`, `<major>.<minor>`, `latest` | unset | `warn` |
+| `<version>-fips`, `<major>.<minor>-fips`, `latest-fips` | `fips140=on` | `enforce` |
+
+Both carry the same binary; only the environment differs. The default image sets
+no `GODEBUG` at all, so the runtime is not in FIPS mode and `fips.mode: enforce`
+makes the process **refuse to start** — that is the documented behaviour, not a
+bug. Use the `-fips` tag for an enforce posture:
+
+```sh
+docker run -v ./config.yaml:/etc/omni-sag/config.yaml:ro \
+  ghcr.io/rupivbluegreen/omni-sag:latest-fips        # config: fips.mode: enforce
+```
+
+With the Helm chart, point `image.tag` at the `-fips` variant of the release you
+are deploying (the chart otherwise defaults the tag to `.Chart.AppVersion`):
+
+```yaml
+image:
+  tag: "1.9.3-fips"
+```
+
+Setting `GODEBUG=fips140=on` in the container environment yourself works equally
+well — the `-fips` image just does it for you, so the posture cannot be lost by
+an env var being dropped from a manifest.
+
+The variant uses `fips140=on`, not `fips140=only`. `only` additionally rejects
+non-approved algorithms, which terminates SSH clients that negotiate them; see
+the caveats below before choosing it.
+
 ## What the self-check verifies
 
 `fips.Check` (in `internal/fips`, a leaf package that imports only the standard
