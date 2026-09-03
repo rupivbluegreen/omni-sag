@@ -246,7 +246,9 @@ a second parallel log path.** Rationale:
 **So the split of ownership is:**
 
 - **This design owns** (a) the **evidence.Event → OTLP `LogRecord` mapping**
-  (Timestamp = `Event.Time`; `SeverityNumber` derived from type/verdict/allow;
+  (Timestamp = `Event.Time`; `SeverityNumber` derived from type/verdict/allow,
+  with `SeverityText` always set alongside it — backends that treat
+  severity_text as required drop records that omit it, silently;
   `Body` = a short human string; `Attributes` = the same promoted field set the
   ECS formatter maps — user, source_ip, target, type, verdict, etc.; **plus
   `TraceId`/`SpanId` when a span is on the context**, which is what auto-
@@ -367,7 +369,8 @@ and [releases](https://github.com/open-telemetry/opentelemetry-go/releases).
 
 - **Unit:** `otel` config parse + defaults + validation (bad protocol/sampler
   rejected; TLS material honored); `Resource` builder; `evidence.Event` →
-  `LogRecord` mapping (field-by-field, severity derivation, TraceId/SpanId
+  `LogRecord` mapping (field-by-field, severity derivation — number *and*
+  text, the latter always one of TRACE/DEBUG/INFO/WARN/ERROR — TraceId/SpanId
   presence when a span is on context); span attribute mapping helpers.
 - **Trace integration (in-memory exporter):** use the OTel
   `tracetest.InMemoryExporter` / `SpanRecorder`, drive a real in-process session

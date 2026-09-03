@@ -79,6 +79,10 @@ target_allow_loopback: true
 #     - name: otel-logs                # EXPERIMENTAL: evidence as OTLP LogRecords
 #       format: json                   # otlp transport requires json
 #       transport: otlp                # see the otel: block below — requires otel.enabled + otel.logs.enabled
+#                                      # Every record carries severity_text
+#                                      # (TRACE/DEBUG/INFO/WARN/ERROR) as well as
+#                                      # the severity number: backends that treat
+#                                      # it as required drop records without it.
 
 # OpenTelemetry (OTLP) export. Opt-in (default off). Traces are STABLE and
 # are the headline deliverable: a span tree over the connection lifecycle
