@@ -3,6 +3,26 @@ image:
   tag: ""            # defaults to .Chart.AppVersion
   pullPolicy: IfNotPresent
 
+# FIPS-readiness posture. See docs/fips.md.
+#
+# mode: "off" (default) | "warn" | "enforce". QUOTE IT — YAML reads a bare
+# off/on as a boolean, and the chart refuses to render if it is not a string.
+#
+# "enforce" makes the gateway refuse to start unless its process is in FIPS
+# mode, which only the -fips image variant is (it sets GODEBUG=fips140=on).
+# The chart therefore appends the -fips suffix to the image tag by itself
+# whenever mode is "enforce", so the config and the image cannot drift apart
+# and crash-loop. useFipsImage overrides that decision in either direction:
+# set it true to run the FIPS image under warn/off (a valid posture — the
+# variant runs every mode), or false to state deliberately that the image is
+# already FIPS by other means. enforce + useFipsImage: false is refused.
+#
+# When configSecretName is set, this chart renders no config at all, so mode
+# here selects ONLY the image — set fips.mode in your own config to match.
+fips:
+  mode: "off"
+  useFipsImage: null   # null ⇒ derived from mode ("enforce" ⇒ true)
+
 # Default 1: with >1 replica behind one SSH LoadBalancer, each pod mints its own
 # ephemeral host key (host_key lives on the per-pod writable volume), so a client
 # reconnecting to a different pod hits a host-key mismatch and refuses to connect.

@@ -1,3 +1,4 @@
+{{- include "omni-sag.validateFips" . -}}
 {{- if not .Values.configSecretName }}
 apiVersion: v1
 kind: ConfigMap
@@ -29,6 +30,12 @@ data:
       {{- if .Values.gatewayTLS.clientCAEnabled }}
       client_ca: "/etc/omni-sag/tls/ca.crt"
       {{- end }}
+    {{- end }}
+    {{- if ne .Values.fips.mode "off" }}
+    # Kept in step with the image by the chart: "enforce" only boots on the
+    # -fips variant, which omni-sag.image selects automatically.
+    fips:
+      mode: {{ .Values.fips.mode | quote }}
     {{- end }}
     evidence:
       pipeline:

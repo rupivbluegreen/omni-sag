@@ -102,13 +102,21 @@ docker run -v ./config.yaml:/etc/omni-sag/config.yaml:ro \
   ghcr.io/rupivbluegreen/omni-sag:latest-fips        # config: fips.mode: enforce
 ```
 
-With the Helm chart, point `image.tag` at the `-fips` variant of the release you
-are deploying (the chart otherwise defaults the tag to `.Chart.AppVersion`):
+With the Helm chart, set the posture once and let it pick the image:
 
 ```yaml
-image:
-  tag: "1.9.3-fips"
+fips:
+  mode: "enforce"     # quote it: YAML reads a bare off/on as a boolean
 ```
+
+The chart appends the `-fips` suffix to the image tag whenever the mode is
+`enforce`, so the config it renders and the image it runs cannot drift apart.
+`fips.useFipsImage: true` runs the variant under `warn`/`off` as well (it serves
+every mode); `enforce` together with `useFipsImage: false` is refused at
+template time rather than left to crash-loop.
+
+When `configSecretName` is set the chart renders no config at all, so `fips.mode`
+there selects only the image — set the same mode in your own config.
 
 Setting `GODEBUG=fips140=on` in the container environment yourself works equally
 well — the `-fips` image just does it for you, so the posture cannot be lost by
