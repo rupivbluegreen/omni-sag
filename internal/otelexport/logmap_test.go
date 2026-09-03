@@ -32,42 +32,49 @@ func TestEventToLogRecord_TableDriven(t *testing.T) {
 		name         string
 		e            evidence.Event
 		wantSeverity log.Severity
+		wantSevText  string
 		wantBodyHas  string
 	}{
 		{
 			name:         "auth allow",
 			e:            evidence.Event{ID: "e1", Time: now, Type: evidence.TypeAuth, User: "alice", SourceIP: "10.0.0.5", Allow: evidence.BoolPtr(true), Reason: "authenticated"},
 			wantSeverity: log.SeverityInfo,
+			wantSevText:  "INFO",
 			wantBodyHas:  "authenticated",
 		},
 		{
 			name:         "auth deny",
 			e:            evidence.Event{ID: "e2", Time: now, Type: evidence.TypeAuth, User: "mallory", Allow: evidence.BoolPtr(false), Reason: "authentication failed"},
 			wantSeverity: log.SeverityWarn,
+			wantSevText:  "WARN",
 			wantBodyHas:  "authentication failed",
 		},
 		{
 			name:         "tunnel_decision allow",
 			e:            evidence.Event{ID: "e3", Time: now, Type: evidence.TypeTunnelDecision, User: "alice", Target: "db1:5432", Allow: evidence.BoolPtr(true), MatchedRole: "dba"},
 			wantSeverity: log.SeverityInfo,
+			wantSevText:  "INFO",
 			wantBodyHas:  string(evidence.TypeTunnelDecision),
 		},
 		{
 			name:         "transfer",
 			e:            evidence.Event{ID: "e4", Time: now, Type: evidence.TypeTransfer, User: "alice", Path: "/f.txt", Bytes: 100, Direction: "download"},
 			wantSeverity: log.SeverityInfo,
+			wantSevText:  "INFO",
 			wantBodyHas:  string(evidence.TypeTransfer),
 		},
 		{
 			name:         "inspection blocked",
 			e:            evidence.Event{ID: "e5", Time: now, Type: evidence.TypeInspection, User: "alice", Verdict: "blocked", Allow: evidence.BoolPtr(false), Reason: "malware detected"},
 			wantSeverity: log.SeverityError,
+			wantSevText:  "ERROR",
 			wantBodyHas:  "malware detected",
 		},
 		{
 			name:         "approval granted",
 			e:            evidence.Event{ID: "e6", Time: now, Type: evidence.TypeApproval, User: "alice", Outcome: "granted", Allow: evidence.BoolPtr(true)},
 			wantSeverity: log.SeverityInfo,
+			wantSevText:  "INFO",
 			wantBodyHas:  string(evidence.TypeApproval),
 		},
 	}
@@ -80,6 +87,9 @@ func TestEventToLogRecord_TableDriven(t *testing.T) {
 			}
 			if r.Severity() != tt.wantSeverity {
 				t.Fatalf("Severity = %v, want %v", r.Severity(), tt.wantSeverity)
+			}
+			if r.SeverityText() != tt.wantSevText {
+				t.Fatalf("SeverityText = %q, want %q", r.SeverityText(), tt.wantSevText)
 			}
 			body := r.Body().AsString()
 			if body == "" {
@@ -130,5 +140,28 @@ func TestEventToLogRecord_TraceIDPresentIffSpanContextValid(t *testing.T) {
 	}
 	if attrs["span_id"].AsString() != testSpanContext.SpanID().String() {
 		t.Fatalf("span_id = %q, want %q", attrs["span_id"].AsString(), testSpanContext.SpanID().String())
+	}
+}
+
+// Backends that require severity_text drop records carrying an unexpected or
+// empty value, so every SeverityNumber must map into the accepted set.
+func TestSeverityTextAlwaysAccepted(t *testing.T) {
+	accepted := map[string]bool{"INFO": true, "WARN": true, "ERROR": true, "DEBUG": true, "TRACE": true}
+	severities := []log.Severity{
+		log.SeverityUndefined,
+		log.SeverityTrace,
+		log.SeverityDebug,
+		log.SeverityInfo,
+		log.SeverityWarn,
+		log.SeverityError,
+		log.SeverityFatal,
+		log.SeverityInfo3,
+		log.SeverityError4,
+	}
+	for _, s := range severities {
+		got := severityTextFor(s)
+		if !accepted[got] {
+			t.Fatalf("severityTextFor(%v) = %q, want one of INFO/WARN/ERROR/DEBUG/TRACE", s, got)
+		}
 	}
 }

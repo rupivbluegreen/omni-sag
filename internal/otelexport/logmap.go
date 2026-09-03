@@ -26,8 +26,10 @@ import (
 // only correlation path.
 func EventToLogRecord(e evidence.Event, sc trace.SpanContext) log.Record {
 	var r log.Record
+	sev := severityFor(e)
 	r.SetTimestamp(e.Time)
-	r.SetSeverity(severityFor(e))
+	r.SetSeverity(sev)
+	r.SetSeverityText(severityTextFor(sev))
 	r.SetBody(log.StringValue(bodyFor(e)))
 	r.AddAttributes(attributesFor(e, sc)...)
 	return r
@@ -45,6 +47,26 @@ func severityFor(e evidence.Event) log.Severity {
 		return log.SeverityWarn
 	}
 	return log.SeverityInfo
+}
+
+// severityTextFor maps a SeverityNumber to severity_text. Loki-bound OTLP
+// bridges treat severity_text as required and drop records without it
+// silently, so emit only the five values they accept and never "".
+func severityTextFor(s log.Severity) string {
+	switch {
+	case s >= log.SeverityError:
+		return "ERROR"
+	case s >= log.SeverityWarn:
+		return "WARN"
+	case s >= log.SeverityInfo:
+		return "INFO"
+	case s >= log.SeverityDebug:
+		return "DEBUG"
+	case s >= log.SeverityTrace:
+		return "TRACE"
+	default:
+		return "INFO"
+	}
 }
 
 // bodyFor renders a short human-readable summary line.
