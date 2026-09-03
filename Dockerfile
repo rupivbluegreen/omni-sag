@@ -27,7 +27,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     -o /out/omni-sag ./cmd/omni-sag
 
 # ---- runtime stage ------------------------------------------------------
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 COPY --from=build /out/omni-sag /omni-sag
 
 # The gateway's SSH listener (see config.yaml `listen: ":2222"`).
@@ -38,3 +38,20 @@ EXPOSE 2222
 # paths in the config).
 ENTRYPOINT ["/omni-sag"]
 CMD ["-config", "/etc/omni-sag/config.yaml"]
+
+# ---- FIPS variant -------------------------------------------------------
+# Same binary, run with Go's native FIPS 140-3 module enabled. This exists
+# because fips.mode: enforce refuses to start unless the runtime is in FIPS
+# mode, which no environment variable in the default image sets — so enforce
+# is unreachable there by construction. Published as the -fips image tags.
+#
+# fips140=on routes approved algorithms through the FIPS module while still
+# permitting the non-approved ones SSH negotiates; it is not fips140=only,
+# which would additionally reject them and break clients. See docs/fips.md.
+FROM runtime AS fips
+ENV GODEBUG=fips140=on
+
+# ---- default ------------------------------------------------------------
+# Last stage = what a plain `docker build .` produces. Keep the non-FIPS
+# runtime here so the default image is never silently the FIPS variant.
+FROM runtime AS default

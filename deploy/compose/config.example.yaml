@@ -24,6 +24,9 @@ target_allow_loopback: true
 
 # FIPS-readiness posture: off (default) | warn | enforce. enforce rejects
 # non-FIPS TLS params and insecure_tls at boot; see docs/fips.md.
+# enforce also requires the PROCESS to be in FIPS mode (GODEBUG=fips140=on).
+# The default container image does not set it, so selecting enforce there
+# makes the gateway refuse to start; run the -fips image tag, which does.
 # fips:
 #   mode: enforce
 

@@ -96,9 +96,38 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          target: default
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
             VERSION=${{ github.ref_name }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      # The FIPS variant is the same binary with GODEBUG=fips140=on baked in,
+      # published under -fips tags. fips.mode: enforce cannot start without it.
+      - name: Derive FIPS image tags
+        id: meta-fips
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/omni-sag
+            ghcr.io/${{ github.repository }}
+          flavor: |
+            suffix=-fips,onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push FIPS variant (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: fips
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          tags: ${{ steps.meta-fips.outputs.tags }}
+          labels: ${{ steps.meta-fips.outputs.labels }}

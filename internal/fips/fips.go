@@ -131,10 +131,13 @@ func Check(mode Mode) (Report, error) {
 		switch mode {
 		case ModeEnforce:
 			return r, fmt.Errorf("fips: enforce mode requires FIPS-approved crypto but the runtime is not in FIPS mode; " +
-				"rebuild/run with GODEBUG=fips140=on (Go 1.24+) or a boringcrypto toolchain (see docs/fips.md)")
+				"set the environment variable GODEBUG=fips140=on (Go 1.24+) on the gateway process, or use a " +
+				"boringcrypto toolchain. The default container image deliberately does NOT set it — run the " +
+				"-fips image tag, which does, or set GODEBUG in the pod/container environment (see docs/fips.md)")
 		case ModeWarn:
 			r.Warnings = append(r.Warnings, "declared FIPS posture 'warn' but the runtime is NOT in FIPS mode; "+
-				"set GODEBUG=fips140=on (Go 1.24+) or use a boringcrypto build (see docs/fips.md)")
+				"set GODEBUG=fips140=on (Go 1.24+), run the -fips container image, or use a boringcrypto "+
+				"build (see docs/fips.md)")
 		}
 	}
 	return r, nil
