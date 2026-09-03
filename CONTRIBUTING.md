@@ -50,6 +50,16 @@ New invariant, new CI check — that's how the monolith stays modular.
    verified it still fails closed.
 6. For non-trivial features, an issue first is nice so we can agree on the shape.
 
+## Cutting a release
+
+Releases are cut by pushing a `vX.Y.Z` tag; the Release workflow builds the binaries, publishes the
+GitHub Release, and pushes images to Docker Hub **and** `ghcr.io/rupivbluegreen/omni-sag`.
+
+Bump `appVersion` in `deploy/helm/omni-sag/Chart.yaml` to the version you are about to tag (and the
+chart's own `version`) **before** tagging. The chart's default image tag is `.Chart.AppVersion`, so a
+stale `appVersion` ships a chart that pulls an image the release never published — the workflow's
+`verify` job fails the release if the two disagree.
+
 ## Project layout
 
 ```
