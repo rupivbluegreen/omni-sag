@@ -511,6 +511,11 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			}
 			return err
 		}
+		// Stamped before the handshake-slot wait below, so time a connection
+		// spends queued under load lands in the auth latency histogram — that
+		// queueing is latency the client feels, and hiding it would leave a
+		// saturated gateway looking healthy.
+		acceptedAt := time.Now()
 		if s.draining.Load() {
 			_ = conn.Close() // draining: refuse new connections
 			continue
@@ -526,13 +531,13 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		}
 		s.wg.Add(1)
 		s.active.Add(1)
-		go func(c net.Conn) {
+		go func(c net.Conn, acceptedAt time.Time) {
 			defer func() {
 				s.active.Add(-1)
 				s.wg.Done()
 			}()
-			s.handleConn(ctx, c)
-		}(conn)
+			s.handleConn(ctx, c, acceptedAt)
+		}(conn, acceptedAt)
 	}
 }
 
@@ -558,10 +563,11 @@ func (s *Server) Drain(grace time.Duration) (int64, error) {
 // ActiveSessions returns the current active connection count.
 func (s *Server) ActiveSessions() int64 { return s.active.Load() }
 
-func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
+// acceptedAt is when Serve accepted raw, taken before the handshake-slot
+// wait so the auth duration it feeds includes any queueing.
+func (s *Server) handleConn(ctx context.Context, raw net.Conn, acceptedAt time.Time) {
 	ctx, root := tracer.Start(ctx, "omnisag.connection", trace.WithSpanKind(trace.SpanKindServer))
 	defer root.End()
-	acceptedAt := time.Now()
 
 	// Bound the handshake with a deadline, then release the slot and clear the
 	// deadline once it completes. A stalled handshake trips the deadline instead

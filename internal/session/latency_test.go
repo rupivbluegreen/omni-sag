@@ -1,13 +1,16 @@
 package session
 
 import (
+	"context"
 	"errors"
+	"net"
 	"sync"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/rupivbluegreen/omni-sag/internal/dialer"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
 )
@@ -144,5 +147,52 @@ func TestSessionSetupObservedOncePerConnection(t *testing.T) {
 	}
 	if setup[0].d < 5*time.Millisecond {
 		t.Errorf("setup duration = %v, want at least the 5ms the dial took", setup[0].d)
+	}
+}
+
+// Serve takes a handshake slot BEFORE it hands the connection to handleConn,
+// so a connection can sit queued while the gateway is saturated. That wait is
+// latency the client feels: if the histogram started counting only once the
+// slot was granted, a gateway slow purely from saturation would still look
+// healthy, which is the failure this metric exists to catch.
+func TestAuthLatencyIncludesHandshakeQueueWait(t *testing.T) {
+	var rec recorder
+	sink := evidence.NewMemSink()
+	hostKey, err := NewEphemeralHostKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := dialer.New(policy.Policy{}, sink, dialer.WithLoopbackTargetsAllowed())
+	srv := New(hostKey, dbaAuth(), d, sink, WithLatencyObservers(rec.observers()))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go srv.Serve(ctx, ln)
+
+	// Saturate every handshake slot, so the connection below queues inside
+	// Serve rather than reaching handleConn.
+	for i := 0; i < maxInflightHandshakes; i++ {
+		srv.sem <- struct{}{}
+	}
+	const queued = 150 * time.Millisecond
+	go func() {
+		time.Sleep(queued)
+		<-srv.sem // release one slot; the queued connection proceeds
+	}()
+
+	sshClient(t, ln.Addr().String(), "alice")
+	waitFor(t, "the auth observation", func() bool {
+		auth, _, _ := rec.snapshot()
+		return len(auth) == 1
+	})
+	auth, _, _ := rec.snapshot()
+	if !auth[0].ok {
+		t.Fatal("the handshake should have succeeded")
+	}
+	if auth[0].d < queued {
+		t.Errorf("auth duration = %v, want at least the %v spent queued for a handshake slot", auth[0].d, queued)
 	}
 }
