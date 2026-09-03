@@ -8,8 +8,25 @@ permissions:
   contents: write # create the GitHub Release
 
 jobs:
+  verify:
+    name: Verify chart appVersion matches the tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Chart appVersion must equal the release tag
+        run: |
+          set -euo pipefail
+          want="${GITHUB_REF_NAME#v}"
+          got=$(sed -nE 's/^appVersion: *"?([^"]*)"?$/\1/p' deploy/helm/omni-sag/Chart.yaml)
+          if [ "$got" != "$want" ]; then
+            echo "::error::deploy/helm/omni-sag/Chart.yaml appVersion is \"$got\" but the tag is ${GITHUB_REF_NAME}. The chart's default image tag is .Chart.AppVersion, so a mismatch ships a chart that pulls an image this release never published. Bump appVersion (and the chart version) on master, then re-cut the tag."
+            exit 1
+          fi
+          echo "appVersion ${got} matches ${GITHUB_REF_NAME}"
+
   release:
     name: Build & publish binaries
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,7 +55,11 @@ jobs:
 
   docker:
     name: Build & push Docker image
+    needs: verify
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
     steps:
       - uses: actions/checkout@v4
 
@@ -50,11 +71,22 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # The Helm chart's default image.repository is ghcr.io/<owner>/omni-sag
+      # (tag = .Chart.AppVersion), so every release must land there too.
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Derive image tags
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ secrets.DOCKERHUB_USERNAME }}/omni-sag
+          images: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/omni-sag
+            ghcr.io/${{ github.repository }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
