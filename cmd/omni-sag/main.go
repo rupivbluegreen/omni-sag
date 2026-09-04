@@ -135,16 +135,12 @@ func run(cfgPath string, debug bool) error {
 	// imports the API.
 	var approvalStore approval.Store
 	if cfg.Approval != nil {
-		if cfg.Approval.UseCRD {
-			approvalStore = approval.CRDStore{}
-		} else {
-			fs, err := approval.NewFileStore(cfg.Approval.StorePath)
-			if err != nil {
-				return err
-			}
-			fs.SetGroupLookup(auth) // auth is the *authn.LDAPAuthenticator already constructed above for SSH login; Groups() needs no extra wiring
-			approvalStore = fs
+		fs, err := approval.NewFileStore(cfg.Approval.StorePath)
+		if err != nil {
+			return err
 		}
+		fs.SetGroupLookup(auth) // auth is the *authn.LDAPAuthenticator already constructed above for SSH login; Groups() needs no extra wiring
+		approvalStore = fs
 		dopts = append(dopts, dialer.WithApprovals(approvalStore, time.Duration(cfg.Approval.ApprovalTTL())*time.Second))
 		sessOpts = append(sessOpts, session.WithApprovals(approvalStore, time.Duration(cfg.Approval.ReleaseTTL())*time.Second))
 		log.Printf("omni-sag: four-eyes approvals enabled")
@@ -229,6 +225,9 @@ func run(cfgPath string, debug bool) error {
 		ev.exportCloser = fanout.Close
 		for _, ec := range cfg.Export.Exporters {
 			log.Printf("omni-sag: event export active: %s (format=%s transport=%s)", ec.Name, ec.Format, ec.Transport)
+			if ec.Format == "cef" {
+				log.Printf("omni-sag: WARNING exporter %s uses format \"cef\", which is DEPRECATED — json or ecs cover every current SIEM target; cef may be removed in a future release", ec.Name)
+			}
 		}
 	}
 

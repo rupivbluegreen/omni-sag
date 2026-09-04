@@ -1,3 +1,10 @@
+// Package eventexport, this file: the CEF (ArcSight Common Event Format)
+// formatter.
+//
+// DEPRECATED: cef is a narrow, ArcSight-specific format. json and ecs cover
+// every other SIEM target and are the recommended formats for new
+// deployments; cef may be removed in a future release. The gateway logs a
+// startup warning when an exporter configures it (see cmd/omni-sag/main.go).
 package eventexport
 
 import (

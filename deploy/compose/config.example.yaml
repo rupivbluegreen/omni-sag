@@ -53,7 +53,8 @@ target_allow_loopback: true
 # slow or down, events are dropped (counted in the metrics as
 # omnisag_eventexport_dropped_total) rather than stalling the gateway.
 #
-# format:    json | ecs (Elastic Common Schema) | cef (ArcSight)
+# format:    json | ecs (Elastic Common Schema) | cef (ArcSight — DEPRECATED,
+#            logs a startup warning, may be removed; use json or ecs instead)
 # transport: file (for a filebeat/logbeat/vector tailer) | syslog (udp|tcp|tls,
 #            RFC 5424 + RFC 6587 octet-counting) | http (NDJSON batches, e.g.
 #            Elastic _bulk / HEC). Multiple exporters run concurrently.
@@ -63,10 +64,10 @@ target_allow_loopback: true
 # export:
 #   enabled: true
 #   exporters:
-#     - name: arcsight                 # cef over TLS syslog
-#       format: cef
+#     - name: siem                     # json over TLS syslog
+#       format: json
 #       transport: syslog
-#       syslog: { address: "arcsight:6514", protocol: tls, facility: local0,
+#       syslog: { address: "siem:6514", protocol: tls, facility: local0,
 #                 tls: { ca: "ca.pem", cert: "c.pem", key: "k.pem" } }
 #     - name: elastic-filebeat         # ECS lines a filebeat tailer ships
 #       format: ecs
@@ -295,18 +296,15 @@ inspection:
 
 # Four-eyes approvals: required for any rule setting require_approval, and
 # for SFTP's quarantine-release flow (a KindQuarantineRelease approval, using
-# release_ttl_seconds instead of ttl_seconds). use_crd swaps in the (stubbed)
-# Kubernetes CRD store instead of the durable file store — not yet wired to a
-# real cluster.
+# release_ttl_seconds instead of ttl_seconds).
 # approval:
 #   store_path: "approvals.json"
 #   ttl_seconds: 900            # session-access approval pending lifetime
 #   release_ttl_seconds: 86400  # quarantine-release approval pending lifetime (24h)
-#   use_crd: false
 
 # Policy hot-reload source (Slice 7). Omit to reload from this config file.
-# CRD-backed source (Kubernetes informer) lands as a follow-up; until then the
-# file source hot-reloads on change and a bad edit keeps the last good policy.
+# The file source hot-reloads on change and a bad edit keeps the last good
+# policy.
 # policy_source:
 #   file: "policy.yaml"
 

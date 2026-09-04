@@ -66,7 +66,7 @@ stale `appVersion` ships a chart that pulls an image the release never published
 cmd/            omni-sag (daemon) · omnisag-ctl (CLI/TUI) · omni-verify (offline verifier) · omnisag-operator
 internal/       one package per concern (authn, policy, dialer, session, evidence, …)
 api/            openapi.yaml — the control-plane contract
-deploy/         compose lab · Helm chart · Containerfile · operator CRDs
+deploy/         compose lab · Helm chart
 docs/           the website, audit pack, and ADRs
 ```
 

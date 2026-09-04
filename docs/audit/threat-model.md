@@ -63,8 +63,9 @@ and ADR-0003 (FIPS).
    PR #3): a second SSH leg opens against the target for the actual shell/SFTP
    session, gated by the same controls (inspect-before-accept, recording,
    evidence, quarantine-then-release). No longer a v1 stand-in.
-4. **CRD policy/approval sources are stubs**; file-backed durable stores are the
-   v1 implementation. Kubernetes informer reconcilers require a cluster.
+4. **Policy/approval sources are file-backed**, hot-reloaded on change; a
+   CRD-backed source (Kubernetes informer) remains a possible v1.x follow-up,
+   not present in the tree today.
 5. **OIDC is a static-token stand-in** behind an `Authorizer` interface; a real
    JWKS validator is the v1.x wiring.
 6. **Cross-namespace four-eyes** requires operator config (API subjects = SSH

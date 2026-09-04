@@ -208,14 +208,15 @@ PASS — evidence bundle is intact and authentic.
 **📡 Event export / SIEM** — stream every evidence event to your SIEM in real time, opt-in and
 alongside the durable pipeline. Pick the format and transport per exporter, run several at once,
 and it's **best-effort**: a slow or dead SIEM drops events (counted in metrics), never stalls a
-session. Formats `json` / `ecs` (Elastic) / `cef` (ArcSight); transports `file` (filebeat/vector
-tail) / `syslog` (udp·tcp·tls) / `http` (NDJSON bulk).
+session. Formats `json` / `ecs` (Elastic) — `cef` (ArcSight) also exists but is deprecated, logs a
+startup warning, and may be removed; transports `file` (filebeat/vector tail) / `syslog`
+(udp·tcp·tls) / `http` (NDJSON bulk).
 ```yaml
 export:
   enabled: true
   exporters:
-    - { name: arcsight, format: cef, transport: syslog, syslog: { address: "arcsight:6514", protocol: tls } }
-    - { name: elastic,  format: ecs, transport: file,   file:   { path: "/var/log/omni-sag/events.jsonl" } }
+    - { name: elastic, format: ecs, transport: file, file: { path: "/var/log/omni-sag/events.jsonl" } }
+    - { name: siem,     format: json, transport: syslog, syslog: { address: "siem:6514", protocol: tls } }
 ```
 
 **📈 OpenTelemetry (OTLP)** — opt-in, default off. Distributed traces over the connection
@@ -243,7 +244,7 @@ weakens the anti-enumeration posture.
 $ omni-sag -config config.yaml -debug
 ```
 
-**📦 Packaging** — UBI9 non-root image, a Helm chart (restricted-v2 pod security), Prometheus
+**📦 Packaging** — distroless non-root image (default + FIPS variants), a Helm chart (restricted-v2 pod security), Prometheus
 metrics on their own listener, graceful drain on SIGTERM, and a FIPS-readiness mode
 (`off` | `warn` | `enforce`). Optionally wrap the SSH data path in TLS so an OpenShift passthrough
 Route can front it — see [docs/openshift-tls-routing.md](docs/openshift-tls-routing.md).
@@ -318,7 +319,7 @@ not yet built.
   Object-Locked quarantine, CyberArk CCP injection, four-eyes (session tunnels + group-scoped
   quarantine-release) with pull-download, per-capability kill switches, CIDR policy rules, nested
   AD group resolution, `+pcode` role selector + tunnel-keeper window, legacy `scp -O`, real-time
-  event export / SIEM (json·ecs·cef × file·syslog·http), tunnel protocol identification (observe +
+  event export / SIEM (json·ecs × file·syslog·http; cef deprecated), tunnel protocol identification (observe +
   enforce), OpenTelemetry (OTLP) export (traces + optional metrics/logs), FIPS-approved TLS routed
   through the API/CCP/LDAP/event-export listeners under `warn`/`enforce`, API + CLI + TUI +
   packaging + FIPS-readiness mode, SSH-over-TLS (SNI passthrough ingress, e.g. OpenShift Routes). ✅
