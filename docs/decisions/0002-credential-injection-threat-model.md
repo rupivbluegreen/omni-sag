@@ -64,7 +64,7 @@ target" — is stubbed. What Slice 6 fully implements and tests:
 
 ## Real target authentication (landed)
 
-Real target authentication landed in `docs/superpowers/plans/2026-07-14-real-target-proxy.md`.
+Real target authentication landed in PR #3 (see `git log --grep="real.target"`).
 The interactive shell and SFTP subsystem now bridge to a real second SSH
 connection to the target, authenticated per the four credential modes:
 

@@ -53,7 +53,8 @@ target_allow_loopback: true
 # slow or down, events are dropped (counted in the metrics as
 # omnisag_eventexport_dropped_total) rather than stalling the gateway.
 #
-# format:    json | ecs (Elastic Common Schema) | cef (ArcSight)
+# format:    json | ecs (Elastic Common Schema) | cef (ArcSight — DEPRECATED,
+#            logs a startup warning, may be removed; use json or ecs instead)
 # transport: file (for a filebeat/logbeat/vector tailer) | syslog (udp|tcp|tls,
 #            RFC 5424 + RFC 6587 octet-counting) | http (NDJSON batches, e.g.
 #            Elastic _bulk / HEC). Multiple exporters run concurrently.
@@ -63,10 +64,10 @@ target_allow_loopback: true
 # export:
 #   enabled: true
 #   exporters:
-#     - name: arcsight                 # cef over TLS syslog
-#       format: cef
+#     - name: siem                     # json over TLS syslog
+#       format: json
 #       transport: syslog
-#       syslog: { address: "arcsight:6514", protocol: tls, facility: local0,
+#       syslog: { address: "siem:6514", protocol: tls, facility: local0,
 #                 tls: { ca: "ca.pem", cert: "c.pem", key: "k.pem" } }
 #     - name: elastic-filebeat         # ECS lines a filebeat tailer ships
 #       format: ecs

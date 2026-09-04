@@ -225,6 +225,9 @@ func run(cfgPath string, debug bool) error {
 		ev.exportCloser = fanout.Close
 		for _, ec := range cfg.Export.Exporters {
 			log.Printf("omni-sag: event export active: %s (format=%s transport=%s)", ec.Name, ec.Format, ec.Transport)
+			if ec.Format == "cef" {
+				log.Printf("omni-sag: WARNING exporter %s uses format \"cef\", which is DEPRECATED — json or ecs cover every current SIEM target; cef may be removed in a future release", ec.Name)
+			}
 		}
 	}
 
