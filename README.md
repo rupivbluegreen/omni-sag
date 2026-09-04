@@ -243,7 +243,7 @@ weakens the anti-enumeration posture.
 $ omni-sag -config config.yaml -debug
 ```
 
-**📦 Packaging** — UBI9 non-root image, a Helm chart (restricted-v2 pod security), Prometheus
+**📦 Packaging** — distroless non-root image (default + FIPS variants), a Helm chart (restricted-v2 pod security), Prometheus
 metrics on their own listener, graceful drain on SIGTERM, and a FIPS-readiness mode
 (`off` | `warn` | `enforce`). Optionally wrap the SSH data path in TLS so an OpenShift passthrough
 Route can front it — see [docs/openshift-tls-routing.md](docs/openshift-tls-routing.md).
