@@ -4,7 +4,7 @@ build:
 	go build ./...
 
 # Cross-compilable, statically-linked release binaries for every command.
-BINARIES := omni-sag omnisag-ctl omni-verify omnisag-operator
+BINARIES := omni-sag omnisag-ctl omni-verify
 GOOS   ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
