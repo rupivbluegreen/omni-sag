@@ -368,7 +368,6 @@ type ApprovalConfig struct {
 	StorePath         string `yaml:"store_path"`          // durable JSON file for approval requests
 	TTLSeconds        int    `yaml:"ttl_seconds"`         // pending-request lifetime (default 900)
 	ReleaseTTLSeconds int    `yaml:"release_ttl_seconds"` // KindQuarantineRelease pending-request lifetime (default 86400 = 24h) — separate from ttl_seconds, which governs session-access approvals
-	UseCRD            bool   `yaml:"use_crd"`             // use the (stubbed) CRD store instead of the file store
 }
 
 // ApprovalTTL returns the configured TTL or the default.
@@ -727,8 +726,8 @@ func (f *File) validate() error {
 		if f.Approval == nil {
 			return fmt.Errorf("config: a rule sets require_approval but no approval block is configured")
 		}
-		if !f.Approval.UseCRD && f.Approval.StorePath == "" {
-			return fmt.Errorf("config: approval requires store_path (or use_crd)")
+		if f.Approval.StorePath == "" {
+			return fmt.Errorf("config: approval requires store_path")
 		}
 	}
 	if err := f.validateFIPS(); err != nil {

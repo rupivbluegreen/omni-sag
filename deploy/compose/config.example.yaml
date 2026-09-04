@@ -295,18 +295,15 @@ inspection:
 
 # Four-eyes approvals: required for any rule setting require_approval, and
 # for SFTP's quarantine-release flow (a KindQuarantineRelease approval, using
-# release_ttl_seconds instead of ttl_seconds). use_crd swaps in the (stubbed)
-# Kubernetes CRD store instead of the durable file store — not yet wired to a
-# real cluster.
+# release_ttl_seconds instead of ttl_seconds).
 # approval:
 #   store_path: "approvals.json"
 #   ttl_seconds: 900            # session-access approval pending lifetime
 #   release_ttl_seconds: 86400  # quarantine-release approval pending lifetime (24h)
-#   use_crd: false
 
 # Policy hot-reload source (Slice 7). Omit to reload from this config file.
-# CRD-backed source (Kubernetes informer) lands as a follow-up; until then the
-# file source hot-reloads on change and a bad edit keeps the last good policy.
+# The file source hot-reloads on change and a bad edit keeps the last good
+# policy.
 # policy_source:
 #   file: "policy.yaml"
 
