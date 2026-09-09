@@ -20,6 +20,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
+	"github.com/rupivbluegreen/omni-sag/internal/ratelimit"
 )
 
 func TestSplitTargetUser(t *testing.T) {
@@ -855,5 +856,152 @@ func TestDialTarget_RefusesAddressOutsideMatchedCIDR(t *testing.T) {
 		policy.Decision{CredentialMode: "prompt", MatchedCIDR: allowed}, "192.0.2.1", 22, token)
 	if !errors.Is(err, dialer.ErrBlockedAddress) {
 		t.Fatalf("address outside the matched CIDR must be refused, got %v", err)
+	}
+}
+
+func TestSplitTargetAccount(t *testing.T) {
+	cases := []struct {
+		raw          string
+		wantUser     string
+		wantHostSpec string
+		wantOK       bool
+	}{
+		{"10.0.0.5", "", "10.0.0.5", true},
+		{"user01@10.0.0.5", "user01", "10.0.0.5", true},
+		{"user01@10.0.0.5:2222", "user01", "10.0.0.5:2222", true},
+		{"user01@[2001:db8::1]:22", "user01", "[2001:db8::1]:22", true},
+		{"fe80::1%eth0", "", "fe80::1%eth0", true},
+		{"", "", "", true},
+		{"@host", "", "", false},
+		{"user01@", "", "", false},
+		{"user01@host@x", "", "", false},
+		{"user 01@host", "", "", false},
+	}
+	for _, c := range cases {
+		u, h, ok := splitTargetAccount(c.raw)
+		if u != c.wantUser || h != c.wantHostSpec || ok != c.wantOK {
+			t.Errorf("splitTargetAccount(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				c.raw, u, h, ok, c.wantUser, c.wantHostSpec, c.wantOK)
+		}
+	}
+}
+
+func TestGrammarChain(t *testing.T) {
+	cases := []struct {
+		raw       string
+		wantLogin string
+		wantPcode string
+		wantTUser string
+		wantHost  string
+		wantPort  int
+		wantOK    bool
+	}{
+		{"u%host", "u", "", "", "host", 0, true},
+		{"u%user01@host", "u", "", "user01", "host", 0, true},
+		{"u%user01@host:2222", "u", "", "user01", "host", 2222, true},
+		{"u+pcodeA%user01@host", "u", "pcodeA", "user01", "host", 0, true},
+		{"u%user01@[2001:db8::1]:22", "u", "", "user01", "2001:db8::1", 22, true},
+		{"u%fe80::1%eth0", "u", "", "", "fe80::1%eth0", 0, true},
+		{"u%@host", "", "", "", "", 0, false},
+		{"u%user01@", "", "", "", "", 0, false},
+		{"u%user01@host@x", "", "", "", "", 0, false},
+	}
+	for _, c := range cases {
+		login, spec, _ := splitTargetUser(c.raw)
+		login, pcode := splitPcodeSelector(login)
+		tuser, hostSpec, ok := splitTargetAccount(spec)
+		if ok != c.wantOK {
+			t.Errorf("%q: ok = %v, want %v", c.raw, ok, c.wantOK)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		host, port := splitTargetHostPort(hostSpec)
+		if login != c.wantLogin || pcode != c.wantPcode || tuser != c.wantTUser || host != c.wantHost || port != c.wantPort {
+			t.Errorf("%q = (login %q, pcode %q, targetuser %q, host %q, port %d), want (%q, %q, %q, %q, %d)",
+				c.raw, login, pcode, tuser, host, port, c.wantLogin, c.wantPcode, c.wantTUser, c.wantHost, c.wantPort)
+		}
+	}
+}
+
+func TestDialTarget_DeniesUnauthorizedTargetUser(t *testing.T) {
+	dialed := false
+	orig := dialNet
+	dialNet = func(_ context.Context, _, _ string, _ time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
+		dialed = true
+		return nil, errors.New("must not dial: target user must be refused first")
+	}
+	t.Cleanup(func() { dialNet = orig })
+
+	sink := evidence.NewMemSink()
+	s := &Server{sink: sink, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	pr := policy.Principal{User: "alice", RequestedTargetUser: "root"}
+	d := policy.Decision{Allow: true, CredentialMode: "prompt", AllowTargetUsers: []string{"user01"}}
+
+	client, err := s.dialTarget(context.Background(), nil, pr, "10.0.0.1", d, "db1.lab.local", 22, "")
+	if client != nil {
+		t.Fatal("got a client for a denied target user, want nil (no silent downgrade)")
+	}
+	if !errors.Is(err, credential.ErrDenied) {
+		t.Fatalf("want ErrDenied, got %v", err)
+	}
+	if dialed {
+		t.Fatal("a denied target user must fail closed before any dial is attempted")
+	}
+	e := singleCredentialEvent(t, sink)
+	if e.Allow == nil || *e.Allow {
+		t.Fatalf("credential event Allow = %v, want false", e.Allow)
+	}
+	if !strings.Contains(e.Detail, "requested=root") || !strings.Contains(e.Detail, "effective=alice") {
+		t.Fatalf("credential event Detail = %q, want requested-vs-effective", e.Detail)
+	}
+}
+
+func TestDialTarget_HonoursAllowedTargetUser(t *testing.T) {
+	fakeConn := startFakeTarget(t, "prompted-secret")
+	orig := dialNet
+	dialNet = func(_ context.Context, _, _ string, _ time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
+		return fakeConn, nil
+	}
+	t.Cleanup(func() { dialNet = orig })
+
+	sink := evidence.NewMemSink()
+	s := &Server{sink: sink, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	token := s.stashTargetSecret(credential.New([]byte("prompted-secret")))
+	pr := policy.Principal{User: "alice", RequestedTargetUser: "user01"}
+	d := policy.Decision{Allow: true, CredentialMode: "prompt", AllowTargetUsers: []string{"user01"}}
+
+	client, err := s.dialTarget(context.Background(), nil, pr, "10.0.0.1", d, "db1.lab.local", 22, token)
+	if err != nil {
+		t.Fatalf("dialTarget: %v", err)
+	}
+	defer client.Close()
+	if got := client.Conn.User(); got != "user01" {
+		t.Fatalf("second leg authenticated as %q, want user01", got)
+	}
+	if e := singleCredentialEvent(t, sink); e.TargetUser != "user01" {
+		t.Fatalf("credential event TargetUser = %q, want user01", e.TargetUser)
+	}
+}
+
+func TestDialTarget_RecordsTargetAuthFailure(t *testing.T) {
+	fakeConn := startFakeTarget(t, "right-secret")
+	orig := dialNet
+	dialNet = func(_ context.Context, _, _ string, _ time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
+		return fakeConn, nil
+	}
+	t.Cleanup(func() { dialNet = orig })
+
+	lim := ratelimit.New(ratelimit.DefaultConfig())
+	s := &Server{sink: noopSink{}, bfLimiter: lim, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	token := s.stashTargetSecret(credential.New([]byte("wrong-secret")))
+	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
+		policy.Decision{CredentialMode: "prompt"}, "db1.lab.local", 22, token)
+	if err == nil {
+		t.Fatal("dialTarget succeeded with the wrong target password, want an error")
+	}
+	if lim.Len() == 0 {
+		t.Fatal("a target-side auth failure must count toward the brute-force limiter")
 	}
 }

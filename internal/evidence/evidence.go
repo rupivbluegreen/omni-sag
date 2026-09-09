@@ -65,6 +65,11 @@ type Event struct {
 	// Credential fields (credential events). The secret is NEVER recorded.
 	CredentialMode string `json:"credential_mode,omitempty"` // inject | prompt | passthrough | deny
 	Outcome        string `json:"outcome,omitempty"`         // injected | prompt | passthrough | denied
+	// TargetUser is the account the gateway authenticates as on the target's
+	// second SSH leg — the EFFECTIVE one, after policy resolution, not what the
+	// client asked for. Accountability for "who connected as whom" is the point
+	// of this gateway, so it is a field rather than a Detail string.
+	TargetUser string `json:"target_user,omitempty"`
 
 	// Freeform detail for anything not yet promoted to a field.
 	Detail string `json:"detail,omitempty"`

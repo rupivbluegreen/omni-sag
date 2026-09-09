@@ -15,12 +15,18 @@ import (
 
 // Info is a snapshot of one live session (safe to serialize; no control hooks).
 type Info struct {
-	ID       string    `json:"id"`
-	User     string    `json:"user"`
-	SourceIP string    `json:"source_ip"`
-	Target   string    `json:"target,omitempty"`
-	Start    time.Time `json:"start"`
-	Channels int       `json:"channels"`
+	ID       string `json:"id"`
+	User     string `json:"user"`
+	SourceIP string `json:"source_ip"`
+	Target   string `json:"target,omitempty"`
+	// TargetUser is the account the client asked to use on the target via the
+	// "%[targetuser@]host" auth-username grammar, when it named one. It is the
+	// REQUESTED account: registration happens at connection setup, before any
+	// target leg is dialled, so policy resolution has not run yet. Empty when
+	// the client named none.
+	TargetUser string    `json:"target_user,omitempty"`
+	Start      time.Time `json:"start"`
+	Channels   int       `json:"channels"`
 }
 
 // entry is the registry's internal record: an Info plus the terminate hook.

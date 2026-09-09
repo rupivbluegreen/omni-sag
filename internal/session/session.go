@@ -378,9 +378,19 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		ctx, cancel := context.WithTimeout(context.Background(), authTimeout)
 		defer cancel()
 
-		loginUser, targetHost, hasTarget := splitTargetUser(meta.User())
+		loginUser, targetSpec, hasTarget := splitTargetUser(meta.User())
 		loginUser, pcode := splitPcodeSelector(loginUser)
-		targetHost, targetPort := splitTargetHostPort(targetHost)
+		requestedTargetUser, hostSpec, specOK := splitTargetAccount(targetSpec)
+		if !specOK {
+			s.bfLimiter.RecordFailure(srcIP)
+			s.emit(ctx, evidence.Event{
+				Time: time.Now().UTC(), Type: evidence.TypeAuth,
+				User: loginUser, SourceIP: srcIP,
+				Allow: evidence.BoolPtr(false), Reason: "malformed target specification",
+			})
+			return nil, errors.New("authentication failed")
+		}
+		targetHost, targetPort := splitTargetHostPort(hostSpec)
 		id, err := auth.Authenticate(ctx, loginUser, string(password))
 		if err != nil {
 			s.bfLimiter.RecordFailure(srcIP)
@@ -441,19 +451,53 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 			// Decide — see policy.Policy.DecideHost's doc comment. Only
 			// CredentialMode is consulted here; the resolved Decision.Port is
 			// used later, by interactive.go/sftp.go, to dial the real target.
-			decision := s.dialerPeek(policy.Principal{User: id.User, Groups: id.Groups, SelectedRole: pcode, TargetPort: targetPort}, targetHost)
+			decision := s.dialerPeek(policy.Principal{User: id.User, Groups: id.Groups, SelectedRole: pcode, TargetPort: targetPort, RequestedTargetUser: requestedTargetUser}, targetHost)
+			// Resolve the target account here, before any prompt is issued:
+			// denying at channel-open instead would mean the gateway had
+			// already collected a password for an account the client may not
+			// use. dialTarget re-resolves with the same helper, so the prompt
+			// and the leg can never name different accounts.
+			targetUser, tuErr := policy.ResolveTargetUser(requestedTargetUser, decision, id.User)
+			if tuErr != nil {
+				// Same event shape as dialTarget's denial (target.go) — same
+				// Reason, same host:port Target, same requested-vs-effective
+				// Detail — so a SIEM sees one denial signature whether the
+				// refusal lands at auth or at channel-open.
+				effective := decision.TargetUser
+				if effective == "" {
+					effective = id.User
+				}
+				port := decision.Port
+				if port <= 0 {
+					port = targetPort
+				}
+				target := targetHost
+				if port > 0 {
+					target = net.JoinHostPort(targetHost, strconv.Itoa(port))
+				}
+				s.bfLimiter.RecordFailure(srcIP)
+				s.emit(ctx, evidence.Event{
+					Time: time.Now().UTC(), Type: evidence.TypeCredential,
+					User: id.User, SourceIP: srcIP, Target: target,
+					TargetUser:     effective,
+					Allow:          evidence.BoolPtr(false),
+					CredentialMode: decision.CredentialMode,
+					Outcome:        string(credential.OutcomeDenied),
+					Reason:         "target user denied",
+					Detail:         fmt.Sprintf("requested=%s effective=%s", requestedTargetUser, effective),
+				})
+				return nil, errors.New("authentication failed")
+			}
 			if credential.Mode(decision.CredentialMode).Normalize() == credential.ModePrompt {
 				groups := strings.Join(id.Groups, groupSep)
 				return nil, &ssh.PartialSuccessError{Next: ssh.ServerAuthCallbacks{
 					KeyboardInteractiveCallback: func(_ ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
 						// Name the actual target account@host (the "%host" the client
 						// asked for) rather than a generic "Target", so the user knows
-						// which credential is being requested. TargetUser defaults to
-						// the gateway login user when the rule does not override it.
-						targetUser := decision.TargetUser
-						if targetUser == "" {
-							targetUser = id.User
-						}
+						// which credential is being requested. targetUser is the
+						// resolved account — the rule's pin, an authorized client
+						// request, or the gateway login user — and is exactly what
+						// dialTarget will authenticate as.
 						prompt := fmt.Sprintf("%s@%s password: ", targetUser, targetHost)
 						answers, err := challenge("", "", []string{prompt}, []bool{false})
 						if err != nil {
@@ -464,12 +508,13 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 						}
 						token := s.stashTargetSecret(credential.New([]byte(answers[0])))
 						return &ssh.Permissions{Extensions: map[string]string{
-							"user":                id.User,
-							"groups":              groups,
-							"target_host":         targetHost,
-							"target_port":         strconv.Itoa(targetPort),
-							"target_secret_token": token,
-							"selected_pcode":      pcode,
+							"user":                  id.User,
+							"groups":                groups,
+							"target_host":           targetHost,
+							"target_port":           strconv.Itoa(targetPort),
+							"target_secret_token":   token,
+							"selected_pcode":        pcode,
+							"requested_target_user": requestedTargetUser,
 						}}, nil
 					},
 				}}
@@ -488,6 +533,9 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		}
 		if pcode != "" {
 			perms.Extensions["selected_pcode"] = pcode
+		}
+		if requestedTargetUser != "" {
+			perms.Extensions["requested_target_user"] = requestedTargetUser
 		}
 		return perms, nil
 	}
@@ -613,7 +661,7 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn, acceptedAt time.T
 	var sessID string
 	if s.reg != nil {
 		var dereg func()
-		sessID, dereg = s.reg.Register(sessions.Info{User: pr.User, SourceIP: srcIP}, func() error {
+		sessID, dereg = s.reg.Register(sessions.Info{User: pr.User, SourceIP: srcIP, TargetUser: pr.RequestedTargetUser}, func() error {
 			return sconn.Close()
 		})
 		defer dereg()
@@ -781,12 +829,13 @@ func principalFrom(perms *ssh.Permissions) policy.Principal {
 	}
 	targetPort, _ := strconv.Atoi(perms.Extensions["target_port"])
 	return policy.Principal{
-		User:              perms.Extensions["user"],
-		Groups:            groups,
-		TargetHost:        perms.Extensions["target_host"],
-		TargetPort:        targetPort,
-		TargetSecretToken: perms.Extensions["target_secret_token"],
-		SelectedRole:      perms.Extensions["selected_pcode"],
+		User:                perms.Extensions["user"],
+		Groups:              groups,
+		TargetHost:          perms.Extensions["target_host"],
+		TargetPort:          targetPort,
+		TargetSecretToken:   perms.Extensions["target_secret_token"],
+		SelectedRole:        perms.Extensions["selected_pcode"],
+		RequestedTargetUser: perms.Extensions["requested_target_user"],
 	}
 }
 

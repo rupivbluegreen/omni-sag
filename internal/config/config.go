@@ -590,13 +590,16 @@ type RoleConfig struct {
 // "none" (default), "metadata-only", or "full". On "full" targets, port
 // forwarding (-L) is refused (PRD FR-10).
 type RuleConfig struct {
-	Host            string   `yaml:"host"`
-	Ports           []int    `yaml:"ports,omitempty"`
-	Record          string   `yaml:"record"`
-	Credential      string   `yaml:"credential"`                 // inject | prompt | passthrough | deny (empty=passthrough)
-	RequireApproval bool     `yaml:"require_approval,omitempty"` // gate matching targets behind a four-eyes approval
-	TargetUser      string   `yaml:"target_user,omitempty"`      // account on the target; empty => same as gateway login user
-	ExpectProtocol  []string `yaml:"expect_protocol,omitempty"`  // allow-list of protocols permitted on this target's tunnels (tunnel_inspection enforce); empty = observe only
+	Host            string `yaml:"host"`
+	Ports           []int  `yaml:"ports,omitempty"`
+	Record          string `yaml:"record"`
+	Credential      string `yaml:"credential"`                 // inject | prompt | passthrough | deny (empty=passthrough)
+	RequireApproval bool   `yaml:"require_approval,omitempty"` // gate matching targets behind a four-eyes approval
+	TargetUser      string `yaml:"target_user,omitempty"`      // account on the target; empty => same as gateway login user
+	// AllowTargetUsers is the exhaustive set of accounts a client may name via
+	// the "user%targetuser@host" auth-username grammar; empty => none, "*" => any.
+	AllowTargetUsers []string `yaml:"allow_target_users,omitempty"`
+	ExpectProtocol   []string `yaml:"expect_protocol,omitempty"` // allow-list of protocols permitted on this target's tunnels (tunnel_inspection enforce); empty = observe only
 }
 
 // Load reads and parses the configuration file at path.
@@ -837,6 +840,28 @@ func validatePolicyRoles(roles []RoleConfig) error {
 			default:
 				return fmt.Errorf("config: role %q rule for %q has invalid credential %q (want inject|prompt|passthrough|deny)", r.Name, rule.Host, rule.Credential)
 			}
+			if len(rule.AllowTargetUsers) > 0 {
+				if rule.TargetUser != "" {
+					return fmt.Errorf("config: role %q rule for %q sets both target_user and allow_target_users — target_user pins the account, so the allow-list would never be consulted", r.Name, rule.Host)
+				}
+				switch rule.Credential {
+				case "inject", "deny":
+					return fmt.Errorf("config: role %q rule for %q sets allow_target_users with credential %q — a client-supplied target user is never honoured in that mode", r.Name, rule.Host, rule.Credential)
+				}
+				wildcard := false
+				for _, u := range rule.AllowTargetUsers {
+					if u == "*" {
+						wildcard = true
+						continue
+					}
+					if u == "" || strings.ContainsAny(u, " \t@%+") {
+						return fmt.Errorf("config: role %q rule for %q has invalid allow_target_users entry %q", r.Name, rule.Host, u)
+					}
+				}
+				if wildcard && len(rule.AllowTargetUsers) > 1 {
+					return fmt.Errorf("config: role %q rule for %q mixes \"*\" with named entries in allow_target_users — use one or the other", r.Name, rule.Host)
+				}
+			}
 			for _, want := range rule.ExpectProtocol {
 				if !knownProtocol(want) {
 					return fmt.Errorf("config: role %q rule for %q has expect_protocol entry %q not recognized by protoident (want one of %v)", r.Name, rule.Host, want, protoident.Protocols())
@@ -889,13 +914,14 @@ func (f *File) CompilePolicy() policy.Policy {
 		rules := make([]policy.Rule, 0, len(rc.Allow))
 		for _, ru := range rc.Allow {
 			rules = append(rules, policy.Rule{
-				Host:            ru.Host,
-				Ports:           ru.Ports,
-				Record:          policy.RecordMode(ru.Record).Normalize(),
-				Credential:      ru.Credential,
-				RequireApproval: ru.RequireApproval,
-				TargetUser:      ru.TargetUser,
-				ExpectProtocol:  ru.ExpectProtocol,
+				Host:             ru.Host,
+				Ports:            ru.Ports,
+				Record:           policy.RecordMode(ru.Record).Normalize(),
+				Credential:       ru.Credential,
+				RequireApproval:  ru.RequireApproval,
+				TargetUser:       ru.TargetUser,
+				AllowTargetUsers: ru.AllowTargetUsers,
+				ExpectProtocol:   ru.ExpectProtocol,
 			})
 		}
 		roles = append(roles, policy.Role{Name: rc.Name, Groups: rc.Groups, Allow: rules})

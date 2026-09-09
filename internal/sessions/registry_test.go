@@ -62,3 +62,13 @@ func TestRegistry_ConcurrentAccess(t *testing.T) {
 		t.Fatalf("expected empty after all deregister, got %d", len(got))
 	}
 }
+
+func TestRegistry_CarriesTargetUser(t *testing.T) {
+	r := NewRegistry()
+	id, dereg := r.Register(Info{User: "alice", SourceIP: "10.0.0.1", TargetUser: "user01"}, func() error { return nil })
+	defer dereg()
+	got, ok := r.Get(id)
+	if !ok || got.TargetUser != "user01" {
+		t.Fatalf("Get(%q) = (%+v, %v), want TargetUser=user01", id, got, ok)
+	}
+}

@@ -64,13 +64,25 @@ ldap:
   nested_groups: true    # resolve transitive/AGDLP group membership (default off)
 ```
 
-**🖥️ Real shell & SFTP on the target** — `user%host` in the SSH username picks a real target; the
-gateway opens a genuine second SSH leg and proxies an actual PTY shell or SFTP session to it. Not
-a stand-in.
+**🖥️ Real shell & SFTP on the target** — `user%[targetuser@]host` in the SSH username picks a real
+target; the gateway opens a genuine second SSH leg and proxies an actual PTY shell or SFTP session
+to it. Not a stand-in.
 ```console
 $ ssh 'alice%db1.lab.local'@gateway -p 2222
 $ sftp 'alice%db1.lab.local'@gateway -P 2222
 ```
+Put `targetuser@` before the host to name the account to land on:
+```console
+$ ssh alice%user01@db1.lab.local@gateway -p 2222
+```
+No quoting is needed there — OpenSSH splits its own `[user@]host` argument on the **last** `@`, so
+`gateway` is the host and `alice%user01@db1.lab.local` is sent as the SSH username. The quoted and
+`-l` forms work too. A client-supplied account is honoured only when the matching rule lists it in
+`allow_target_users` and uses `credential: prompt` or `passthrough`; a rule that pins `target_user`
+is not overridable, and `credential: inject` never accepts one (the gateway fetches the secret keyed
+by the account, so a client-named account would make it a credential oracle). Without `targetuser@`
+the account is the rule's `target_user`, or your gateway login name — today's behaviour, unchanged.
+
 The matching policy rule must resolve to exactly one host and one port (ambiguous matches fail
 closed, not "pick one"). When a host is reachable through more than one of your roles the match is
 ambiguous — add a `+pcode` selector (the policy role name) to choose which role the session runs

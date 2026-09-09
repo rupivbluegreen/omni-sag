@@ -320,3 +320,66 @@ func TestPasswordCallback_PromptModeChainsKeyboardInteractive(t *testing.T) {
 		t.Fatalf("stashed secret = %v, want \"targetpass\"", sec)
 	}
 }
+
+func TestPasswordCallback_MalformedTargetSpecFailsClosed(t *testing.T) {
+	fakeAuth := fakeAuthenticator{identity: authn.Identity{User: "alice", Groups: []string{"dba"}}}
+	for _, user := range []string{"alice%@db1.lab.local", "alice%user01@", "alice%user01@db1.lab.local@x"} {
+		s := &Server{bfLimiter: ratelimit.New(ratelimit.DefaultConfig()), sink: noopSink{}}
+		if _, err := s.passwordCallback(fakeAuth)(fakeConnMeta{user: user}, []byte("password123")); err == nil {
+			t.Fatalf("%q authenticated, want a failure", user)
+		}
+	}
+}
+
+func TestPasswordCallback_DeniedTargetUserNeverPrompts(t *testing.T) {
+	fakeAuth := fakeAuthenticator{identity: authn.Identity{User: "alice", Groups: []string{"dba"}}}
+	s := &Server{
+		bfLimiter: ratelimit.New(ratelimit.DefaultConfig()),
+		sink:      noopSink{},
+		dialerPeek: func(pr policy.Principal, host string) policy.Decision {
+			return policy.Decision{Allow: true, CredentialMode: "prompt", MatchedRole: "dba", TargetUser: "svc_db1"}
+		},
+	}
+	_, err := s.passwordCallback(fakeAuth)(fakeConnMeta{user: "alice%root@db1.lab.local"}, []byte("password123"))
+	var partial *ssh.PartialSuccessError
+	if errors.As(err, &partial) {
+		t.Fatal("a denied target account must not reach the target-password prompt")
+	}
+	if err == nil {
+		t.Fatal("want an authentication failure for a denied target account")
+	}
+}
+
+func TestPasswordCallback_AllowedTargetUserPromptsForIt(t *testing.T) {
+	fakeAuth := fakeAuthenticator{identity: authn.Identity{User: "alice", Groups: []string{"dba"}}}
+	s := &Server{
+		bfLimiter: ratelimit.New(ratelimit.DefaultConfig()),
+		sink:      noopSink{},
+		dialerPeek: func(pr policy.Principal, host string) policy.Decision {
+			return policy.Decision{Allow: true, CredentialMode: "prompt", MatchedRole: "dba", AllowTargetUsers: []string{"user01"}}
+		},
+	}
+	_, err := s.passwordCallback(fakeAuth)(fakeConnMeta{user: "alice%user01@db1.lab.local"}, []byte("password123"))
+	var partial *ssh.PartialSuccessError
+	if !errors.As(err, &partial) {
+		t.Fatalf("want *ssh.PartialSuccessError, got %v", err)
+	}
+	var asked string
+	challenge := func(_, _ string, questions []string, _ []bool) ([]string, error) {
+		asked = questions[0]
+		return []string{"targetpass"}, nil
+	}
+	perms, err := partial.Next.KeyboardInteractiveCallback(fakeConnMeta{user: "alice%user01@db1.lab.local"}, challenge)
+	if err != nil {
+		t.Fatalf("KeyboardInteractiveCallback: %v", err)
+	}
+	if asked != "user01@db1.lab.local password: " {
+		t.Fatalf("prompt = %q, want it to name user01", asked)
+	}
+	if got := perms.Extensions["requested_target_user"]; got != "user01" {
+		t.Fatalf("requested_target_user = %q, want user01", got)
+	}
+	if got := principalFrom(perms).RequestedTargetUser; got != "user01" {
+		t.Fatalf("principalFrom RequestedTargetUser = %q, want user01", got)
+	}
+}
