@@ -20,6 +20,7 @@ import (
 	"github.com/rupivbluegreen/omni-sag/internal/dialer"
 	"github.com/rupivbluegreen/omni-sag/internal/evidence"
 	"github.com/rupivbluegreen/omni-sag/internal/policy"
+	"github.com/rupivbluegreen/omni-sag/internal/ratelimit"
 )
 
 func TestSplitTargetUser(t *testing.T) {
@@ -981,5 +982,26 @@ func TestDialTarget_HonoursAllowedTargetUser(t *testing.T) {
 	}
 	if e := singleCredentialEvent(t, sink); e.TargetUser != "user01" {
 		t.Fatalf("credential event TargetUser = %q, want user01", e.TargetUser)
+	}
+}
+
+func TestDialTarget_RecordsTargetAuthFailure(t *testing.T) {
+	fakeConn := startFakeTarget(t, "right-secret")
+	orig := dialNet
+	dialNet = func(_ context.Context, _, _ string, _ time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
+		return fakeConn, nil
+	}
+	t.Cleanup(func() { dialNet = orig })
+
+	lim := ratelimit.New(ratelimit.DefaultConfig())
+	s := &Server{sink: noopSink{}, bfLimiter: lim, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	token := s.stashTargetSecret(credential.New([]byte("wrong-secret")))
+	_, err := s.dialTarget(context.Background(), nil, policy.Principal{User: "alice"}, "10.0.0.1",
+		policy.Decision{CredentialMode: "prompt"}, "db1.lab.local", 22, token)
+	if err == nil {
+		t.Fatal("dialTarget succeeded with the wrong target password, want an error")
+	}
+	if lim.Len() == 0 {
+		t.Fatal("a target-side auth failure must count toward the brute-force limiter")
 	}
 }

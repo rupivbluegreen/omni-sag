@@ -280,6 +280,16 @@ func (s *Server) dialTarget(ctx context.Context, sconn ssh.Conn, pr policy.Princ
 	clientConn, chans, reqs, err := ssh.NewClientConn(rawConn, addr, cfg)
 	if err != nil {
 		rawConn.Close()
+		// A rejected second leg is a failed authentication attempt from this
+		// source, and the gateway-side success at session.go already cleared
+		// the counter. Without this, a client that can name the target account
+		// has an unmetered username/password spray channel against every
+		// allowed host — and can lock target accounts out. Only the handshake
+		// is counted: a TCP-level dial failure is not a guess, and the
+		// fail-closed paths above are gateway misconfiguration, not attempts.
+		if s.bfLimiter != nil {
+			s.bfLimiter.RecordFailure(srcIP)
+		}
 		return nil, fmt.Errorf("session: target ssh handshake %s: %w", addr, err)
 	}
 	return ssh.NewClient(clientConn, chans, reqs), nil
