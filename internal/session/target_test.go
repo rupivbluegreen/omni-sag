@@ -857,3 +857,69 @@ func TestDialTarget_RefusesAddressOutsideMatchedCIDR(t *testing.T) {
 		t.Fatalf("address outside the matched CIDR must be refused, got %v", err)
 	}
 }
+
+func TestSplitTargetAccount(t *testing.T) {
+	cases := []struct {
+		raw          string
+		wantUser     string
+		wantHostSpec string
+		wantOK       bool
+	}{
+		{"10.156.34.70", "", "10.156.34.70", true},
+		{"user01@10.156.34.70", "user01", "10.156.34.70", true},
+		{"user01@10.156.34.70:2222", "user01", "10.156.34.70:2222", true},
+		{"user01@[2001:db8::1]:22", "user01", "[2001:db8::1]:22", true},
+		{"fe80::1%eth0", "", "fe80::1%eth0", true},
+		{"", "", "", true},
+		{"@host", "", "", false},
+		{"user01@", "", "", false},
+		{"user01@host@x", "", "", false},
+		{"user 01@host", "", "", false},
+	}
+	for _, c := range cases {
+		u, h, ok := splitTargetAccount(c.raw)
+		if u != c.wantUser || h != c.wantHostSpec || ok != c.wantOK {
+			t.Errorf("splitTargetAccount(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				c.raw, u, h, ok, c.wantUser, c.wantHostSpec, c.wantOK)
+		}
+	}
+}
+
+func TestGrammarChain(t *testing.T) {
+	cases := []struct {
+		raw       string
+		wantLogin string
+		wantPcode string
+		wantTUser string
+		wantHost  string
+		wantPort  int
+		wantOK    bool
+	}{
+		{"u%host", "u", "", "", "host", 0, true},
+		{"u%user01@host", "u", "", "user01", "host", 0, true},
+		{"u%user01@host:2222", "u", "", "user01", "host", 2222, true},
+		{"u+p01012%user01@host", "u", "p01012", "user01", "host", 0, true},
+		{"u%user01@[2001:db8::1]:22", "u", "", "user01", "2001:db8::1", 22, true},
+		{"u%fe80::1%eth0", "u", "", "", "fe80::1%eth0", 0, true},
+		{"u%@host", "", "", "", "", 0, false},
+		{"u%user01@", "", "", "", "", 0, false},
+		{"u%user01@host@x", "", "", "", "", 0, false},
+	}
+	for _, c := range cases {
+		login, spec, _ := splitTargetUser(c.raw)
+		login, pcode := splitPcodeSelector(login)
+		tuser, hostSpec, ok := splitTargetAccount(spec)
+		if ok != c.wantOK {
+			t.Errorf("%q: ok = %v, want %v", c.raw, ok, c.wantOK)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		host, port := splitTargetHostPort(hostSpec)
+		if login != c.wantLogin || pcode != c.wantPcode || tuser != c.wantTUser || host != c.wantHost || port != c.wantPort {
+			t.Errorf("%q = (login %q, pcode %q, targetuser %q, host %q, port %d), want (%q, %q, %q, %q, %d)",
+				c.raw, login, pcode, tuser, host, port, c.wantLogin, c.wantPcode, c.wantTUser, c.wantHost, c.wantPort)
+		}
+	}
+}

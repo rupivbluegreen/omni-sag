@@ -378,9 +378,19 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		ctx, cancel := context.WithTimeout(context.Background(), authTimeout)
 		defer cancel()
 
-		loginUser, targetHost, hasTarget := splitTargetUser(meta.User())
+		loginUser, targetSpec, hasTarget := splitTargetUser(meta.User())
 		loginUser, pcode := splitPcodeSelector(loginUser)
-		targetHost, targetPort := splitTargetHostPort(targetHost)
+		requestedTargetUser, hostSpec, specOK := splitTargetAccount(targetSpec)
+		if !specOK {
+			s.bfLimiter.RecordFailure(srcIP)
+			s.emit(ctx, evidence.Event{
+				Time: time.Now().UTC(), Type: evidence.TypeAuth,
+				User: loginUser, SourceIP: srcIP,
+				Allow: evidence.BoolPtr(false), Reason: "malformed target specification",
+			})
+			return nil, errors.New("authentication failed")
+		}
+		targetHost, targetPort := splitTargetHostPort(hostSpec)
 		id, err := auth.Authenticate(ctx, loginUser, string(password))
 		if err != nil {
 			s.bfLimiter.RecordFailure(srcIP)
@@ -464,12 +474,13 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 						}
 						token := s.stashTargetSecret(credential.New([]byte(answers[0])))
 						return &ssh.Permissions{Extensions: map[string]string{
-							"user":                id.User,
-							"groups":              groups,
-							"target_host":         targetHost,
-							"target_port":         strconv.Itoa(targetPort),
-							"target_secret_token": token,
-							"selected_pcode":      pcode,
+							"user":                  id.User,
+							"groups":                groups,
+							"target_host":           targetHost,
+							"target_port":           strconv.Itoa(targetPort),
+							"target_secret_token":   token,
+							"selected_pcode":        pcode,
+							"requested_target_user": requestedTargetUser,
 						}}, nil
 					},
 				}}
@@ -488,6 +499,9 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 		}
 		if pcode != "" {
 			perms.Extensions["selected_pcode"] = pcode
+		}
+		if requestedTargetUser != "" {
+			perms.Extensions["requested_target_user"] = requestedTargetUser
 		}
 		return perms, nil
 	}
@@ -781,12 +795,13 @@ func principalFrom(perms *ssh.Permissions) policy.Principal {
 	}
 	targetPort, _ := strconv.Atoi(perms.Extensions["target_port"])
 	return policy.Principal{
-		User:              perms.Extensions["user"],
-		Groups:            groups,
-		TargetHost:        perms.Extensions["target_host"],
-		TargetPort:        targetPort,
-		TargetSecretToken: perms.Extensions["target_secret_token"],
-		SelectedRole:      perms.Extensions["selected_pcode"],
+		User:                perms.Extensions["user"],
+		Groups:              groups,
+		TargetHost:          perms.Extensions["target_host"],
+		TargetPort:          targetPort,
+		TargetSecretToken:   perms.Extensions["target_secret_token"],
+		SelectedRole:        perms.Extensions["selected_pcode"],
+		RequestedTargetUser: perms.Extensions["requested_target_user"],
 	}
 }
 

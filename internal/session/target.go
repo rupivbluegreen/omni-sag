@@ -49,6 +49,36 @@ func splitPcodeSelector(loginUser string) (user, pcode string) {
 	return loginUser[:i], loginUser[i+1:]
 }
 
+// splitTargetAccount splits the target portion of an SSH auth username —
+// everything after the "%" — into an optional target account and the host
+// spec: "user01@10.0.0.5:22" -> ("user01", "10.0.0.5:22"), "10.0.0.5:22" ->
+// ("", "10.0.0.5:22"). "@" is the separator because it cannot appear in an AD
+// sAMAccountName and does not collide with "%" (the login/target boundary) or
+// "+" (the pcode selector); the SSH client has already consumed its own
+// trailing "@gateway" by splitting its [user@]host argument on the LAST "@",
+// so only the gateway-side string reaches here. It runs BEFORE
+// splitTargetHostPort so that splitter still sees a plain "[host]:port".
+//
+// Unlike the other splitters this one validates instead of tolerating: an
+// empty account, an empty host, whitespace in the account, or more than one
+// "@" returns ok=false and the caller fails authentication closed. More than
+// one "@" is ambiguous rather than merely odd — AD accounts are often written
+// as UPNs ("svc_db1@corp.local"), and CyberArk's PSM for SSH hit the same
+// collision and reserved "#" for the domain rather than overloading "@".
+// Guessing which "@" splits would pick a target account on the user's behalf.
+func splitTargetAccount(targetSpec string) (targetUser, hostSpec string, ok bool) {
+	i := strings.IndexByte(targetSpec, '@')
+	if i < 0 {
+		return "", targetSpec, true
+	}
+	targetUser, hostSpec = targetSpec[:i], targetSpec[i+1:]
+	if targetUser == "" || hostSpec == "" ||
+		strings.ContainsAny(targetUser, " \t") || strings.Contains(hostSpec, "@") {
+		return "", "", false
+	}
+	return targetUser, hostSpec, true
+}
+
 // splitTargetHostPort splits an optional trailing ":port" off the target host
 // from the "%host[:port]" grammar: "10.0.0.5:22" -> ("10.0.0.5", 22),
 // "10.0.0.5" -> ("10.0.0.5", 0), "[2001:db8::1]:22" -> ("2001:db8::1", 22).
