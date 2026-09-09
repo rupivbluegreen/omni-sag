@@ -891,4 +891,37 @@ if [ "$BOB_SFTP_RESULT" != "REFUSED" ]; then
 fi
 pass "bob (not in dba) has no route to the target: his sftp session is refused before /releases is reachable"
 
+# --- Test 5: a client-supplied target account is refused against a pinned rule
+# The demo rule pins target_user: svc_db1, so naming any other account must be
+# refused at AUTH — before the gateway ever asks for the target password. The
+# driver reports exactly that as DRIVER_ERROR=never saw target password prompt.
+echo "== client-supplied target account refused when the rule pins one =="
+PINNED_OUT="$(python3 "$WORKDIR/ssh_shell.py" "$GW_PORT" "${GW_USER}%root@${TARGET_HOST}@${TARGET_HOST}" \
+  "$GW_PASSWORD" "$TARGET_PASSWORD" "BEGIN_PIN_$$" "END_PIN_$$" 2>"$WORKDIR/ssh_pinned.log" || true)"
+PINNED_WHOAMI="$(printf '%s\n' "$PINNED_OUT" | sed -n 's/^WHOAMI_RESULT=//p')"
+if [ -n "$PINNED_WHOAMI" ]; then
+  fail "alice connected as '$PINNED_WHOAMI' naming root against a rule pinning $TARGET_USER"
+  echo "--- driver transcript ---" >&2; tail -n 40 "$WORKDIR/ssh_pinned.log" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$PINNED_OUT" | grep -q "^DRIVER_ERROR=never saw target password prompt"; then
+  fail "expected the denial to land before the target password prompt, got: $PINNED_OUT"
+  echo "--- driver transcript ---" >&2; tail -n 40 "$WORKDIR/ssh_pinned.log" >&2
+  exit 1
+fi
+pass "alice%root@... refused at auth, never prompted: the rule pins target_user $TARGET_USER"
+
+# --- Test 6: naming the rule's own account explicitly is accepted -----------
+echo "== naming the rule's own target account explicitly is accepted =="
+MARKER6="OMNISAG6_$$_$(date +%s)"
+NAMED_OUT="$(python3 "$WORKDIR/ssh_shell.py" "$GW_PORT" "${GW_USER}%${TARGET_USER}@${TARGET_HOST}@${TARGET_HOST}" \
+  "$GW_PASSWORD" "$TARGET_PASSWORD" "BEGIN_${MARKER6}" "END_${MARKER6}" 2>"$WORKDIR/ssh_named.log")"
+NAMED_WHOAMI="$(printf '%s\n' "$NAMED_OUT" | sed -n 's/^WHOAMI_RESULT=//p')"
+if [ "$NAMED_WHOAMI" != "$TARGET_USER" ]; then
+  fail "naming the rule's own account ($TARGET_USER) failed, whoami got: '$NAMED_WHOAMI'"
+  echo "--- driver transcript ---" >&2; tail -n 40 "$WORKDIR/ssh_named.log" >&2
+  exit 1
+fi
+pass "alice%${TARGET_USER}@... accepted: matches the rule's target_user"
+
 echo "ALL PASS"

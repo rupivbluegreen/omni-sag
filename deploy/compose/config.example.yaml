@@ -352,6 +352,17 @@ policy:
           target_user: "svc_db1"
           record: full
           credential: prompt
+          # allow_target_users: the exhaustive set of accounts a CLIENT may
+          # name via the "user%targetuser@host" auth-username grammar. Absent
+          # (the default) refuses any client-supplied account, so a policy
+          # written before that grammar keeps its exact behaviour. "*" permits
+          # any account. Only valid when target_user is unset and credential is
+          # prompt or passthrough — config load fails otherwise rather than
+          # silently ignoring the list, because under inject the gateway
+          # fetches the secret keyed by the account and a client-named one
+          # would turn the gateway into a credential oracle. A rule that pins
+          # target_user (like this one) is never overridable by the client.
+          # allow_target_users: ["user01", "user02"]
         # CIDR rule example: grant access to an entire subnet via CIDR notation
         # (e.g. all databases in the 10.0.0.0/8 range). Matching works the same
         # as exact hostnames but applies to IP ranges; hostname targets are
