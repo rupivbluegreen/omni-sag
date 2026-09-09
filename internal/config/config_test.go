@@ -958,3 +958,56 @@ func TestValidate_DualListenerAccepted(t *testing.T) {
 		t.Fatalf("dual-listener config should validate: %v", err)
 	}
 }
+
+func TestCompilePolicy_AllowTargetUsers(t *testing.T) {
+	f := &File{Policy: PolicyConfig{Roles: []RoleConfig{{
+		Name: "dba", Groups: []string{"dba"},
+		Allow: []RuleConfig{{Host: "db1.lab.local", Credential: "prompt", AllowTargetUsers: []string{"user01"}}},
+	}}}}
+	p := f.CompilePolicy()
+	got := p.Roles[0].Allow[0].AllowTargetUsers
+	if len(got) != 1 || got[0] != "user01" {
+		t.Fatalf("AllowTargetUsers = %v, want [user01]", got)
+	}
+}
+
+func allowTargetUsersConfig(rule string) string {
+	return `
+listen: ":2222"
+evidence:
+  file: "evidence.jsonl"
+policy:
+  roles:
+    - name: dba
+      groups: ["dba"]
+      allow:
+` + rule
+}
+
+func TestValidate_AllowTargetUsersRejected(t *testing.T) {
+	cases := []struct{ name, rule string }{
+		{"with target_user", "        - host: \"db1.lab.local\"\n          credential: prompt\n          target_user: \"svc_db1\"\n          allow_target_users: [\"user01\"]\n"},
+		{"with inject", "        - host: \"db1.lab.local\"\n          credential: inject\n          allow_target_users: [\"user01\"]\n"},
+		{"with deny", "        - host: \"db1.lab.local\"\n          credential: deny\n          allow_target_users: [\"user01\"]\n"},
+		{"empty entry", "        - host: \"db1.lab.local\"\n          credential: prompt\n          allow_target_users: [\"\"]\n"},
+		{"entry with @", "        - host: \"db1.lab.local\"\n          credential: prompt\n          allow_target_users: [\"svc@corp.local\"]\n"},
+		{"entry with space", "        - host: \"db1.lab.local\"\n          credential: prompt\n          allow_target_users: [\"user 01\"]\n"},
+		{"wildcard mixed with names", "        - host: \"db1.lab.local\"\n          credential: prompt\n          allow_target_users: [\"*\", \"user01\"]\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := Load(writeTemp(t, allowTargetUsersConfig(c.rule))); err == nil {
+				t.Fatal("Load() = nil error, want a validation error")
+			}
+		})
+	}
+}
+
+func TestValidate_AllowTargetUsersAccepted(t *testing.T) {
+	for _, list := range []string{`["user01", "user02"]`, `["*"]`} {
+		rule := "        - host: \"db1.lab.local\"\n          credential: prompt\n          allow_target_users: " + list + "\n"
+		if _, err := Load(writeTemp(t, allowTargetUsersConfig(rule))); err != nil {
+			t.Fatalf("Load() with %s = %v, want nil", list, err)
+		}
+	}
+}
