@@ -923,3 +923,63 @@ func TestGrammarChain(t *testing.T) {
 		}
 	}
 }
+
+func TestDialTarget_DeniesUnauthorizedTargetUser(t *testing.T) {
+	dialed := false
+	orig := dialNet
+	dialNet = func(_ context.Context, _, _ string, _ time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
+		dialed = true
+		return nil, errors.New("must not dial: target user must be refused first")
+	}
+	t.Cleanup(func() { dialNet = orig })
+
+	sink := evidence.NewMemSink()
+	s := &Server{sink: sink, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	pr := policy.Principal{User: "alice", RequestedTargetUser: "root"}
+	d := policy.Decision{Allow: true, CredentialMode: "prompt", AllowTargetUsers: []string{"user01"}}
+
+	client, err := s.dialTarget(context.Background(), nil, pr, "10.0.0.1", d, "db1.lab.local", 22, "")
+	if client != nil {
+		t.Fatal("got a client for a denied target user, want nil (no silent downgrade)")
+	}
+	if !errors.Is(err, credential.ErrDenied) {
+		t.Fatalf("want ErrDenied, got %v", err)
+	}
+	if dialed {
+		t.Fatal("a denied target user must fail closed before any dial is attempted")
+	}
+	e := singleCredentialEvent(t, sink)
+	if e.Allow == nil || *e.Allow {
+		t.Fatalf("credential event Allow = %v, want false", e.Allow)
+	}
+	if !strings.Contains(e.Detail, "requested=root") || !strings.Contains(e.Detail, "effective=alice") {
+		t.Fatalf("credential event Detail = %q, want requested-vs-effective", e.Detail)
+	}
+}
+
+func TestDialTarget_HonoursAllowedTargetUser(t *testing.T) {
+	fakeConn := startFakeTarget(t, "prompted-secret")
+	orig := dialNet
+	dialNet = func(_ context.Context, _, _ string, _ time.Duration, _ *net.IPNet, _ bool) (net.Conn, error) {
+		return fakeConn, nil
+	}
+	t.Cleanup(func() { dialNet = orig })
+
+	sink := evidence.NewMemSink()
+	s := &Server{sink: sink, targetHostKeyCB: ssh.InsecureIgnoreHostKey()} // test fixture: deliberate, not production
+	token := s.stashTargetSecret(credential.New([]byte("prompted-secret")))
+	pr := policy.Principal{User: "alice", RequestedTargetUser: "user01"}
+	d := policy.Decision{Allow: true, CredentialMode: "prompt", AllowTargetUsers: []string{"user01"}}
+
+	client, err := s.dialTarget(context.Background(), nil, pr, "10.0.0.1", d, "db1.lab.local", 22, token)
+	if err != nil {
+		t.Fatalf("dialTarget: %v", err)
+	}
+	defer client.Close()
+	if got := client.Conn.User(); got != "user01" {
+		t.Fatalf("second leg authenticated as %q, want user01", got)
+	}
+	if e := singleCredentialEvent(t, sink); e.TargetUser != "user01" {
+		t.Fatalf("credential event TargetUser = %q, want user01", e.TargetUser)
+	}
+}

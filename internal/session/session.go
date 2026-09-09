@@ -451,19 +451,36 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 			// Decide — see policy.Policy.DecideHost's doc comment. Only
 			// CredentialMode is consulted here; the resolved Decision.Port is
 			// used later, by interactive.go/sftp.go, to dial the real target.
-			decision := s.dialerPeek(policy.Principal{User: id.User, Groups: id.Groups, SelectedRole: pcode, TargetPort: targetPort}, targetHost)
+			decision := s.dialerPeek(policy.Principal{User: id.User, Groups: id.Groups, SelectedRole: pcode, TargetPort: targetPort, RequestedTargetUser: requestedTargetUser}, targetHost)
+			// Resolve the target account here, before any prompt is issued:
+			// denying at channel-open instead would mean the gateway had
+			// already collected a password for an account the client may not
+			// use. dialTarget re-resolves with the same helper, so the prompt
+			// and the leg can never name different accounts.
+			targetUser, tuErr := policy.ResolveTargetUser(requestedTargetUser, decision, id.User)
+			if tuErr != nil {
+				s.bfLimiter.RecordFailure(srcIP)
+				s.emit(ctx, evidence.Event{
+					Time: time.Now().UTC(), Type: evidence.TypeCredential,
+					User: id.User, SourceIP: srcIP, Target: targetHost,
+					Allow:          evidence.BoolPtr(false),
+					CredentialMode: decision.CredentialMode,
+					Outcome:        string(credential.OutcomeDenied),
+					Reason:         "target user denied",
+					Detail:         fmt.Sprintf("requested=%s", requestedTargetUser),
+				})
+				return nil, errors.New("authentication failed")
+			}
 			if credential.Mode(decision.CredentialMode).Normalize() == credential.ModePrompt {
 				groups := strings.Join(id.Groups, groupSep)
 				return nil, &ssh.PartialSuccessError{Next: ssh.ServerAuthCallbacks{
 					KeyboardInteractiveCallback: func(_ ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
 						// Name the actual target account@host (the "%host" the client
 						// asked for) rather than a generic "Target", so the user knows
-						// which credential is being requested. TargetUser defaults to
-						// the gateway login user when the rule does not override it.
-						targetUser := decision.TargetUser
-						if targetUser == "" {
-							targetUser = id.User
-						}
+						// which credential is being requested. targetUser is the
+						// resolved account — the rule's pin, an authorized client
+						// request, or the gateway login user — and is exactly what
+						// dialTarget will authenticate as.
 						prompt := fmt.Sprintf("%s@%s password: ", targetUser, targetHost)
 						answers, err := challenge("", "", []string{prompt}, []bool{false})
 						if err != nil {

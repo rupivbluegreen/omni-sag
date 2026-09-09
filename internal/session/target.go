@@ -167,9 +167,33 @@ func passwordAuthMethods(secret string) []ssh.AuthMethod {
 // passthrough mode's reverse agent channel (may be nil for the other modes,
 // including in tests). srcIP is recorded in evidence only.
 func (s *Server) dialTarget(ctx context.Context, sconn ssh.Conn, pr policy.Principal, srcIP string, decision policy.Decision, targetHost string, targetPort int, secretToken string) (*ssh.Client, error) {
-	targetUser := decision.TargetUser
-	if targetUser == "" {
-		targetUser = pr.User
+	// Single authority for the effective target account: rule pin, client
+	// request and allow-list resolved in one pure helper, shared with the
+	// prompt-mode password prompt in session.go so the account the user is
+	// asked to authenticate as is always the account this leg authenticates as.
+	// A denial fails closed like every other credential-path failure;
+	// internal/policy cannot import internal/credential, so its sentinel is
+	// wrapped into credential.ErrDenied here.
+	targetUser, tuErr := policy.ResolveTargetUser(pr.RequestedTargetUser, decision, pr.User)
+	if tuErr != nil {
+		effective := decision.TargetUser
+		if effective == "" {
+			effective = pr.User
+		}
+		s.emit(ctx, evidence.Event{
+			Time:           time.Now().UTC(),
+			Type:           evidence.TypeCredential,
+			User:           pr.User,
+			SourceIP:       srcIP,
+			Target:         net.JoinHostPort(targetHost, strconv.Itoa(targetPort)),
+			TargetUser:     effective,
+			Allow:          evidence.BoolPtr(false),
+			CredentialMode: decision.CredentialMode,
+			Outcome:        string(credential.OutcomeDenied),
+			Reason:         "target user denied",
+			Detail:         fmt.Sprintf("requested=%s effective=%s", pr.RequestedTargetUser, effective),
+		})
+		return nil, fmt.Errorf("%w: %s", credential.ErrDenied, tuErr)
 	}
 	if s.targetHostKeyCB == nil {
 		// Fail closed: no silent insecure default (a security review of this
