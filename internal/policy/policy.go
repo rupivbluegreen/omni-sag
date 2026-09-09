@@ -40,6 +40,14 @@ type Principal struct {
 	// threaded from the auth layer like TargetHost.
 	TargetPort int
 
+	// RequestedTargetUser is the account the client asked to use ON THE TARGET
+	// via the "%[targetuser@]host" auth-username grammar ("" when it wrote only
+	// "%host"). It is a client-REQUESTED, NOT-YET-AUTHORIZED value: nothing may
+	// dial or prompt with it until ResolveTargetUser has approved it against
+	// the matched Decision. Carrier field, threaded from the auth layer like
+	// TargetHost and TargetSecretToken; no Decide logic reads it.
+	RequestedTargetUser string
+
 	// SelectedRole optionally scopes every decision for this principal to a
 	// single role (a pcode), set from the "+pcode" selector in the SSH auth
 	// username (see session parsing). Empty ⇒ evaluate against all roles the
@@ -94,6 +102,14 @@ type Rule struct {
 	// TargetUser is the account the gateway authenticates as on the target for
 	// this rule's matches. Empty => the same name as the gateway login user.
 	TargetUser string
+	// AllowTargetUsers is the exhaustive set of accounts a CLIENT may name in
+	// the "%[targetuser@]host" auth-username grammar for this rule's matches.
+	// Empty (the default) denies any client-supplied account, so a policy
+	// written before that grammar existed keeps its exact behaviour. "*"
+	// permits any syntactically valid account. Only meaningful when TargetUser
+	// is unset and Credential is prompt/passthrough; config validation rejects
+	// the other combinations rather than silently ignoring the list.
+	AllowTargetUsers []string
 	// ExpectProtocol is the allow-list of app protocols permitted on tunnels
 	// (-L/-D) to this rule's targets, checked by tunnel protocol
 	// identification enforce mode (internal/protoident). Empty => no
@@ -123,6 +139,9 @@ type Decision struct {
 	CredentialMode  string     // credential posture of the matched target (empty on deny)
 	RequireApproval bool       // matched target requires a four-eyes approval
 	TargetUser      string     // account to use on the target; empty => same as login user
+	// AllowTargetUsers is the matched rule's allow-list of client-nameable
+	// accounts; empty => none. See Rule.AllowTargetUsers and ResolveTargetUser.
+	AllowTargetUsers []string
 	// MatchedGroups is the subset of the principal's own Groups that actually
 	// granted the matched role — i.e. intersect(Principal.Groups, the matched
 	// Role.Groups), not the principal's full group list (a principal can hold
@@ -254,15 +273,16 @@ func (p Policy) Decide(pr Principal, t Target, resolve ResolverFunc) Decision {
 		for _, rule := range r.Allow {
 			if rule.matches(t) {
 				return Decision{
-					Allow:           true,
-					Reason:          "allowed by role " + r.Name,
-					MatchedRole:     r.Name,
-					RecordMode:      rule.Record.Normalize(),
-					CredentialMode:  rule.Credential,
-					RequireApproval: rule.RequireApproval,
-					TargetUser:      rule.TargetUser,
-					MatchedGroups:   intersectGroups(pr.Groups, r.Groups),
-					ExpectProtocol:  rule.ExpectProtocol,
+					Allow:            true,
+					Reason:           "allowed by role " + r.Name,
+					MatchedRole:      r.Name,
+					RecordMode:       rule.Record.Normalize(),
+					CredentialMode:   rule.Credential,
+					RequireApproval:  rule.RequireApproval,
+					TargetUser:       rule.TargetUser,
+					AllowTargetUsers: rule.AllowTargetUsers,
+					MatchedGroups:    intersectGroups(pr.Groups, r.Groups),
+					ExpectProtocol:   rule.ExpectProtocol,
 				}
 			}
 		}
@@ -283,16 +303,17 @@ func (p Policy) Decide(pr Principal, t Target, resolve ResolverFunc) Decision {
 			}
 			if allIn(ips, n) && rule.matchesPort(t.Port) {
 				return Decision{
-					Allow:           true,
-					Reason:          "allowed by role " + r.Name,
-					MatchedRole:     r.Name,
-					RecordMode:      rule.Record.Normalize(),
-					CredentialMode:  rule.Credential,
-					RequireApproval: rule.RequireApproval,
-					TargetUser:      rule.TargetUser,
-					MatchedGroups:   intersectGroups(pr.Groups, r.Groups),
-					MatchedCIDR:     n,
-					ExpectProtocol:  rule.ExpectProtocol,
+					Allow:            true,
+					Reason:           "allowed by role " + r.Name,
+					MatchedRole:      r.Name,
+					RecordMode:       rule.Record.Normalize(),
+					CredentialMode:   rule.Credential,
+					RequireApproval:  rule.RequireApproval,
+					TargetUser:       rule.TargetUser,
+					AllowTargetUsers: rule.AllowTargetUsers,
+					MatchedGroups:    intersectGroups(pr.Groups, r.Groups),
+					MatchedCIDR:      n,
+					ExpectProtocol:   rule.ExpectProtocol,
 				}
 			}
 		}
@@ -473,16 +494,17 @@ func (p Policy) DecideHost(pr Principal, host string, resolve ResolverFunc) Deci
 		return Decision{Allow: false, RecordMode: RecordNone, Reason: fmt.Sprintf("ambiguous: the rule matching host %s has %d configured ports — the real-target shell/SFTP flow requires exactly one", host, len(m.rule.Ports))}
 	}
 	return Decision{
-		Allow:           true,
-		Reason:          "allowed by role " + m.role.Name,
-		MatchedRole:     m.role.Name,
-		RecordMode:      m.rule.Record.Normalize(),
-		CredentialMode:  m.rule.Credential,
-		RequireApproval: m.rule.RequireApproval,
-		TargetUser:      m.rule.TargetUser,
-		MatchedGroups:   intersectGroups(pr.Groups, m.role.Groups),
-		Port:            m.rule.Ports[0],
-		MatchedCIDR:     m.cidr,
+		Allow:            true,
+		Reason:           "allowed by role " + m.role.Name,
+		MatchedRole:      m.role.Name,
+		RecordMode:       m.rule.Record.Normalize(),
+		CredentialMode:   m.rule.Credential,
+		RequireApproval:  m.rule.RequireApproval,
+		TargetUser:       m.rule.TargetUser,
+		AllowTargetUsers: m.rule.AllowTargetUsers,
+		MatchedGroups:    intersectGroups(pr.Groups, m.role.Groups),
+		Port:             m.rule.Ports[0],
+		MatchedCIDR:      m.cidr,
 	}
 }
 
