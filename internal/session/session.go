@@ -644,7 +644,7 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn, acceptedAt time.T
 	var sessID string
 	if s.reg != nil {
 		var dereg func()
-		sessID, dereg = s.reg.Register(sessions.Info{User: pr.User, SourceIP: srcIP}, func() error {
+		sessID, dereg = s.reg.Register(sessions.Info{User: pr.User, SourceIP: srcIP, TargetUser: pr.RequestedTargetUser}, func() error {
 			return sconn.Close()
 		})
 		defer dereg()
