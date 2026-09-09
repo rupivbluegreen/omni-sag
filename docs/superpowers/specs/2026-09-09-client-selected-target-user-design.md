@@ -101,22 +101,22 @@ OpenSSH splits its own `[user@]host` argument on the **last** `@`, so the
 unquoted form works and needs no quoting:
 
 ```console
-$ ssh tq58qd%user01@10.156.34.70@gw -p 2323
+$ ssh alice%user01@10.0.0.5@gw -p 2222
 ```
 
-OpenSSH takes `gw` as the host and sends `tq58qd%user01@10.156.34.70` as the
+OpenSSH takes `gw` as the host and sends `alice%user01@10.0.0.5` as the
 SSH username. The quoted and `-l` forms are equivalent and also supported:
 
 ```console
-$ ssh 'tq58qd%user01@10.156.34.70'@gw -p 2323
-$ ssh -l 'tq58qd%user01@10.156.34.70' gw -p 2323
-$ sftp -P 2323 'tq58qd%user01@10.156.34.70'@gw
+$ ssh 'alice%user01@10.0.0.5'@gw -p 2222
+$ ssh -l 'alice%user01@10.0.0.5' gw -p 2222
+$ sftp -P 2222 'alice%user01@10.0.0.5'@gw
 ```
 
 The existing form is unchanged and keeps today's behaviour:
 
 ```console
-$ ssh tq58qd%10.156.34.70@gw -p 2323
+$ ssh alice%10.0.0.5@gw -p 2222
 ```
 
 ### Invalid forms — rejected at auth, fail closed

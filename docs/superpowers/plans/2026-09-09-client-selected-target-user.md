@@ -463,9 +463,9 @@ func TestSplitTargetAccount(t *testing.T) {
 		wantHostSpec string
 		wantOK       bool
 	}{
-		{"10.156.34.70", "", "10.156.34.70", true},
-		{"user01@10.156.34.70", "user01", "10.156.34.70", true},
-		{"user01@10.156.34.70:2222", "user01", "10.156.34.70:2222", true},
+		{"10.0.0.5", "", "10.0.0.5", true},
+		{"user01@10.0.0.5", "user01", "10.0.0.5", true},
+		{"user01@10.0.0.5:2222", "user01", "10.0.0.5:2222", true},
 		{"user01@[2001:db8::1]:22", "user01", "[2001:db8::1]:22", true},
 		{"fe80::1%eth0", "", "fe80::1%eth0", true}, // IPv6 zone id untouched
 		{"", "", "", true},
@@ -496,7 +496,7 @@ func TestFullGrammarChain(t *testing.T) {
 		{"u%host", "u", "", "", "host", 0, true},
 		{"u%user01@host", "u", "", "user01", "host", 0, true},
 		{"u%user01@host:2222", "u", "", "user01", "host", 2222, true},
-		{"u+p01012%user01@host", "u", "p01012", "user01", "host", 0, true},
+		{"u+pcodeA%user01@host", "u", "pcodeA", "user01", "host", 0, true},
 		{"u%user01@[2001:db8::1]:22", "u", "", "user01", "2001:db8::1", 22, true},
 		{"u%@host", "u", "", "", "", 0, false},
 		{"u%user01@", "u", "", "", "", 0, false},
