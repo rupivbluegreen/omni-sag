@@ -1011,3 +1011,22 @@ func TestValidate_AllowTargetUsersAccepted(t *testing.T) {
 		}
 	}
 }
+
+// The hot-reload path (policy source -> CompilePolicyBytes) must enforce the
+// same allow_target_users rules as a full config load; both go through
+// validatePolicyRoles, and this pins that they stay together.
+func TestCompilePolicyBytes_RejectsInvalidAllowTargetUsers(t *testing.T) {
+	bad := `
+policy:
+  roles:
+    - name: dba
+      groups: ["dba"]
+      allow:
+        - host: "db1.lab.local"
+          credential: inject
+          allow_target_users: ["user01"]
+`
+	if _, err := CompilePolicyBytes([]byte(bad)); err == nil {
+		t.Fatal("CompilePolicyBytes accepted allow_target_users with credential inject, want an error")
+	}
+}

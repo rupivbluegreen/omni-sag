@@ -459,15 +459,32 @@ func (s *Server) passwordCallback(auth authn.Authenticator) func(ssh.ConnMetadat
 			// and the leg can never name different accounts.
 			targetUser, tuErr := policy.ResolveTargetUser(requestedTargetUser, decision, id.User)
 			if tuErr != nil {
+				// Same event shape as dialTarget's denial (target.go) — same
+				// Reason, same host:port Target, same requested-vs-effective
+				// Detail — so a SIEM sees one denial signature whether the
+				// refusal lands at auth or at channel-open.
+				effective := decision.TargetUser
+				if effective == "" {
+					effective = id.User
+				}
+				port := decision.Port
+				if port <= 0 {
+					port = targetPort
+				}
+				target := targetHost
+				if port > 0 {
+					target = net.JoinHostPort(targetHost, strconv.Itoa(port))
+				}
 				s.bfLimiter.RecordFailure(srcIP)
 				s.emit(ctx, evidence.Event{
 					Time: time.Now().UTC(), Type: evidence.TypeCredential,
-					User: id.User, SourceIP: srcIP, Target: targetHost,
+					User: id.User, SourceIP: srcIP, Target: target,
+					TargetUser:     effective,
 					Allow:          evidence.BoolPtr(false),
 					CredentialMode: decision.CredentialMode,
 					Outcome:        string(credential.OutcomeDenied),
 					Reason:         "target user denied",
-					Detail:         fmt.Sprintf("requested=%s", requestedTargetUser),
+					Detail:         fmt.Sprintf("requested=%s effective=%s", requestedTargetUser, effective),
 				})
 				return nil, errors.New("authentication failed")
 			}
