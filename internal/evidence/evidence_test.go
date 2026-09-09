@@ -23,3 +23,20 @@ func TestEvent_TunnelProtocolJSON(t *testing.T) {
 		t.Fatalf("round-trip mismatch: %+v", back)
 	}
 }
+
+func TestEvent_TargetUserJSON(t *testing.T) {
+	data, err := json.Marshal(Event{Type: TypeCredential, User: "alice", TargetUser: "user01"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"target_user":"user01"`) {
+		t.Fatalf("marshaled event missing target_user field: %s", data)
+	}
+	data, err = json.Marshal(Event{Type: TypeCredential, User: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "target_user") {
+		t.Fatalf("target_user must be omitted when empty: %s", data)
+	}
+}
